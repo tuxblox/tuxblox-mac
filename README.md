@@ -25,7 +25,7 @@ Nothing patches either client. The only file written inside the macOS bundle is 
 
 ### Player only, without TuxBlox
 
-The macOS Player does not need `compat/` or `libtuxblox`. Install the launcher into its own directory (for example `~/.local/share/tuxblox-mac`), add the flag and Rosemary, and run it. The Studio card will say that TuxBlox is required and will not try to download or start Studio.
+The macOS Player does not need `compat/`. Install the launcher into its own directory (for example `~/.local/share/tuxblox-mac`), add the flag and Rosemary, and run it. Launching Studio reports that the TuxBlox compatibility layer is required; it does not download the Windows client.
 
 ### Player and Studio
 
@@ -71,9 +71,10 @@ The result is:
 
 ```text
 build/native/TuxBloxLauncher
+build/native/libtuxblox/
 ```
 
-The Windows compatibility layer is not built from this tree.
+`build/native` is the complete launcher directory: the binary and the interface stack it loads. The Windows compatibility layer is not built from this tree.
 
 ## Installing the Player only
 
@@ -81,6 +82,7 @@ The Windows compatibility layer is not built from this tree.
 DIR="$HOME/.local/share/tuxblox-mac"
 mkdir -p "$DIR"
 install -m 755 build/native/TuxBloxLauncher "$DIR/TuxBloxLauncher"
+cp -a build/native/libtuxblox "$DIR/libtuxblox"
 ./shared/tools/fetch-rosemary.sh "$DIR/rosemary"
 ```
 
