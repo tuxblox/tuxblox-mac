@@ -42,6 +42,12 @@ endif()
 
 # Still needed by the interface stack's UiStack.cmake, which finds GTK and libadwaita through pkg-config.
 find_package(PkgConfig REQUIRED)
+# Prefer the mounted stack's gdk-pixbuf and glib: the build image's copy is older than
+# the stack's GTK and cannot resolve the symbols it was built against.
+if(TUXBLOX_UI_STACK_DEV)
+    set(ENV{PKG_CONFIG_PATH}
+        "${TUXBLOX_UI_STACK_DEV}/lib/pkgconfig:${TUXBLOX_UI_STACK_DEV}/lib/x86_64-linux-gnu/pkgconfig")
+endif()
 pkg_check_modules(GDK_PIXBUF REQUIRED IMPORTED_TARGET gdk-pixbuf-2.0)
 
 # TuxBlox's own code that uses those libraries, mounted read-only into the build container.
