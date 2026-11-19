@@ -116,8 +116,9 @@ RUN set -eu; \
     pkg-config --modversion glib-2.0; \
     PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --modversion glib-2.0
 
-# The three things nothing else in here already provides: patchelf rewrites the interface stack's
-# RPATHs, and sassc and rsvg-convert build its stylesheets and icons.
+# The things nothing else in here already provides: patchelf rewrites the interface stack's
+# RPATHs, sassc and rsvg-convert build its stylesheets and icons, and librsvg2-dev supplies the
+# pkg-config file GTK's SVG support needs when the stack is built from source.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        patchelf sassc librsvg2-bin \
+        patchelf sassc librsvg2-bin librsvg2-dev \
     && rm -rf /var/lib/apt/lists/*
