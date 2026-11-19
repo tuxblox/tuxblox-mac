@@ -27,6 +27,7 @@ Discord Rich Presence, server-region notifications, desktop entries and the rema
 - Rosemary (`rosemary` on `PATH`, or `<data-dir>/rosemary/rosemary`)
 - OpenSSL, libcurl, libarchive and zlib for the backend
 - GTK4/libadwaita for the launcher interface
+- CMake, Ninja and pkg-config for the build
 
 ## Building
 
@@ -39,6 +40,8 @@ cmake --build build
 The client is kept in `~/.local/share/tuxblox-mac` by default; set `TUXBLOX_MAC_DIR` to use another directory. Rosemary is found through `TUXBLOX_ROSEMARY`, `<data-dir>/rosemary/rosemary`, or `PATH`.
 
 The first launch downloads the official Player from Roblox's setup CDN and verifies its Apple signature before installing it. Nothing is patched.
+
+`./build/tuxblox-mac --check` installs or verifies the client without opening the window. It prints the installed version on success.
 
 ## Licensing
 
