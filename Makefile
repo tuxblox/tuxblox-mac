@@ -71,7 +71,13 @@ WEBVIEW := $(ROOT)/compat/webkitgtk/prebuilt/webkitgtk-$(WEBKITGTK_VERSION)-x86_
 FIND := find -L
 SHARED_SRC := $(shell $(FIND) shared -type f \
 	-not -path 'shared/ui/dist/*' -not -path 'shared/ui/sources/*' \
-	-not -path 'shared/ui/libadwaita/*' 2>/dev/null)
+	-not -path 'shared/ui/libadwaita/*' \
+	-not -path 'shared/crypto/openssl/*' \
+	-not -path 'shared/network/libcurl/*' \
+	-not -path 'shared/network/nghttp2/*' \
+	-not -path 'shared/fs/libarchive/*' \
+	-not -path 'shared/fs/zstd/*' \
+	-not -path 'shared/fs/zlib/*' 2>/dev/null)
 LAUNCHER_SRC := $(shell $(FIND) launcher/src launcher/CMakeLists.txt -type f 2>/dev/null)
 INSTALLER_SRC := $(shell $(FIND) installer/src installer/CMakeLists.txt -type f 2>/dev/null)
 STUDIO_MCP_SRC := $(shell $(FIND) studio-mcp/src studio-mcp/CMakeLists.txt -type f 2>/dev/null)
