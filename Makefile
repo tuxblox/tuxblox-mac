@@ -925,7 +925,7 @@ $(LAUNCHER): $(LAUNCHER_SRC) $(SHARED_SRC) $(LIBS) $(UI) $(ASSET_SVGS) assets | 
 	@if [ ! -f launcher/build/TuxBloxLauncher ]; then echo "!! launcher/build/TuxBloxLauncher was not built" >&2; exit 1; fi
 	@if [ -z "$$TUXBLOX_SKIP_SMOKE" ]; then cd launcher && ./smoke-test.sh build/TuxBloxLauncher $(UI); \
 	 else echo "!! TUXBLOX_SKIP_SMOKE set, the fresh-install smoke test was NOT run" >&2; fi
-	@mkdir -p $(ART)
+	@mkdir -p $(ART) $(NATIVE)
 	rm -rf $(ART)/launcher && mv launcher/build $(ART)/launcher
 	cp $(ART)/launcher/TuxBloxLauncher $@
 	rm -rf $(NATIVE)/libtuxblox && mkdir -p $(NATIVE)/libtuxblox
