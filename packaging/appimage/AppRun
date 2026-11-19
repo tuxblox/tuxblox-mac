@@ -8,7 +8,7 @@
 
 set -eu
 
-APPDIR="${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 VERSION_FILE="$APPDIR/usr/share/tuxblox-mac/VERSION"
 APP_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || printf 'unknown')"
 
