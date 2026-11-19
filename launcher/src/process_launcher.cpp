@@ -419,6 +419,10 @@ LaunchOutcome ProcessLauncher::launch(LaunchTarget target, const std::string& ur
     }
     if (target == LaunchTarget::Player && launcherFlags().macClient)
         return launchMacPlayer(installDir_, p, uri, extraEnv);
+    // The macOS repository ships the launcher, not compat/. Refuse before the
+    // Windows installer is downloaded or a missing binary is exec'd.
+    if (!compatLayerAvailable(installDir_))
+        return {false, i18n::tr("the TuxBlox compatibility layer is not installed"), "", false};
 
     std::string exePath = resolveActiveVersionExePath(target, installDir_);
     bool wasBootstrapInstall = false;

@@ -24,6 +24,11 @@ namespace tuxblox {
 // Where the compatibility layer's entry point lives inside an install.
 std::string compatBinaryPath(const std::string& installDir);
 
+// True when that entry point exists and is executable. A launcher-only build
+// (this repository without compat/) has no layer, so the Windows Player and
+// Studio have to refuse clearly instead of exec'ing a missing binary.
+bool compatLayerAvailable(const std::string& installDir);
+
 // If versions.json has an active pin for `target` AND that version's exe
 // still exists on disk, returns its full path. Otherwise returns an empty
 // string -- callers fall back to resolveOrBootstrapExePath's existing

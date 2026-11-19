@@ -20,6 +20,7 @@
 #include "versions_manifest.h"
 
 #include <filesystem>
+#include <unistd.h>
 
 namespace fs = std::filesystem;
 
@@ -27,6 +28,10 @@ namespace tuxblox {
 
 std::string compatBinaryPath(const std::string& installDir) {
     return compatDirUnder(installDir) + "/main";
+}
+
+bool compatLayerAvailable(const std::string& installDir) {
+    return access(compatBinaryPath(installDir).c_str(), X_OK) == 0;
 }
 
 std::vector<std::string> launchEnvVars(const std::string& installDir, LaunchTarget target) {

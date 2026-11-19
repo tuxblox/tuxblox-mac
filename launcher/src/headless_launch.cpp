@@ -58,6 +58,11 @@ int runHeadlessQuickLaunch(const std::string& installDir, LaunchTarget target, c
     // roblox: link would otherwise download the Windows Player and never start
     // the client that is actually installed.
     const bool macPlayer = target == LaunchTarget::Player && launcherFlags().macClient;
+    if (!macPlayer && !compatLayerAvailable(installDir)) {
+        fprintf(stderr, "TuxBlox: %s\n",
+                i18n::tr("This launcher was installed without the TuxBlox compatibility layer, so the Windows Player and Roblox Studio cannot start. Install TuxBlox first, then run this launcher from its directory."));
+        return 1;
+    }
 
     // Before the exe is resolved, so a version installed by this check is the
     // one that starts.
