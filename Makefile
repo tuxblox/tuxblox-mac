@@ -644,14 +644,12 @@ export PATH="$$Prefix/bin:$$PATH"
 
 HostAllowList=(
     '^libc\.so\.6$$' '^libm\.so\.6$$' '^libdl\.so\.2$$' '^libpthread\.so\.0$$' '^librt\.so\.1$$' '^libresolv\.so\.2$$'
+    '^libgcc_s\.so\.1$$'
     '^ld-linux-x86-64\.so\.2$$'
     '^libX11\.so\.6$$' '^libX11-xcb\.so\.1$$' '^libXau\.so\.6$$' '^libXdmcp\.so\.6$$' '^libXext\.so\.6$$' '^libXrender\.so\.1$$'
     '^libXi\.so\.6$$' '^libXrandr\.so\.2$$' '^libXcursor\.so\.1$$' '^libXdamage\.so\.1$$' '^libXfixes\.so\.3$$' '^libXinerama\.so\.1$$'
     '^libxcb\.so\.1$$' '^libxcb-render\.so\.0$$' '^libxcb-shm\.so\.0$$'
     '^libGL\.so\.1$$' '^libEGL\.so\.1$$' '^libGLdispatch\.so\.0$$'
-    # Desktop SVG rendering, like X11 and GL: the host already carries it, and
-    # building librsvg would add a Rust toolchain to the interface stack.
-    '^librsvg-2\.so\.2$$'
 )
 
 isElf() {
@@ -673,6 +671,9 @@ stageRuntime() {
     rm -rf "$$StageDir"
     mkdir -p "$$StageDir/$$LibRel" "$$StageDir/share/glib-2.0" "$$StageDir/fonts"
     cp -a "$$Prefix/$$LibRel/." "$$StageDir/$$LibRel/"
+    # GTK links to librsvg for SVG icons. It lives in the build image, not the
+    # prefix, so bring it into the bundle rather than requiring it on the host.
+    cp -a /usr/lib/x86_64-linux-gnu/librsvg-2.so.2* "$$StageDir/$$LibRel/"
     rm -rf "$$StageDir/$$LibRel/pkgconfig" "$$StageDir/$$LibRel/glib-2.0/include" "$$StageDir/$$LibRel/gdk-pixbuf-2.0"
     rm -f "$$StageDir/$$LibRel"/libgirepository-2.0.so* "$$StageDir/$$LibRel"/libxkbregistry.so*
     cp -a "$$Prefix/fonts/." "$$StageDir/fonts/"
