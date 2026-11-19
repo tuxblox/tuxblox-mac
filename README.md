@@ -11,6 +11,23 @@ This repository is the launcher half of TuxBlox: Home, Sessions, Versions, FastF
 - Studio is inherited unchanged and still uses the TuxBlox compatibility layer.
 - Builds are x86_64 for now. arm64 is not supported yet.
 
+## Download
+
+The latest release includes a ready x86_64 AppImage and a portable tarball:
+
+<https://github.com/tuxblox/tuxblox-mac/releases/latest>
+
+```sh
+chmod +x TuxBloxMac-*-x86_64.AppImage
+./TuxBloxMac-*-x86_64.AppImage
+```
+
+The first run copies the launcher, its interface stack and Rosemary to `~/.local/share/tuxblox-mac`, writes the macOS Player flag, and starts. Later runs reuse the same directory and replace the launcher when the AppImage version changes. Set `TUXBLOX_MAC_DATA` to use another directory.
+
+The AppImage needs FUSE. Where FUSE is unavailable, download the `.tar.zst`, extract it, and run `TuxBloxMac.AppDir/AppRun`; it is the same payload.
+
+The release is Player-only. Studio still needs the TuxBlox compatibility layer; use the drop-in install below if you want Studio.
+
 ## What it does
 
 - Downloads the official macOS Player from Roblox's setup CDN.
@@ -75,6 +92,14 @@ build/native/libtuxblox/
 ```
 
 `build/native` is the complete launcher directory: the binary and the interface stack it loads. The Windows compatibility layer is not built from this tree.
+
+To assemble the release artifacts:
+
+```sh
+APPIMAGETOOL=/path/to/appimagetool make mac-appimage
+```
+
+Without `APPIMAGETOOL`, the target still writes the portable `.tar.zst`. Rosemary is downloaded from the pinned release if it is not already under `build/rosemary`.
 
 ## Installing the Player only
 

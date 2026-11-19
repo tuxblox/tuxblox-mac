@@ -1,0 +1,63 @@
+#!/bin/sh
+# TuxBlox Mac - portable AppImage/tarball entry point
+# Copyright (C) 2026 TuxBlox Developers
+#
+# The AppImage is read-only, so the launcher, its interface stack and Rosemary
+# are copied to a writable data directory on first run (and replaced when the
+# AppImage version changes). The macOS client and the user's settings stay there.
+
+set -eu
+
+APPDIR="${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"
+VERSION_FILE="$APPDIR/usr/share/tuxblox-mac/VERSION"
+APP_VERSION="$(cat "$VERSION_FILE" 2>/dev/null || printf 'unknown')"
+
+if [ -z "${HOME:-}" ] && [ -z "${XDG_DATA_HOME:-}" ]; then
+    echo "TuxBlox Mac: set HOME or XDG_DATA_HOME so the launcher has a data directory" >&2
+    exit 1
+fi
+
+DATA_DIR="${TUXBLOX_MAC_DATA:-${XDG_DATA_HOME:-$HOME/.local/share}/tuxblox-mac}"
+case "$DATA_DIR" in
+    /*) ;;
+    *)
+        echo "TuxBlox Mac: TUXBLOX_MAC_DATA must be an absolute path: $DATA_DIR" >&2
+        exit 1
+        ;;
+esac
+
+mkdir -p "$DATA_DIR"
+
+installed_version="$(cat "$DATA_DIR/.appimage-version" 2>/dev/null || true)"
+if [ "$installed_version" != "$APP_VERSION" ]; then
+    # The previous launcher stays usable until the new copy is complete.
+    install -m 755 "$APPDIR/usr/bin/TuxBloxLauncher" "$DATA_DIR/TuxBloxLauncher.new"
+    rm -rf "$DATA_DIR/libtuxblox.new"
+    cp -a "$APPDIR/usr/bin/libtuxblox" "$DATA_DIR/libtuxblox.new"
+    rm -rf "$DATA_DIR/libtuxblox.old"
+    if [ -d "$DATA_DIR/libtuxblox" ]; then
+        mv "$DATA_DIR/libtuxblox" "$DATA_DIR/libtuxblox.old"
+    fi
+    mv "$DATA_DIR/libtuxblox.new" "$DATA_DIR/libtuxblox"
+    mv "$DATA_DIR/TuxBloxLauncher.new" "$DATA_DIR/TuxBloxLauncher"
+    rm -rf "$DATA_DIR/libtuxblox.old"
+
+    mkdir -p "$DATA_DIR/rosemary"
+    install -m 755 "$APPDIR/usr/bin/rosemary/rosemary" "$DATA_DIR/rosemary/rosemary.new"
+    mv "$DATA_DIR/rosemary/rosemary.new" "$DATA_DIR/rosemary/rosemary"
+
+    printf '%s\n' "$APP_VERSION" > "$DATA_DIR/.appimage-version"
+fi
+
+if [ ! -e "$DATA_DIR/flags.json" ]; then
+    cat > "$DATA_DIR/flags.json" <<'JSON'
+{
+  "tbxFlagEnableExperimentalMacClient": true,
+  "tbxFlagDisableUpdater": true
+}
+JSON
+fi
+
+export TUXBLOX_ROOT="$DATA_DIR"
+export TUXBLOX_ROSEMARY="$DATA_DIR/rosemary/rosemary"
+exec "$DATA_DIR/TuxBloxLauncher" "$@"

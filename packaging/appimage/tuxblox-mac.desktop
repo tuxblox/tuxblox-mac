@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=TuxBlox Mac
+Comment=Roblox Player on Linux through Rosemary
+Exec=TuxBloxLauncher
+Icon=tuxblox
+Terminal=false
+Categories=Game;
+StartupWMClass=tuxblox-launcher

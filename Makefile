@@ -117,7 +117,7 @@ shared-state:
 	    ln -sfn ../$$d $(FLATPAK_DIR)/$$d; \
 	done
 
-.PHONY: launcher installer studio-mcp compat deps appimage flatpak assets
+.PHONY: launcher installer studio-mcp compat deps appimage mac-appimage flatpak assets
 launcher: bump-build record-provenance $(LAUNCHER)
 installer: bump-build record-provenance $(INSTALLER)
 
@@ -166,6 +166,12 @@ appimage:
 	    printf '   it runs in place: APPDIR=%s %s/AppRun\n' '$(APPIMAGE_APPDIR)' '$(APPIMAGE_APPDIR)' >&2; \
 	fi
 	@printf ':: the AppImage variant stays in %s, build/native/TuxBloxInstaller is untouched\n' '$(APPIMAGE_DIR)'
+
+MAC_APPIMAGE_DIR := $(BUILD)/appimage-mac
+
+mac-appimage: launcher
+	@packaging/appimage/build-appimage.sh $(NATIVE) $(MAC_APPIMAGE_DIR)
+	@printf ':: the portable release is in %s\n' '$(MAC_APPIMAGE_DIR)'
 
 FLATPAK_DIR := $(BUILD)/flatpak
 FLATPAK_BUNDLE := $(FLATPAK_DIR)/net.tuxblox.TuxBlox.flatpak
