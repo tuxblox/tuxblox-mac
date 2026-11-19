@@ -283,7 +283,7 @@ include(cmake/EmbedAssets.cmake)
 # and copyright_file.cpp/license_file.cpp embed license text. Declared here
 # on launcher_core itself, not duplicated on every consumer, since these
 # are launcher_core's own compile-time requirements.
-add_dependencies(launcher_core generate_ca_bundle_header generate_apple_root_ca_header generate_logo_header generate_font_header generate_thirdparty_license_headers generate_license_header generate_i18n_header generate_default_flags_header)
+add_dependencies(launcher_core generate_ca_bundle_header generate_apple_root_ca_header generate_logo_header generate_font_header generate_thirdparty_license_headers generate_license_header generate_i18n_header generate_default_flags_header generate_asset_headers)
 
 # The window needs the interface stack's development tree, which only exists once the Makefile's $(UI) rule has run; without it only launcher_core and its tests build, and the Makefile refuses to finish.
 if(TUXBLOX_UI_STACK_DEV)
