@@ -649,6 +649,9 @@ HostAllowList=(
     '^libXi\.so\.6$$' '^libXrandr\.so\.2$$' '^libXcursor\.so\.1$$' '^libXdamage\.so\.1$$' '^libXfixes\.so\.3$$' '^libXinerama\.so\.1$$'
     '^libxcb\.so\.1$$' '^libxcb-render\.so\.0$$' '^libxcb-shm\.so\.0$$'
     '^libGL\.so\.1$$' '^libEGL\.so\.1$$' '^libGLdispatch\.so\.0$$'
+    # Desktop SVG rendering, like X11 and GL: the host already carries it, and
+    # building librsvg would add a Rust toolchain to the interface stack.
+    '^librsvg-2\.so\.2$$'
 )
 
 isElf() {
