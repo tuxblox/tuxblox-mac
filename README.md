@@ -6,7 +6,7 @@ This is a separate project from TuxBlox. TuxBlox stays focused on the Windows cl
 
 ## Status
 
-Early development. The macOS backend is being moved here from the experimental TuxBlox branch, and the standalone interface is being built around it.
+Early development. The first version is a single-window GTK launcher that installs, verifies, launches and stops the official macOS Player through Rosemary.
 
 ## What it will do
 
@@ -19,16 +19,26 @@ Early development. The macOS backend is being moved here from the experimental T
 
 There is no Windows or Studio support here. Those stay in TuxBlox.
 
-Discord Rich Presence, server-region notifications and the remaining settings come after the first working launcher.
+Discord Rich Presence, server-region notifications, desktop entries and the remaining settings come after the first working launcher.
 
 ## Requirements
 
-- Linux x86_64 or arm64
-- Rosemary (`rosemary` on `PATH`, or a pinned copy managed by the launcher)
+- Linux x86_64 (arm64 packaging is next)
+- Rosemary (`rosemary` on `PATH`, or `<data-dir>/rosemary/rosemary`)
 - OpenSSL, libcurl, libarchive and zlib for the backend
 - GTK4/libadwaita for the launcher interface
 
-Build instructions will be added with the first source import.
+## Building
+
+```sh
+cmake -S . -B build -G Ninja
+cmake --build build
+./build/tuxblox-mac
+```
+
+The client is kept in `~/.local/share/tuxblox-mac` by default; set `TUXBLOX_MAC_DIR` to use another directory. Rosemary is found through `TUXBLOX_ROSEMARY`, `<data-dir>/rosemary/rosemary`, or `PATH`.
+
+The first launch downloads the official Player from Roblox's setup CDN and verifies its Apple signature before installing it. Nothing is patched.
 
 ## Licensing
 
