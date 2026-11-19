@@ -1,0 +1,192 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "watch_launch.h"
+
+#include "flag_startup.h"
+#include "crash_report.h"
+#include "i18n.h"
+#include "install_paths.h"
+#include "presence_loop.h"
+#include "process_launcher.h"
+#include "process_name.h"
+#include "roblox_autoupdate.h"
+#include "roblox_log_capture.h"
+#include "settings.h"
+#include "server_region.h"
+#include "system_info.h"
+#include "ui_adw/message_box.h"
+#include "fastflag_file.h"
+#include "versions_manifest.h"
+#include "wine_shortcut_export.h"
+#include <ctime>
+#include <optional>
+#include <vector>
+
+namespace tuxblox {
+
+// The tail, not the whole file, because a long session writes a log that no clipboard is going to carry and nobody is going to paste.
+constexpr long kMaxLogCopyBytes = 4 * 1024 * 1024;
+
+int runWatchAndLaunch(const std::string& installDir, LaunchTarget target, const std::string& uri,
+                       const std::string& currentVersion) {
+    // The launcher and this watcher are the same binary, so without this they are the same name in
+    // every process list, and anything matching the launcher matches a running Roblox session too.
+    setProcessName("tuxbloxWatcher");
+
+    // This mode is reached before main() gets as far as the window, so it loads the flags
+    // itself: without it the first read here would seal an empty table, and the switches
+    // over crash reports and the server location notification would answer for the server
+    // without ever having asked it.
+    initLauncherFlags(installDir);
+
+    Settings settings = loadSettings(installDir);
+    i18n::initializeFromSetting(settings.language);
+
+    // Runs before the active version is resolved below, so a freshly
+    // installed version is the one that launches and gets its FastFlags.
+    // The Windows deploy has nothing to do with the macOS client: that
+    // backend gets its build from ensureCurrent() on the launch path instead.
+    if (!launcherFlags().macClient)
+        runRobloxUpdateCheck(installDir, target, settings);
+    // Straight after the install rather than only once the session ends, so a
+    // first-ever install gets its menu entry right away.
+    exportPrefixShortcuts(installDir, selfExePath());
+    // launchEnvPairs(), not parseEnvPairs(settings.envVars): a launch started
+    // from a desktop shortcut has to carry the graphics-card selection too,
+    // and this is the path that does not go through the running launcher.
+    auto extraEnv = launchEnvPairs(settings);
+
+    // Roblox reads FastFlags from a folder inside the version directory and every install makes a new one, so the file is rewritten on each launch rather than when the user edits a flag. A fresh prefix has no version directory until the official installer has made one, so flags start applying from the launch after that.
+    applyFastFlags(installDir, target, settings);
+
+    ProcessLauncher launcher(installDir);
+    std::time_t launchStart = std::time(nullptr);
+    auto outcome = launcher.launch(target, uri, extraEnv);
+    if (!outcome.ok) {
+        std::string message = i18n::trf("A TuxBlox process has exited with a non-zero exit code.\n{0}",
+                                        {outcome.errorMessage});
+        showErrorMessageBox(i18n::tr("TuxBlox Error"), message);
+        return 1;
+    }
+
+    const bool player = target == LaunchTarget::Player;
+    // This is also the wait for the session to end, so it runs whether or not either feature is on.
+    // The macOS client writes into the captured Rosemary output, not into the
+    // Windows Roblox log folder findSessionLog() looks in.
+    const std::string presenceLog =
+        launcherFlags().macClient && target == LaunchTarget::Player ? outcome.logPath : "";
+    runPresenceLoop(installDir, target, settings, launchStart,
+                    [&] { return launcher.pollIsRunning(target); },
+                    makeServerRegionWatcher(serverRegionNotifyEnabled(settings.serverRegionNotify),
+                                            presenceNotificationIcon(target)),
+                    presenceLog);
+
+    auto ev = launcher.takeExitEvent(target);
+
+    // Everything that was copied is in our log now, so the file it came from is not left behind as a second log for the same session.
+    const std::vector<std::string> appendedLogs =
+        appendRobloxSessionLogs(installDir, launchStart, outcome.logPath, player);
+    removeAppendedRobloxLogs(installDir, appendedLogs, player);
+
+    // How the session ended, on the end of its own log. Written whatever the code, because "it
+    // finished" is worth as much to somebody reading the log afterwards as a number to complain
+    // about, and written after the merge so it is the last line rather than the middle of one.
+    const std::optional<int> endedWith =
+        ev ? std::optional<int>(ev->exitCode) : findRealExitCodeInLog(outcome.logPath);
+    if (endedWith.has_value()) {
+        appendSessionLine(outcome.logPath,
+                          i18n::trf("Exit Code: {0}", {std::to_string(*endedWith)}));
+    }
+    exportPrefixShortcuts(installDir, selfExePath());
+
+    if (outcome.wasBootstrapInstall && ev && !ev->stopRequested && ev->exitCode == 0) {
+        // Only the first version of this program counts as installing it. An update brings another
+        // one, and putting the icon back then would overrule somebody who had deleted it.
+        const bool firstInstall = scanPrefixVersions(installDir, target).size() <= 1;
+        registerBootstrappedVersion(installDir, target);
+        if (firstInstall) {
+            writeClientDesktopShortcut(installDir, selfExePath(), target);
+        }
+    }
+
+    if (!ev || ev->stopRequested || ev->exitCode == 0) {
+        return 0; // clean exit (or nothing to report) -- no UI at all
+    }
+
+    int protonExitCode = ev->exitCode;
+    std::optional<int> robloxExitCode;
+    if (ev->exitCode == 2) {
+        robloxExitCode = findRealExitCodeInLog(outcome.logPath);
+    }
+    int displayCode = robloxExitCode.value_or(protonExitCode);
+
+    const char* title = exitCodeTitle(displayCode);
+    std::string exitCodeLine = i18n::trf("Exit Code: {0}", {std::to_string(displayCode)});
+    if (title) exitCodeLine += std::string(" (") + title + ")";
+
+    std::string popupTitle, message;
+    // Exit code 3 came from the layer when it checked the signature before launching. It now
+    // checks as the process starts instead, so the refusal arrives as Roblox's own exit code.
+    constexpr int kRefusedSignature = static_cast<int>(0xC0000428); // STATUS_INVALID_IMAGE_HASH
+    if (ev->exitCode == 3 || robloxExitCode == kRefusedSignature) {
+        showErrorMessageBox(i18n::tr("Failed to launch Roblox"),
+            i18n::tr("Failed to verify the integrity of Roblox. Some files might be unsigned or have "
+                     "been tampered with. Please make sure TuxBlox is up to date, then reinstall "
+                     "Roblox and try again."));
+        return 1;
+    }
+
+    if (ev->exitCode == 1) {
+        popupTitle = i18n::tr("TuxBlox Error");
+        message = i18n::tr("TuxBlox has encountered an error and has quit!");
+    } else if (ev->exitCode == 2) {
+        popupTitle = i18n::tr("Roblox Error");
+        message = i18n::tr("Roblox has exited with a non-zero exit code.\n") + exitCodeLine;
+    } else {
+        popupTitle = i18n::tr("Something went wrong");
+        message = i18n::tr("An unknown error has occurred which has crashed TuxBlox.\n") + exitCodeLine;
+    }
+
+    auto sendReport = [&] {
+        CrashReport report;
+        report.launcherVersion = currentVersion;
+        report.protonVersion = readInstalledCompatVersion(installDir).value_or("");
+        report.target = target;
+        report.protonExitCode = protonExitCode;
+        report.robloxExitCode = robloxExitCode;
+        report.logPath = outcome.logPath;
+        report.systemInfo = collectSystemInfo();
+        uploadCrashReport(report);
+    };
+
+    // tbxFlagDisableCrashTelemetry takes the whole feature away, the Report button included:
+    // a switch that stopped the automatic send but left a button that did it anyway would not
+    // be a way to stop reports arriving.
+    if (!launcherFlags().crashTelemetry) {
+        showErrorMessageBoxWithCopy(popupTitle, message, readLogTail(outcome.logPath, kMaxLogCopyBytes));
+    } else if (settings.sendCrashReports) {
+        sendReport();
+        // The log is already on its way, so what is left to offer is the copy somebody attaches to a bug report themselves.
+        showErrorMessageBoxWithCopy(popupTitle, message, readLogTail(outcome.logPath, kMaxLogCopyBytes));
+    } else if (showErrorMessageBoxWithAction(popupTitle, message, i18n::tr("Report"))) {
+        sendReport();
+    }
+
+    return 1;
+}
+
+} // namespace tuxblox

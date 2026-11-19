@@ -1,0 +1,102 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "cli.h"
+#include "i18n.h"
+#include <string>
+
+namespace tuxblox {
+namespace bootstrap {
+
+namespace {
+
+const char* const kPreviewFlag = "--preview-rbxinstaller";
+const char* const kInstallFlag = "--install-roblox";
+const char* const kUpdateFlag = "--update-roblox";
+
+bool setMode(CliOptions& options, Mode mode) {
+    if (options.mode != Mode::None) {
+        options.error = i18n::trf("Choose one of {0}, {1} or {2}.",
+                                  {kUpdateFlag, kInstallFlag, kPreviewFlag});
+        return false;
+    }
+    options.mode = mode;
+    return true;
+}
+
+} // namespace
+
+CommandAction commandAction(const CliOptions& options) {
+    // Version before help, and both before the error, exactly as the separate program answered them.
+    if (options.version) return CommandAction::Version;
+    if (options.help) return CommandAction::Usage;
+    if (!options.error.empty()) return CommandAction::Error;
+    return CommandAction::Run;
+}
+
+bool isCommandFlag(const std::string& arg) {
+    return arg == kPreviewFlag || arg == kInstallFlag || arg == kUpdateFlag;
+}
+
+CliOptions parseArgs(int argc, const char* const* argv) {
+    CliOptions options;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == kPreviewFlag) {
+            if (!setMode(options, Mode::Preview)) return options;
+        } else if (arg == kInstallFlag) {
+            if (!setMode(options, Mode::Install)) return options;
+        } else if (arg == kUpdateFlag) {
+            if (!setMode(options, Mode::Update)) return options;
+        } else if (arg == "--help" || arg == "-h") {
+            options.help = true;
+        } else if (arg == "--version") {
+            options.version = true;
+        } else {
+            options.error = i18n::trf("Unrecognised argument: {0}", {arg});
+            return options;
+        }
+    }
+
+    if (options.help || options.version) return options;
+    if (options.mode == Mode::None) {
+        options.error = i18n::tr("Nothing to do: pass --update-roblox, --install-roblox or --preview-rbxinstaller.");
+    }
+    return options;
+}
+
+std::string usageText() {
+    return i18n::tr(
+        "Usage: TuxBloxLauncher [--update-roblox | --install-roblox | --preview-rbxinstaller]\n"
+        "\n"
+        "  --update-roblox         Install the channel's newest version if it is missing.\n"
+        "                          Shows no window unless there is something to download.\n"
+        "  --install-roblox        Install the Roblox version the environment describes.\n"
+        "  --preview-rbxinstaller  Show the window without downloading or writing anything.\n"
+        "  --help                  Show this message.\n"
+        "  --version               Print the TuxBlox release and exit.\n"
+        "  --component-version     Print the launcher's own version and exit.\n"
+        "\n"
+        "Environment:\n"
+        "  TUXBLOX_BOOTSTRAPPER_DOWNLOAD_SERVER      Mirror to download from.\n"
+        "  TUXBLOX_BOOTSTRAPPER_DOWNLOAD_RBXHASH     Exact version, or blank for newest.\n"
+        "  TUXBLOX_BOOTSTRAPPER_DOWNLOAD_RBXCHANNEL  Roblox release channel.\n"
+        "  TUXBLOX_BOOTSTRAPPER_DOWNLOAD_APP         player or studio.\n"
+        "  TUXBLOX_BOOTSTRAPPER_INSTALL_DIR          Where versions are installed.\n");
+}
+
+} // namespace bootstrap
+} // namespace tuxblox

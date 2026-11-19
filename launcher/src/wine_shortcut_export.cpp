@@ -1,0 +1,610 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "wine_shortcut_export.h"
+#include "asset_roblox_player.h"
+#include "flag_startup.h"
+#include "mac_client.h"
+#include "prefix_user.h"
+#include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <system_error>
+#include <unistd.h>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace tuxblox {
+
+namespace {
+
+struct ExportTarget {
+    const char* exeLeaf;     // lowercased basename to match
+    const char* slug;        // "studio" / "player"
+    const char* name;        // shown in menus when we write the entry ourselves
+    const char* launchFlag;  // picks the installed version at launch, not now
+};
+
+const std::vector<ExportTarget>& exportTargets() {
+    static const std::vector<ExportTarget> targets = {
+        {"robloxstudiobeta.exe", "studio", "Roblox Studio", "--launch-studio"},
+        {"robloxplayerbeta.exe", "player", "Roblox Player", "--launch-player"},
+    };
+    return targets;
+}
+
+// Same buckets writeDesktopEntries() populates -- see its own comment for why
+// every size gets a copy rather than only 256x256.
+const char* const kIconSizes[] = {"16x16", "24x24", "32x32", "48x48",
+                                   "64x64", "96x96", "128x128", "256x256"};
+
+std::string toLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string trimCR(std::string s) {
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n')) s.pop_back();
+    return s;
+}
+
+std::string windowsBasename(const std::string& winPath) {
+    const size_t slash = winPath.find_last_of("\\/");
+    return slash == std::string::npos ? winPath : winPath.substr(slash + 1);
+}
+
+// Reads a flat key=value .desktop file. proton_shortcuts entries have exactly
+// one [Desktop Entry] group, so no group tracking is needed.
+std::string desktopValue(const std::string& contents, const std::string& key) {
+    size_t pos = 0;
+    while (pos <= contents.size()) {
+        size_t end = contents.find('\n', pos);
+        if (end == std::string::npos) end = contents.size();
+        const std::string line = trimCR(contents.substr(pos, end - pos));
+        if (line.compare(0, key.size(), key) == 0 && line.size() > key.size() &&
+            line[key.size()] == '=')
+            return line.substr(key.size() + 1);
+        if (end == contents.size()) break;
+        pos = end + 1;
+    }
+    return "";
+}
+
+std::string readWholeFile(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return "";
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+// Suffix for a same-directory temp path, unique enough that two concurrently
+// running launcher processes (allowed by design -- multiple Studio instances)
+// never collide on it.
+std::string tempSuffix() {
+    return ".tmp-" + std::to_string(static_cast<long>(getpid()));
+}
+
+// Writes `dest` via a same-directory temp file + rename(), so a reader (e.g.
+// a desktop environment's inotify watcher on ~/.local/share/applications)
+// never observes a half-written file. rename() is atomic only within one
+// filesystem, hence "same directory".
+bool writeFileAtomic(const fs::path& dest, const std::string& contents) {
+    const fs::path tmpPath = fs::path(dest.string() + tempSuffix());
+    {
+        std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        f << contents;
+        if (!f) return false;
+    }
+    std::error_code ec;
+    fs::rename(tmpPath, dest, ec);
+    if (ec) {
+        fs::remove(tmpPath, ec);
+        return false;
+    }
+    return true;
+}
+
+// An .icns is a flat container of typed entries. Modern ones carry their
+// bitmaps as ordinary PNG files, so the largest one can be handed straight to
+// the icon theme without an image library. Older ARGB entries are ignored.
+std::string pngFromIcns(const std::string& icns) {
+    auto bigEndian = [](const unsigned char *p) {
+        return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) |
+               (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+    };
+    if (icns.size() < 8 || icns.compare(0, 4, "icns") != 0) return std::string();
+    const auto *bytes = reinterpret_cast<const unsigned char *>(icns.data());
+    const uint32_t total = bigEndian(bytes + 4);
+    if (total < 8 || total > icns.size()) return std::string();
+
+    std::string best;
+    std::size_t at = 8;
+    while (at + 8 <= total) {
+        const uint32_t length = bigEndian(bytes + at + 4);
+        if (length < 8 || at + length > total) break;
+        const unsigned char *payload = bytes + at + 8;
+        const std::size_t payloadLength = length - 8;
+        const bool isPng = payloadLength >= 8 && std::memcmp(payload, "\x89PNG\r\n\x1a\n", 8) == 0;
+        if (isPng && payloadLength > best.size()) {
+            best.assign(reinterpret_cast<const char *>(payload), payloadLength);
+        }
+        at += length;
+    }
+    return best;
+}
+
+// The app icon carries the transparent margin Apple's icon grid asks for.
+// On a Linux panel that makes it look smaller than the Studio icon, which
+// fills its canvas. Crop to the opaque square and scale to the icon size
+// the menu will ask for; the rounded corners and the artwork stay as shipped.
+std::string trimIconPng(const std::string& png) {
+    GError *pError = nullptr;
+    GdkPixbufLoader *pLoader = gdk_pixbuf_loader_new();
+    bool ok = gdk_pixbuf_loader_write(pLoader,
+                                      reinterpret_cast<const guchar *>(png.data()), png.size(),
+                                      &pError);
+    if (ok) ok = gdk_pixbuf_loader_close(pLoader, &pError);
+    GdkPixbuf *pPixbuf = ok ? gdk_pixbuf_loader_get_pixbuf(pLoader) : nullptr;
+    if (pPixbuf != nullptr) g_object_ref(pPixbuf);
+    g_object_unref(pLoader);
+    if (pError != nullptr) g_error_free(pError);
+    if (pPixbuf == nullptr || !gdk_pixbuf_get_has_alpha(pPixbuf)) {
+        if (pPixbuf != nullptr) g_object_unref(pPixbuf);
+        return std::string();
+    }
+
+    const int width = gdk_pixbuf_get_width(pPixbuf);
+    const int height = gdk_pixbuf_get_height(pPixbuf);
+    const int channels = gdk_pixbuf_get_n_channels(pPixbuf);
+    const int stride = gdk_pixbuf_get_rowstride(pPixbuf);
+    const guchar *pPixels = gdk_pixbuf_get_pixels(pPixbuf);
+
+    int minX = width, minY = height, maxX = -1, maxY = -1;
+    for (int y = 0; y < height; y++) {
+        const guchar *pRow = pPixels + y * stride;
+        for (int x = 0; x < width; x++) {
+            // The shadow fades out well below this; the icon itself is opaque.
+            if (pRow[x * channels + 3] <= 128) continue;
+            minX = std::min(minX, x);
+            maxX = std::max(maxX, x);
+            minY = std::min(minY, y);
+            maxY = std::max(maxY, y);
+        }
+    }
+    if (maxX < minX || maxY < minY) {
+        g_object_unref(pPixbuf);
+        return std::string();
+    }
+    if (minX == 0 && minY == 0 && maxX == width - 1 && maxY == height - 1 &&
+        width == 256 && height == 256) {
+        g_object_unref(pPixbuf);
+        return png;
+    }
+
+    int side = std::max(maxX - minX + 1, maxY - minY + 1);
+    side = std::min(side, std::min(width, height));
+    int left = (minX + maxX + 1) / 2 - side / 2;
+    int top = (minY + maxY + 1) / 2 - side / 2;
+    left = std::clamp(left, 0, width - side);
+    top = std::clamp(top, 0, height - side);
+
+    GdkPixbuf *pSub = gdk_pixbuf_new_subpixbuf(pPixbuf, left, top, side, side);
+    GdkPixbuf *pScaled = pSub == nullptr
+                             ? nullptr
+                             : gdk_pixbuf_scale_simple(pSub, 256, 256, GDK_INTERP_BILINEAR);
+    std::string out;
+    if (pScaled != nullptr) {
+        gchar *pBuffer = nullptr;
+        gsize size = 0;
+        pError = nullptr;
+        if (gdk_pixbuf_save_to_buffer(pScaled, &pBuffer, &size, "png", &pError, nullptr)) {
+            out.assign(pBuffer, size);
+        }
+        g_free(pBuffer);
+        if (pError != nullptr) g_error_free(pError);
+    }
+    if (pScaled != nullptr) g_object_unref(pScaled);
+    if (pSub != nullptr) g_object_unref(pSub);
+    g_object_unref(pPixbuf);
+    return out;
+}
+
+// The macOS client has no Windows shortcut to copy an icon out of. Prefer the
+// Player icon the client itself ships, which is the artwork people recognise
+// and stays legible on both light and dark panels; fall back to the embedded
+// one if a build ever stops carrying it.
+std::string writeMacPlayerIcon(const std::string& installDir, const std::string& iconsDir) {
+    const std::string name = "tuxblox-roblox-player";
+
+    macclient::Build build;
+    if (macclient::installedBuild(installDir, build)) {
+        const fs::path icns = fs::path(build.app) / "Contents" / "Resources" / "AppIcon.icns";
+        std::error_code ec;
+        if (fs::is_regular_file(icns, ec) && !ec) {
+            const std::string png = pngFromIcns(readWholeFile(icns));
+            const std::string trimmed = png.empty() ? std::string() : trimIconPng(png);
+            const std::string &icon = trimmed.empty() ? png : trimmed;
+            const fs::path dir = fs::path(iconsDir) / "256x256" / "apps";
+            fs::create_directories(dir, ec);
+            if (!ec && !icon.empty() && writeFileAtomic(dir / (name + ".png"), icon)) {
+                // An older fallback SVG would otherwise win the theme lookup on
+                // desktops that prefer scalable icons, bringing back the
+                // unreadable black-on-dark artwork.
+                std::error_code rmEc;
+                fs::remove(fs::path(iconsDir) / "scalable" / "apps" / (name + ".svg"), rmEc);
+                return name;
+            }
+        }
+    }
+
+    const fs::path dir = fs::path(iconsDir) / "scalable" / "apps";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) return std::string();
+    const std::string svg(reinterpret_cast<const char *>(kAssetRobloxPlayer), kAssetRobloxPlayerLen);
+    if (!writeFileAtomic(dir / (name + ".svg"), svg)) return std::string();
+    return name;
+}
+
+// Copies the icon named by the source entry into every size bucket that has
+// one, under a deterministic TuxBlox-owned name. Returns the Icon= value to
+// write, or "" if nothing was copied. Each copy lands via a temp file +
+// rename() for the same reason writeFileAtomic() does.
+std::string copyIcons(const fs::path& srcIconsRoot, const std::string& sourceIconName,
+                       const fs::path& iconsDir, const std::string& slug) {
+    if (sourceIconName.empty()) return "";
+    const std::string destName = std::string("tuxblox-roblox-") + slug;
+    bool copiedAny = false;
+    for (const char* size : kIconSizes) {
+        const fs::path src = srcIconsRoot / size / "apps" / (sourceIconName + ".png");
+        std::error_code ec;
+        if (!fs::exists(src, ec) || ec) continue;
+        const fs::path destDir = iconsDir / size / "apps";
+        fs::create_directories(destDir, ec);
+        if (ec) continue;
+        const fs::path dest = destDir / (destName + ".png");
+        const fs::path tmp = fs::path(dest.string() + tempSuffix());
+        fs::copy_file(src, tmp, fs::copy_options::overwrite_existing, ec);
+        if (ec) continue;
+        fs::rename(tmp, dest, ec);
+        if (ec) {
+            fs::remove(tmp, ec);
+            continue;
+        }
+        copiedAny = true;
+    }
+    return copiedAny ? destName : "";
+}
+
+} // namespace
+
+std::string unescapeWinemenubuilderPath(const std::string& escaped) {
+    std::string out;
+    size_t i = 0;
+    while (i < escaped.size()) {
+        if (escaped.compare(i, 4, "\\\\\\\\") == 0) {
+            out.push_back('\\');
+            i += 4;
+        } else {
+            out.push_back(escaped[i]);
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::string quotedExecValue(const std::string& execValue) {
+    // The value is `"<escaped windows path>" ""`. Backslashes are escaped but
+    // quotes are not, so the next '"' really is the closing delimiter.
+    const size_t open = execValue.find('"');
+    if (open == std::string::npos) return "";
+    const size_t close = execValue.find('"', open + 1);
+    if (close == std::string::npos) return "";
+    return execValue.substr(open + 1, close - open - 1);
+}
+
+std::string exeFromDesktopExecLine(const std::string& execValue) {
+    return unescapeWinemenubuilderPath(quotedExecValue(execValue));
+}
+
+// True when that Roblox program is installed in the virtual drive, whichever
+// version folder it sits in.
+bool isTargetInstalled(const std::string& installDir, const char* exeLeaf) {
+    const fs::path versions =
+        fs::path(prefixUserDir(installDir)) / "AppData" / "Local" / "Roblox" / "Versions";
+    std::error_code ec;
+    fs::directory_iterator it(versions, ec);
+    if (ec) return false;
+    for (const auto& version : it) {
+        std::error_code fileEc;
+        for (const auto& file : fs::directory_iterator(version.path(), fileEc)) {
+            if (fileEc) break;
+            if (toLower(file.path().filename().string()) == exeLeaf) return true;
+        }
+    }
+    return false;
+}
+
+// The entry we write when Roblox was installed without a Windows shortcut for
+// us to convert. TuxBlox's own downloader installs the files directly, so
+// winemenubuilder never runs and proton_shortcuts stays empty -- but the
+// window class is fixed per program, and that is the part a taskbar needs to
+// recognise the window and offer to pin it. The Exec launches through TuxBlox
+// rather than a recorded path, so it follows whichever version is installed.
+std::string builtinEntry(const ExportTarget& target, const std::string& launcherExePath,
+                         const std::string& iconsDir, const char *pWindowClass) {
+    const std::string slugIcon = std::string("tuxblox-roblox-") + target.slug;
+    std::error_code ec;
+    const bool haveSlugIcon =
+        fs::exists(fs::path(iconsDir) / "256x256" / "apps" / (slugIcon + ".png"), ec) ||
+        fs::exists(fs::path(iconsDir) / "scalable" / "apps" / (slugIcon + ".svg"), ec);
+
+    std::ostringstream out;
+    out << "[Desktop Entry]\n"
+           "Type=Application\n"
+           "Name=" << target.name << "\n"
+           "Comment=via TuxBlox\n"
+           "Keywords=Wine;TuxBlox;Roblox;Game;\n"
+           "Exec=\"" << launcherExePath << "\" " << target.launchFlag << "\n"
+           "Icon=" << (haveSlugIcon ? slugIcon : "tuxblox") << "\n"
+           "Terminal=false\n"
+           "StartupNotify=true\n"
+           "StartupWMClass=" << pWindowClass << "\n"
+           "Categories=Game;\n";
+    return out.str();
+}
+
+// The line that says TuxBlox wrote this file, and the only thing that authorises removing it.
+const char GeneratedMarker[] = "X-TuxBlox-Generated=true";
+
+std::string clientDesktopEntry(LaunchTarget target, const std::string& launcherExePath,
+                               bool haveIcon) {
+    const ExportTarget *pTarget = nullptr;
+    for (const auto& candidate : exportTargets()) {
+        const bool player = std::string(candidate.slug) == "player";
+        if (player == (target == LaunchTarget::Player)) pTarget = &candidate;
+    }
+    if (pTarget == nullptr) return std::string();
+
+    const std::string icon = haveIcon ? std::string("tuxblox-roblox-") + pTarget->slug : "tuxblox";
+    std::ostringstream out;
+    out << "[Desktop Entry]\n"
+           "Type=Application\n"
+           "Name=" << pTarget->name << "\n"
+           "Comment=via TuxBlox\n"
+           "Exec=\"" << launcherExePath << "\" " << pTarget->launchFlag << "\n"
+           "Icon=" << icon << "\n"
+           "Terminal=false\n"
+           "StartupNotify=true\n"
+           "StartupWMClass=" << pTarget->exeLeaf << "\n"
+           "Categories=Game;\n"
+           // The menu entry beside this one is what application searches read. Without this the
+           // desktop copy is indexed too and the same program is offered twice.
+           "NoDisplay=true\n"
+        << GeneratedMarker << "\n";
+    return out.str();
+}
+
+bool writeClientDesktopShortcut(const std::string& installDir, const std::string& launcherExePath,
+                                LaunchTarget target) {
+    const ExportTarget *pTarget = nullptr;
+    for (const auto& candidate : exportTargets()) {
+        const bool player = std::string(candidate.slug) == "player";
+        if (player == (target == LaunchTarget::Player)) pTarget = &candidate;
+    }
+    if (pTarget == nullptr) return false;
+
+    const std::string driveC = installDir + "/runtime/pfx/drive_c";
+    const fs::path desktop =
+        fs::path(driveC) / "users" / prefixUserName(driveC) / "Desktop";
+    std::error_code ec;
+    if (!fs::is_directory(desktop, ec)) return false;
+
+    const char *pHome = std::getenv("HOME");
+    const std::string iconsDir =
+        pHome == nullptr ? std::string() : std::string(pHome) + "/.local/share/icons/hicolor";
+    const bool haveIcon =
+        !iconsDir.empty() &&
+        fs::exists(fs::path(iconsDir) / "256x256" / "apps" /
+                       (std::string("tuxblox-roblox-") + pTarget->slug + ".png"), ec);
+
+    const fs::path file = desktop / (std::string(pTarget->name) + ".desktop");
+    if (!writeFileAtomic(file, clientDesktopEntry(target, launcherExePath, haveIcon))) return false;
+    // A desktop entry that is not executable is refused with a warning rather than launched.
+    fs::permissions(file,
+                    fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
+                    fs::perm_options::add, ec);
+    return true;
+}
+
+int translateDesktopShortcuts(const std::string& installDir, const std::string& launcherExePath) {
+    const std::string driveC = installDir + "/runtime/pfx/drive_c";
+    // The desktop itself, for a shortcut still sitting there, and the folder the compatibility layer
+    // moves one into as soon as it reads it, which is where they arrive while Roblox is running.
+    const fs::path places[] = {fs::path(driveC) / "users" / prefixUserName(driveC) / "Desktop",
+                               fs::path(driveC) / "proton_shortcuts"};
+
+    // Collected before any of them is acted on, since writing an entry adds a file to one of these folders.
+    std::vector<fs::path> shortcuts;
+    for (const fs::path& place : places) {
+        std::error_code ec;
+        if (!fs::is_directory(place, ec)) continue;
+        for (const auto& entry : fs::directory_iterator(place, ec)) {
+            if (ec) break;
+            if (toLower(entry.path().extension().string()) == ".lnk") shortcuts.push_back(entry.path());
+        }
+    }
+
+    int translated = 0;
+    for (const fs::path& shortcut : shortcuts) {
+        const std::string blob = readWholeFile(shortcut);
+        const std::vector<unsigned char> bytes(blob.begin(), blob.end());
+        for (const LaunchTarget target : {LaunchTarget::Player, LaunchTarget::Studio}) {
+            if (extractExeRelPathFromLnkBytes(bytes, targetExeName(target)).empty()) continue;
+            // Taken away only once its replacement is there, so a shortcut is never simply lost.
+            if (writeClientDesktopShortcut(installDir, launcherExePath, target)) {
+                std::error_code removeEc;
+                if (fs::remove(shortcut, removeEc)) translated++;
+            }
+            break;
+        }
+    }
+    return translated;
+}
+
+int removeGeneratedDesktopShortcuts(const std::string& desktopDir) {
+    std::error_code ec;
+    if (!fs::is_directory(desktopDir, ec)) return 0;
+
+    int removed = 0;
+    for (const auto& entry : fs::directory_iterator(desktopDir, ec)) {
+        if (ec) break;
+        if (entry.path().extension() != ".desktop") continue;
+        if (readWholeFile(entry.path()).find(GeneratedMarker) == std::string::npos) continue;
+        std::error_code removeEc;
+        if (fs::remove(entry.path(), removeEc)) removed++;
+    }
+    return removed;
+}
+
+void exportPrefixShortcutsTo(const std::string& installDir, const std::string& launcherExePath,
+                             const std::string& appsDir, const std::string& iconsDir) {
+    try {
+        const fs::path shortcutsDir =
+            fs::path(installDir) / "runtime" / "pfx" / "drive_c" / "proton_shortcuts";
+
+        // Correction to the brief: the real call path (watch_launch.cpp, after
+        // a session ends) has no reason to have created ~/.local/share/applications
+        // first, so this must create it rather than assume the caller did.
+        std::error_code mkEc;
+        fs::create_directories(appsDir, mkEc);
+
+        // While the macOS backend is active, a Windows Player shortcut must
+        // not replace the entry that starts through it. The macOS client is
+        // the Player this install would launch.
+        const bool macPlayer = launcherFlags().macClient &&
+                               macclient::hasInstalledClient(installDir);
+
+        std::vector<std::string> produced;
+
+        std::error_code ec;
+        fs::directory_iterator it(shortcutsDir, ec);
+        if (!ec) {
+            for (const auto& entry : it) {
+                if (entry.path().extension() != ".desktop") continue;
+
+                const std::string contents = readWholeFile(entry.path());
+                // Keep the escaped substring as-is for the Exec= line we write
+                // below (a desktop-entry value needs backslashes re-escaped,
+                // and winemenubuilder's own four-backslash form already
+                // round-trips through GIO correctly -- see
+                // unescapeWinemenubuilderPath()'s comment for where that form
+                // comes from). Only the basename match needs the unescaped
+                // path.
+                const std::string escapedExe = quotedExecValue(desktopValue(contents, "Exec"));
+                const std::string exe = unescapeWinemenubuilderPath(escapedExe);
+                if (exe.empty()) continue;
+
+                const std::string leaf = toLower(windowsBasename(exe));
+                const char* slug = nullptr;
+                for (const auto& t : exportTargets())
+                    if (leaf == t.exeLeaf) slug = t.slug;
+                if (!slug) continue; // not Roblox -- don't publish it
+                if (macPlayer && std::string(slug) == "player") continue;
+
+                std::string name = desktopValue(contents, "Name");
+                if (name.empty()) name = windowsBasename(exe);
+                const std::string wmClass = desktopValue(contents, "StartupWMClass");
+
+                std::string icon = copyIcons(shortcutsDir / "icons",
+                                              desktopValue(contents, "Icon"), iconsDir, slug);
+                if (icon.empty()) icon = "tuxblox";
+
+                const std::string id = std::string("tuxblox-roblox-") + slug + ".desktop";
+                std::ostringstream out;
+                out << "[Desktop Entry]\n"
+                       "Type=Application\n"
+                       "Name=" << name << "\n"
+                       "Comment=via TuxBlox\n"
+                       // Application searches read Keywords but not Comment,
+                       // so without these an entry named "Roblox Studio" is
+                       // unfindable by "tuxblox" or "wine".
+                       "Keywords=Wine;TuxBlox;Roblox;Game;\n"
+                       // --run-exe re-resolves the current version rather than
+                       // launching this recorded path, so the entry keeps
+                       // working after Roblox updates -- see main.cpp. The
+                       // path is written back in its still-escaped form
+                       // (escapedExe), not the human-readable `exe` -- see
+                       // the comment above where escapedExe is computed.
+                       "Exec=\"" << launcherExePath << "\" --run-exe \"" << escapedExe << "\"\n"
+                       "Icon=" << icon << "\n"
+                       "Terminal=false\n"
+                       "StartupNotify=true\n";
+                if (!wmClass.empty()) out << "StartupWMClass=" << wmClass << "\n";
+                out << "Categories=Game;\n";
+                if (writeFileAtomic(fs::path(appsDir) / id, out.str())) produced.push_back(id);
+            }
+        }
+
+        // No Windows shortcut produced this one. Write our own entry while the
+        // program is installed, and remove it only once it has gone (Roblox
+        // uninstalled, prefix wiped). Only ever touches the ids this function owns.
+        for (const auto& t : exportTargets()) {
+            const std::string id = std::string("tuxblox-roblox-") + t.slug + ".desktop";
+            bool stillThere = false;
+            for (const auto& p : produced) if (p == id) stillThere = true;
+            if (stillThere) continue;
+            // The macOS backend keeps the Player outside the Windows version
+            // tree, so the usual check cannot see it. The entry is only useful
+            // while the backend is on: with the flag off, --launch-player would
+            // look for a Windows Player that was never installed.
+            const bool macPlayerTarget = macPlayer && std::string(t.slug) == "player";
+            if (macPlayerTarget || isTargetInstalled(installDir, t.exeLeaf)) {
+                if (macPlayerTarget) writeMacPlayerIcon(installDir, iconsDir);
+                writeFileAtomic(fs::path(appsDir) / id,
+                                builtinEntry(t, launcherExePath, iconsDir,
+                                             macPlayerTarget ? "net.tuxblox.TuxBlox.Player" : t.exeLeaf));
+                continue;
+            }
+            std::error_code rmEc;
+            fs::remove(fs::path(appsDir) / id, rmEc);
+        }
+    } catch (...) {
+        // Best-effort -- must never fail an otherwise-working launch.
+    }
+}
+
+void exportPrefixShortcuts(const std::string& installDir, const std::string& launcherExePath) {
+    const char* home = std::getenv("HOME");
+    if (!home || home[0] == '\0') return;
+    exportPrefixShortcutsTo(installDir, launcherExePath,
+                             std::string(home) + "/.local/share/applications",
+                             std::string(home) + "/.local/share/icons/hicolor");
+    // After the entries above, because the icon on the desktop is one of them.
+    if (launcherFlags().translateWindowsShortcuts) {
+        translateDesktopShortcuts(installDir, launcherExePath);
+    }
+}
+
+} // namespace tuxblox

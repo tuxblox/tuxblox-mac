@@ -1,0 +1,43 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#pragma once
+#include <string>
+
+#include "lnk_resolver.h"
+
+namespace tuxblox {
+
+// What one Home card's button says. The Player's turns into Stop because only one
+// Player session runs at a time; Studio's stays a Launch button, since another
+// session can start while others are open. What is open, and stopping one of
+// them, belongs to the list below the cards rather than to the cards.
+struct CardState {
+    std::string launchLabel;
+    // The main button stops the session rather than starting one, so it is red.
+    bool launchStops = false;
+    // A launch is on its way but has no session yet, which is most of an install. The button says so and refuses further clicks rather than looking like it did nothing.
+    bool launchDisabled = false;
+};
+
+// Kept apart from the Home page so it can be tested without a display.
+// `playerEnabled` is what tbxFlagDisablePlayerButton leaves of the Player button: the gate is a
+// flag rather than a setting, so it can be lifted for everyone the day Player support ships, and
+// anyone who wants it early can set it in their own flags.json.
+CardState cardState(LaunchTarget target, bool installed, int sessions, bool stopping, bool launchPending,
+                     bool playerEnabled);
+
+} // namespace tuxblox

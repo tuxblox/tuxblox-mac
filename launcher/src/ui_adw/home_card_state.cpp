@@ -1,0 +1,53 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "home_card_state.h"
+#include "i18n.h"
+
+namespace tuxblox {
+
+CardState cardState(LaunchTarget target, bool installed, int sessions, bool stopping, bool launchPending,
+                     bool playerEnabled) {
+    CardState state;
+    const bool playerRunning = target == LaunchTarget::Player && sessions > 0;
+    if (playerRunning) {
+        state.launchLabel = stopping ? i18n::tr("Stopping…") : i18n::tr("Stop Player");
+        state.launchStops = true;
+        return state;
+    }
+
+    // Below the branch above on purpose: a running Player must stay stoppable.
+    if (target == LaunchTarget::Player && !playerEnabled) {
+        state.launchLabel = i18n::tr("Coming soon");
+        state.launchDisabled = true;
+        return state;
+    }
+
+    if (!installed) {
+        state.launchLabel = i18n::tr("Install & Launch");
+    } else {
+        state.launchLabel = target == LaunchTarget::Player ? i18n::tr("Launch Player") : i18n::tr("Launch Studio");
+    }
+
+    // Nothing has started yet, so there is nothing to stop and no point offering another go.
+    if (launchPending && !state.launchStops) {
+        state.launchLabel = i18n::tr("Starting…");
+        state.launchDisabled = true;
+    }
+    return state;
+}
+
+} // namespace tuxblox

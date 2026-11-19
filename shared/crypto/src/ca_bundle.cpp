@@ -1,0 +1,92 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "ca_bundle.h"
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+
+#include "tuxblox_ca_bundle_pem.h"
+
+namespace tuxblox {
+
+namespace {
+
+// Where each family of Linux keeps its list, first match wins. Only whole files are looked for,
+// because a download takes one path and a folder of certificates needs the machine's own index intact.
+const char *const MachineBundlePaths[] = {
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/ssl/cert.pem",
+};
+
+bool isReadableFile(const std::filesystem::path& path) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(path, error) || error) return false;
+    std::ifstream probe(path, std::ios::binary);
+    return probe.good();
+}
+
+} // namespace
+
+std::string caBundlePath() {
+    // A list the environment points at wins, but only when it is really there: a leftover setting
+    // in somebody's shell profile must not stop every download instead.
+    if (const char *pFromEnvironment = std::getenv("SSL_CERT_FILE")) {
+        if (*pFromEnvironment && isReadableFile(pFromEnvironment)) return pFromEnvironment;
+    }
+    for (const char *pCandidate : MachineBundlePaths) {
+        if (isReadableFile(pCandidate)) return pCandidate;
+    }
+    return std::string();
+}
+
+std::string caBundleEmbedded() {
+    return std::string(reinterpret_cast<const char *>(kTuxBloxCaBundlePem),
+                       kTuxBloxCaBundlePemLen);
+}
+
+void applyCaBundle(CURL *pCurl) {
+    applyCaBundleWith(pCurl, caBundlePath());
+}
+
+void applyCaBundleWith(CURL *pCurl, const std::string& bundlePath) {
+    // A folder of certificates is passed through untouched, since that is the machine's own layout.
+    if (const char *pDirectory = std::getenv("SSL_CERT_DIR")) {
+        if (*pDirectory) curl_easy_setopt(pCurl, CURLOPT_CAPATH, pDirectory);
+    }
+
+    const std::string& bundle = bundlePath;
+    if (!bundle.empty()) {
+        curl_easy_setopt(pCurl, CURLOPT_CAINFO, bundle.c_str());
+        return;
+    }
+
+    // Nothing on this machine was usable, so the copy built into TuxBlox is handed over directly from
+    // memory. It is never written to a file: a list of certificates sitting at a predictable path in a
+    // folder every user can write to could be swapped between being written and being read, and
+    // whoever swapped it would decide which sites TuxBlox trusts.
+    static const std::string embedded = caBundleEmbedded();
+    struct curl_blob blob;
+    blob.data = const_cast<char *>(embedded.data());
+    blob.len = embedded.size();
+    blob.flags = CURL_BLOB_COPY;
+    curl_easy_setopt(pCurl, CURLOPT_CAINFO_BLOB, &blob);
+}
+
+} // namespace tuxblox

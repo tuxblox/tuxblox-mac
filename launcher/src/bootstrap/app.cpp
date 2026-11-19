@@ -1,0 +1,479 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "app.h"
+
+#include "flag_startup.h"
+#include "checksum.h"
+#include "i18n.h"
+#include "downloader.h"
+#include "install_concurrency.h"
+#include "install_plan.h"
+#include "roblox_deploy.h"
+#include "tar_extract.h"
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace tuxblox {
+namespace bootstrap {
+
+namespace {
+
+// The package set a Studio install actually downloads. Preview walks this
+// list so the window shows realistic names without contacting anything.
+const std::vector<std::string>& previewPackages() {
+    static const std::vector<std::string> kPackages = {
+        "RobloxApp.zip",
+        "redist.zip",
+        "shaders.zip",
+        "ssl.zip",
+        "content-avatar.zip",
+        "content-fonts.zip",
+        "content-sky.zip",
+        "content-sounds.zip",
+        "content-textures2.zip",
+        "extracontent-luapackages.zip",
+        "extracontent-translations.zip",
+        "BuiltInPlugins.zip",
+        "ApplicationConfig.zip",
+        "Plugins.zip",
+        "StudioFonts.zip",
+        "Qml.zip",
+    };
+    return kPackages;
+}
+
+// Enough connections to keep the link busy without hammering Roblox's CDN. How many is
+// tbxIntRobloxInstallerParallelWorkers, and whether at all is the flag beside it, so a
+// CDN that answers badly under load can be given one connection again without a release.
+
+const char* titleFor(Mode mode) {
+    switch (mode) {
+        case Mode::Preview: return i18n::tr("Preview Mode");
+        case Mode::Update:  return i18n::tr("Checking for updates...");
+        case Mode::Install: return i18n::tr("Installing Roblox");
+        case Mode::None:    break;
+    }
+    return "TuxBlox";
+}
+
+void nap(int milliseconds) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+}
+
+} // namespace
+
+App::App(Mode mode, Config config) : mode_(mode), config_(std::move(config)) {
+    snapshot_.status = titleFor(mode);
+    // Every mode but Update was asked for directly, so its window belongs on
+    // screen immediately. Update earns one only if it finds work to do.
+    needsWindow_ = mode != Mode::Update;
+}
+
+App::~App() {
+    cancel();
+    if (thread_.joinable()) thread_.join();
+}
+
+void App::start() {
+    if (thread_.joinable()) return;
+    // The bootstrapper is reached before main() gets anywhere near initLauncherFlags(), and
+    // it is the very thing tbxFlagEnableParallelWorkersForRobloxInstaller describes -- so it
+    // loads the flags itself. Without this the first read would seal an empty table and
+    // every flag would answer "off", which here means downloading Roblox one file at a time.
+    initLauncherFlags(config_.installDir);
+    thread_ = std::thread(&App::run, this);
+}
+
+void App::cancel() { cancelled_ = true; }
+
+Snapshot App::snapshot() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return snapshot_;
+}
+
+bool App::finished() const { return finished_; }
+
+bool App::holdsOpenWhenDone() const { return mode_ == Mode::Preview; }
+
+void App::setStatus(const std::string& status, double percent) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.phase = Phase::Working;
+    snapshot_.status = status;
+    snapshot_.overallPercent = percent;
+}
+
+void App::finish(const std::string& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.phase = Phase::Done;
+    snapshot_.status = message;
+    snapshot_.overallPercent = 100.0;
+    finished_ = true;
+}
+
+void App::fail(const std::string& message) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.phase = Phase::Error;
+    snapshot_.errorMessage = message;
+    finished_ = true;
+}
+
+void App::run() {
+    switch (mode_) {
+        case Mode::Preview:
+            runPreview();
+            break;
+        case Mode::Install:
+            runInstall(false);
+            break;
+        case Mode::Update:
+            runInstall(true);
+            break;
+        case Mode::None:
+            fail(i18n::tr("Nothing to do."));
+            break;
+    }
+}
+
+// No downloader and no filesystem work is constructed anywhere on this path,
+// so preview cannot touch the network or the disk even if it is wrong.
+void App::runPreview() {
+    // Every line says so, because the steps below name real packages and
+    // would otherwise read as a download that is actually happening.
+    const std::string prefix = i18n::tr("Preview Mode - ");
+    const auto& packages = previewPackages();
+    // Two opening steps, then three per package.
+    const double steps = 2.0 + static_cast<double>(packages.size()) * 3.0;
+    double done = 0.0;
+    auto advance = [&](const std::string& status, int pauseMs) {
+        if (cancelled_) return false;
+        done += 1.0;
+        setStatus(prefix + status, done / steps * 100.0);
+        nap(pauseMs);
+        return !cancelled_;
+    };
+
+    if (!advance(i18n::tr("Contacting Roblox servers"), 700)) return;
+    if (!advance(i18n::tr("Fetching the package list"), 500)) return;
+
+    for (const auto& package : packages) {
+        if (!advance(i18n::trf("Downloading {0}", {package}), 220)) return;
+        if (!advance(i18n::trf("Extracting {0}", {package}), 140)) return;
+        if (!advance(i18n::trf("Installing {0}", {package}), 90)) return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot_.phase = Phase::Done;
+        snapshot_.status = prefix + i18n::tr("Finished");
+        snapshot_.overallPercent = 100.0;
+    }
+    finished_ = true;
+}
+
+
+// Resolves the version to install, then downloads, verifies and extracts
+// every package into <installDir>/<hash>.
+void App::runInstall(bool skipIfPresent) {
+    const std::vector<std::string> mirrors = mirrorsFor(config_);
+    const bool updating = mode_ == Mode::Update;
+
+    std::string hash = config_.hash;
+    if (hash.empty()) {
+        setStatus(updating ? i18n::tr("Checking for updates...") : i18n::tr("Contacting Roblox servers"), 2.0);
+        try {
+            hash = parseClientVersionHash(fetchClientVersionJson(
+                robloxBinaryType(config_.app), config_.channel, &cancelled_));
+        } catch (const std::exception& e) {
+            const std::string detail = e.what();
+            if (isNotAuthorized(detail)) {
+                fail(i18n::tr("Roblox does not allow this channel to be looked up. Name an exact "
+                              "version instead, or use the live channel."));
+            } else {
+                fail(i18n::trf("Could not work out which version to install: {0}", {detail}));
+            }
+            return;
+        }
+    }
+    if (cancelled_) return;
+
+    const std::string target = versionDir(config_.installDir, hash);
+    // Checked by executable, not by directory: a folder left behind by an
+    // interrupted install has to be finished, not mistaken for a version.
+    // A named version is checked against either app, since its hash already
+    // decided which one it is.
+    const bool present = config_.hash.empty() ? versionIsInstalled(target, config_.app)
+                                               : versionIsInstalledForAnyApp(target);
+    if (skipIfPresent && present) {
+        finish(i18n::tr("Roblox is up to date"));
+        return;
+    }
+
+    // Past this point there is a real download, which is worth showing. An
+    // update check that got here has already spent its network round trip
+    // headless, so the window appears for the part that takes time rather
+    // than for the part that usually finds nothing.
+    needsWindow_ = true;
+
+    // A leftover directory would otherwise collide with the rename at the end.
+    if (fs::exists(target)) {
+        std::error_code stale;
+        fs::remove_all(target, stale);
+    }
+
+    setStatus(i18n::tr("Fetching the package list"), 5.0);
+    std::vector<PackageEntry> packages;
+    try {
+        std::string manifestText;
+        std::string lastError = "no mirror attempted";
+        bool ok = false;
+        for (const auto& mirror : mirrors) {
+            try {
+                manifestText = fetchText(
+                    setupCdnUrl(mirror, config_.channel, hash, "rbxPkgManifest.txt"), &cancelled_);
+                ok = true;
+                break;
+            } catch (const std::exception& e) {
+                lastError = e.what();
+            }
+        }
+        if (!ok) throw std::runtime_error(lastError);
+        packages = parsePackageManifest(manifestText);
+    } catch (const std::exception& e) {
+        fail(i18n::trf("Could not fetch the package list (Roblox may have removed this "
+                       "version): {0}", {e.what()}));
+        return;
+    }
+    if (cancelled_) return;
+
+    std::error_code error;
+    const std::string staging = target + ".partial";
+    fs::remove_all(staging, error);
+    fs::create_directories(staging, error);
+    if (error) {
+        fail(i18n::trf("Could not create {0}: {1}", {staging, error.message()}));
+        return;
+    }
+
+    // Anything that fails from here leaves nothing behind: the version only
+    // becomes visible to Roblox once every package is in place.
+    auto abandon = [&](const std::string& message) {
+        std::error_code ignored;
+        fs::remove_all(staging, ignored);
+        fail(message);
+    };
+
+    const std::vector<PackageJob> jobs = buildJobs(packages, config_.app, staging);
+    if (jobs.empty()) {
+        abandon(i18n::tr("Roblox's package list had nothing TuxBlox knows how to install."));
+        return;
+    }
+
+    // Downloading and extracting run together: a connection spends most of its life
+    // waiting, so the unpacking is nearly free if it happens while the next package arrives.
+    const uint64_t totalBytes = totalPackedBytes(jobs);
+    std::vector<std::atomic<uint64_t>> received(jobs.size());
+    for (auto& value : received) value = 0;
+
+    // One lock per destination. Seven packages share the version root and must never
+    // write it at once; the rest own a directory each and unpack in parallel.
+    std::vector<std::string> jobDests;
+    jobDests.reserve(jobs.size());
+    for (const PackageJob& job : jobs) jobDests.push_back(job.destDir);
+    const std::vector<std::string> dests = distinctDestDirs(jobDests);
+    std::vector<std::mutex> destLocks(dests.size());
+
+    std::atomic<size_t> nextJob{0};
+    std::atomic<size_t> extracted{0};
+    std::atomic<size_t> downloadersLeft{0};
+    std::atomic<bool> stop{false};
+    std::mutex failureMutex;
+    std::string failure;
+
+    std::mutex queueMutex;
+    std::condition_variable queueReady;
+    std::deque<size_t> ready;
+
+    double highestFraction = 0.0;
+
+    auto noteFailure = [&](const std::string& message) {
+        {
+            std::lock_guard<std::mutex> lock(failureMutex);
+            if (failure.empty()) failure = message;
+        }
+        {
+            // Set under the queue lock, or a waiter can miss the notify and never wake.
+            std::lock_guard<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        queueReady.notify_all();
+    };
+
+    auto publishProgress = [&]() {
+        uint64_t done = 0;
+        for (const auto& value : received) done += value;
+        const size_t unpacked = extracted.load();
+        std::lock_guard<std::mutex> lock(mutex_);
+        // Ratcheted under the lock: a mirror retry restarts a package at zero bytes.
+        snapshot_.overallPercent =
+            6.0 + 92.0 * monotonicInstallFraction(highestFraction, done, totalBytes, unpacked, jobs.size());
+    };
+
+    auto downloadWorker = [&]() {
+        for (;;) {
+            const size_t index = nextJob++;
+            if (index >= jobs.size() || stop || cancelled_) break;
+            const PackageJob& job = jobs[index];
+
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                snapshot_.status = i18n::trf("Downloading {0}", {job.name});
+            }
+
+            DownloadOutcome outcome{DownloadResult::Failed, "no mirror attempted"};
+            for (const auto& mirror : mirrors) {
+                outcome = downloadFile(
+                    setupCdnUrl(mirror, config_.channel, hash, job.name), job.archivePath,
+                    [&](uint64_t now, uint64_t) {
+                        received[index] = now;
+                        publishProgress();
+                    },
+                    &cancelled_);
+                if (outcome.result == DownloadResult::Ok) break;
+                if (stop || cancelled_) break;
+            }
+            if (stop || cancelled_) break;
+
+            if (outcome.result != DownloadResult::Ok) {
+                noteFailure(i18n::trf("Could not download {0}: {1}", {job.name, outcome.errorMessage}));
+                break;
+            }
+            // Still before extraction, so a corrupted package never reaches the drive.
+            if (md5File(job.archivePath) != job.md5) {
+                noteFailure(i18n::trf("Checksum mismatch for {0} -- refusing to install a corrupted package.", {job.name}));
+                break;
+            }
+            received[index] = job.packedSize;
+
+            {
+                std::lock_guard<std::mutex> lock(queueMutex);
+                ready.push_back(index);
+            }
+            queueReady.notify_one();
+        }
+
+        // Every exit path passes here, or an extractor could wait on work that never comes.
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            --downloadersLeft;
+        }
+        queueReady.notify_all();
+    };
+
+    auto extractWorker = [&]() {
+        for (;;) {
+            size_t index = 0;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                // Timed, because cancelled_ is set from outside and cannot take this lock to notify.
+                // On the wall clock rather than wait_for, because libstdc++ routes wait_for through pthread_cond_clockwait, which glibc only grew in 2.30.
+                queueReady.wait_until(lock, std::chrono::system_clock::now() + std::chrono::milliseconds(100), [&] {
+                    return !ready.empty() || stop || cancelled_ || downloadersLeft.load() == 0;
+                });
+                if (stop || cancelled_) return;
+                if (ready.empty() && downloadersLeft.load() != 0) continue;
+                if (ready.empty()) {
+                    if (downloadersLeft.load() == 0) return;
+                    continue;
+                }
+                index = ready.front();
+                ready.pop_front();
+            }
+
+            const PackageJob& job = jobs[index];
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                snapshot_.status = "Extracting " + job.name;
+            }
+            try {
+                std::lock_guard<std::mutex> guard(destLocks[destDirIndex(dests, job.destDir)]);
+                extractZip(job.archivePath, job.destDir);
+            } catch (const std::exception& e) {
+                noteFailure(std::string("Could not extract ") + job.name + ": " + e.what());
+                return;
+            }
+
+            std::error_code removeError;
+            fs::remove(job.archivePath, removeError);
+            ++extracted;
+            publishProgress();
+        }
+    };
+
+    {
+        const size_t asked = static_cast<size_t>(launcherFlags().robloxInstallerWorkers);
+        const size_t downloaders = std::min<size_t>(asked, jobs.size());
+        const unsigned int cores = std::thread::hardware_concurrency();
+        const size_t extractors = std::min<size_t>(cores > 0 ? cores : 1, jobs.size());
+        downloadersLeft = downloaders;
+
+        std::vector<std::thread> pool;
+        pool.reserve(downloaders + extractors);
+        for (size_t at = 0; at < downloaders; ++at) pool.emplace_back(downloadWorker);
+        for (size_t at = 0; at < extractors; ++at) pool.emplace_back(extractWorker);
+        // Joined here, so nothing is still writing when abandon() removes the staging directory.
+        for (auto& worker : pool) worker.join();
+    }
+
+    if (!failure.empty()) { abandon(failure); return; }
+    if (cancelled_) { abandon(i18n::tr("Cancelled.")); return; }
+    if (extracted.load() != jobs.size()) {
+        abandon(i18n::tr("Roblox's packages were not all unpacked."));
+        return;
+    }
+
+    {
+        std::ofstream appSettings(staging + "/AppSettings.xml", std::ios::binary);
+        appSettings << appSettingsXml();
+        if (!appSettings) {
+            abandon(i18n::trf("Could not write AppSettings.xml into {0}", {staging}));
+            return;
+        }
+    }
+
+    // One rename is what makes the version appear, so a half-written install
+    // is never visible under its real name.
+    fs::rename(staging, target, error);
+    if (error) {
+        abandon(i18n::trf("Could not move the finished version into place: {0}", {error.message()}));
+        return;
+    }
+
+    finish(updating ? i18n::tr("Roblox is up to date") : i18n::trf("Installed {0}", {hash}));
+}
+
+} // namespace bootstrap
+} // namespace tuxblox

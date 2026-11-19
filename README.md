@@ -1,50 +1,44 @@
 # TuxBlox Mac
 
-A small, standalone launcher for Roblox's official macOS Player on Linux, running through Rosemary.
+The complete TuxBlox launcher, with the experimental macOS Player backend, kept in a separate repository.
 
-This is a separate project from TuxBlox. TuxBlox stays focused on the Windows client and its compatibility layer; this launcher is for the macOS Player, which is useful while the Windows Player path is still in progress and for machines where the macOS build is a better fit.
+The Windows Studio path is inherited from TuxBlox and is not rewritten here. Studio continues to use the same compatibility layer and data as a normal TuxBlox install; the macOS Player runs through Rosemary and lives beside it.
 
-## Status
+## What is here
 
-Early development. The first version is a single-window GTK launcher that installs, verifies, launches and stops the official macOS Player through Rosemary.
+This tree is the launcher half of TuxBlox: the full interface (Home, Sessions, Versions, FastFlags, Settings and About), the shared UI, flags, crypto, release and translation code, and the assets.
 
-## What it will do
+It deliberately does **not** contain `compat/`, the Wine-based Windows compatibility layer. Studio is unchanged because it keeps using the layer already installed by TuxBlox.
 
-- download the official `RobloxPlayer.zip` from Roblox's setup CDN;
-- verify the Apple code signature against a pinned Apple Root CA;
-- install the unmodified app under the launcher's data directory, with an integrity manifest;
-- start it through Rosemary, with launch and stop controls and a desktop entry;
-- keep the client unpatched: the only file written inside the bundle is `ClientSettings` for FastFlags;
-- support x86_64 and arm64 hosts, with the client architecture following the host.
+## Installing
 
-There is no Windows or Studio support here. Those stay in TuxBlox.
+The launcher finds its data from the directory it is installed in, just like TuxBlox. To keep Studio working, install the built `TuxBloxLauncher` into the existing TuxBlox directory (usually `~/.tuxblox`) and start it from there:
 
-Discord Rich Presence, server-region notifications, desktop entries and the remaining settings come after the first working launcher.
+```sh
+install -m 755 build/launcher/TuxBloxLauncher ~/.tuxblox/TuxBloxLauncher
+~/.tuxblox/TuxBloxLauncher
+```
 
-## Requirements
-
-- Linux x86_64 (arm64 packaging is next)
-- Rosemary (`rosemary` on `PATH`, or `<data-dir>/rosemary/rosemary`)
-- OpenSSL, libcurl, libarchive and zlib for the backend
-- GTK4/libadwaita for the launcher interface
-- CMake, Ninja and pkg-config for the build
+The macOS Player is kept under `<install>/mac-client`, and the launcher looks for Rosemary at `TUXBLOX_ROSEMARY`, `<install>/rosemary/rosemary`, or `rosemary` on `PATH`.
 
 ## Building
 
+The launcher builds with the same toolchain as TuxBlox. The Windows compatibility layer is not built from this tree, so the launcher target is the one to use:
+
 ```sh
-cmake -S . -B build -G Ninja
-cmake --build build
-./build/tuxblox-mac
+make launcher
 ```
 
-The client is kept in `~/.local/share/tuxblox-mac` by default; set `TUXBLOX_MAC_DIR` to use another directory. Rosemary is found through `TUXBLOX_ROSEMARY`, `<data-dir>/rosemary/rosemary`, or `PATH`.
+The repository includes the `Makefile`, launcher, shared UI and assets needed for that target. The same build requirements as TuxBlox apply: GTK4/libadwaita, libcurl, libarchive, OpenSSL, zlib, CMake and Ninja.
 
-The first launch downloads the official Player from Roblox's setup CDN and verifies its Apple signature before installing it. Nothing is patched.
+The macOS Player and the Windows Studio path both run the official, unmodified clients. Nothing here patches them.
 
-`./build/tuxblox-mac --check` installs or verifies the client without opening the window. It prints the installed version on success.
+## Updates
+
+This launcher carries TuxBlox's updater. Until it has its own release channel, the official updater can replace it with the upstream launcher. Keep `tbxFlagDisableUpdater` set in `flags.json` while testing, or do not run the official installer over this launcher.
 
 ## Licensing
 
-This project's own code is GPLv3. Rosemary is a separate GPL-3.0 executable and is not linked into this program; its licence is in `third_party_licenses/rosemary/LICENSE`.
+TuxBlox's own code is GPLv3. The compatibility layer in TuxBlox stays LGPLv2.1, with `compat/tuxblox/` and `compat/webkitgtk/bundle/` under GPLv3; it is not part of this repository. Rosemary is a separate GPL-3.0 executable and is not linked into the launcher; its licence is in `third_party_licenses/rosemary/LICENSE`.
 
-The launcher runs the official, unmodified Roblox client. It is not affiliated with, endorsed by, or associated with Roblox Corporation.
+The launcher runs the official, unmodified Roblox clients. It is not affiliated with, endorsed by, or associated with Roblox Corporation.

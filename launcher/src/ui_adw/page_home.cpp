@@ -1,0 +1,468 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "page_home.h"
+
+#include "flag_startup.h"
+#include "asset_download.h"
+#include "asset_play.h"
+#include "asset_roblox_player.h"
+#include "asset_roblox_studio.h"
+#include "asset_stop.h"
+#include "home_card_state.h"
+#include "i18n.h"
+#include "session_facts.h"
+#include "install_identity.h"
+#include "release_stamp.h"
+#include "release_file.h"
+#include "version.h"
+#include "widgets.h"
+
+#include <ctime>
+
+// Third Parties
+#include <adwaita.h>
+
+namespace tuxblox {
+
+namespace {
+
+std::string versionLabel(const AppVersions &versions) {
+    std::string label = versions.activeHash;
+    for (const auto &installed : versions.installed) {
+        if (installed.hash != versions.activeHash) continue;
+        // The version Roblox reports for itself reads as a version; the hash is only an identifier, so it is the fallback
+        if (!installed.versionString.empty()) label = installed.versionString;
+        if (!installed.channel.empty()) label += " \xC2\xB7 " + installed.channel;
+        break;
+    }
+    return label;
+}
+
+GtkWidget *textLabel(const std::string &text, const char *pStyleClass) {
+    GtkWidget *pLabel = gtk_label_new(text.c_str());
+    gtk_label_set_xalign(GTK_LABEL(pLabel), 0.0f);
+    if (pStyleClass != nullptr) gtk_widget_add_css_class(pLabel, pStyleClass);
+    return pLabel;
+}
+
+} // namespace
+
+HomePage::HomePage(App &app, std::string installDir) : app_(app) {
+    GtkWidget *pBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_margin_start(pBox, 24);
+    gtk_widget_set_margin_end(pBox, 24);
+    gtk_widget_set_margin_top(pBox, 22);
+    gtk_widget_set_margin_bottom(pBox, 16);
+
+    // Only the update takes the page over, so this is empty and out of the way until then.
+    GtkWidget *pTitle = textLabel("", "title-1");
+    pTitle_ = GTK_LABEL(pTitle);
+    gtk_widget_set_visible(pTitle, FALSE);
+    gtk_box_append(GTK_BOX(pBox), pTitle);
+
+    pCards_ = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_box_set_homogeneous(GTK_BOX(pCards_), TRUE);
+    // Stops the cards' own vertical expansion from reaching the page and stretching them down the window
+    gtk_widget_set_vexpand(pCards_, FALSE);
+    gtk_box_append(GTK_BOX(pCards_), buildCard(player_, "Roblox Player", kAssetRobloxPlayer, kAssetRobloxPlayerLen));
+    gtk_box_append(GTK_BOX(pCards_), buildCard(studio_, "Roblox Studio", kAssetRobloxStudio, kAssetRobloxStudioLen));
+    gtk_box_append(GTK_BOX(pBox), pCards_);
+
+    pSessions_ = buildSessions();
+    gtk_widget_set_margin_top(pSessions_, 14);
+    gtk_box_append(GTK_BOX(pBox), pSessions_);
+
+    pUpdateStatus_ = textLabel("", "heading");
+    gtk_widget_set_margin_top(pUpdateStatus_, 18);
+    gtk_widget_set_visible(pUpdateStatus_, FALSE);
+    gtk_box_append(GTK_BOX(pBox), pUpdateStatus_);
+
+    pUpdateBar_ = gtk_progress_bar_new();
+    gtk_widget_set_margin_top(pUpdateBar_, 10);
+    gtk_widget_set_visible(pUpdateBar_, FALSE);
+    gtk_box_append(GTK_BOX(pBox), pUpdateBar_);
+
+    pError_ = errorLabel();
+    gtk_widget_set_margin_top(pError_, 12);
+    gtk_box_append(GTK_BOX(pBox), pError_);
+
+    // Shown only when the layer is missing, which is a state only a Flatpak reaches: it fetches its
+    // own, and a failed fetch otherwise leaves a launcher that will not start anything and cannot
+    // say what to do about it.
+    if constexpr (kFlatpakBuild) {
+        pRuntimeRetry_ = gtk_button_new_with_label(i18n::tr("Install the runtime"));
+        gtk_widget_add_css_class(pRuntimeRetry_, "suggested-action");
+        gtk_widget_set_halign(pRuntimeRetry_, GTK_ALIGN_CENTER);
+        gtk_widget_set_margin_top(pRuntimeRetry_, 10);
+        gtk_widget_set_visible(pRuntimeRetry_, FALSE);
+        g_signal_connect(pRuntimeRetry_, "clicked", G_CALLBACK(onRuntimeRetry), this);
+        gtk_box_append(GTK_BOX(pBox), pRuntimeRetry_);
+    }
+
+    GtkWidget *pSpacer = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_vexpand(pSpacer, TRUE);
+    gtk_box_append(GTK_BOX(pBox), pSpacer);
+
+    // What this binary carries, which is what the install is: a component says which release it
+    // was published in, and only a published one can say which channel it went to.
+    const InstallIdentity identity =
+        installIdentity(releaseChannel().empty() ? "" : releaseVersion(), releaseChannel(), kTuxBloxVersion);
+
+    GtkWidget *pStrip = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    const std::string name = identity.isRelease ? "TuxBlox " + identity.version
+                                                : i18n::trf("Launcher {0}", {identity.version});
+    gtk_box_append(GTK_BOX(pStrip), textLabel(name, "caption"));
+    GtkWidget *pChannel = textLabel(identity.channel.empty() ? "" : i18n::trf("· {0} channel", {identity.channel}),
+                                    "caption");
+    gtk_widget_add_css_class(pChannel, "dim-label");
+    gtk_widget_set_hexpand(pChannel, TRUE);
+    gtk_box_append(GTK_BOX(pStrip), pChannel);
+    GtkWidget *pState = textLabel("", "caption");
+    pUpdateState_ = GTK_LABEL(pState);
+    gtk_box_append(GTK_BOX(pStrip), pState);
+    gtk_box_append(GTK_BOX(pBox), pStrip);
+
+    pRoot_ = adw_clamp_new();
+    adw_clamp_set_maximum_size(ADW_CLAMP(pRoot_), 720);
+    adw_clamp_set_child(ADW_CLAMP(pRoot_), pBox);
+}
+
+GtkWidget *HomePage::widget() const {
+    return pRoot_;
+}
+
+GtkWidget *HomePage::buildCard(Card &card, const char *pTitle, const unsigned char *pIcon, size_t iconLength) {
+    GtkWidget *pIconImage = iconImage(pIcon, iconLength, 34);
+    gtk_widget_set_valign(pIconImage, GTK_ALIGN_START);
+
+    GtkWidget *pMeta = textLabel(i18n::tr("Not installed yet"), "caption");
+    gtk_widget_add_css_class(pMeta, "dim-label");
+    gtk_widget_add_css_class(pMeta, "version-meta");
+    gtk_label_set_ellipsize(GTK_LABEL(pMeta), PANGO_ELLIPSIZE_END);
+    card.pMeta = GTK_LABEL(pMeta);
+
+    GtkWidget *pText = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
+    gtk_widget_set_hexpand(pText, TRUE);
+    gtk_box_append(GTK_BOX(pText), textLabel(pTitle, "heading"));
+    gtk_box_append(GTK_BOX(pText), pMeta);
+
+    GtkWidget *pHeader = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 11);
+    gtk_box_append(GTK_BOX(pHeader), pIconImage);
+    gtk_box_append(GTK_BOX(pHeader), pText);
+    // The header takes the spare height, so both cards' buttons sit on the same line however tall the card is
+    gtk_widget_set_vexpand(pHeader, TRUE);
+    gtk_widget_set_valign(pHeader, GTK_ALIGN_START);
+
+    GtkWidget *pButtonIcon = iconImage(kAssetDownload, kAssetDownloadLen, 18);
+    GtkWidget *pButtonLabel = gtk_label_new(i18n::tr("Install & Launch"));
+    gtk_label_set_ellipsize(GTK_LABEL(pButtonLabel), PANGO_ELLIPSIZE_END);
+    card.pButtonIcon = pButtonIcon;
+    card.pButtonLabel = GTK_LABEL(pButtonLabel);
+    GtkWidget *pButtonContent = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_halign(pButtonContent, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(pButtonContent), pButtonIcon);
+    gtk_box_append(GTK_BOX(pButtonContent), pButtonLabel);
+    GtkWidget *pButton = gtk_button_new();
+    gtk_button_set_child(GTK_BUTTON(pButton), pButtonContent);
+    gtk_widget_set_hexpand(pButton, TRUE);
+    card.pButton = GTK_BUTTON(pButton);
+    g_object_set_data(G_OBJECT(pButton), "tuxblox-target", GINT_TO_POINTER(static_cast<int>(card.target)));
+    g_signal_connect(pButton, "clicked", G_CALLBACK(onLaunchClicked), this);
+
+    GtkWidget *pButtons = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_top(pButtons, 12);
+    gtk_box_append(GTK_BOX(pButtons), pButton);
+
+    GtkWidget *pInner = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_margin_start(pInner, 16);
+    gtk_widget_set_margin_end(pInner, 16);
+    gtk_widget_set_margin_top(pInner, 15);
+    gtk_widget_set_margin_bottom(pInner, 15);
+    gtk_box_append(GTK_BOX(pInner), pHeader);
+    gtk_box_append(GTK_BOX(pInner), pButtons);
+
+    GtkWidget *pCard = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(pCard, "card");
+    gtk_box_append(GTK_BOX(pCard), pInner);
+    return pCard;
+}
+
+GtkWidget *HomePage::buildSessions() {
+    pSessionEmpty_ = textLabel(i18n::tr("Nothing is running right now."), "caption");
+    gtk_widget_add_css_class(pSessionEmpty_, "dim-label");
+    gtk_widget_set_margin_top(pSessionEmpty_, 3);
+
+    pSessionRows_ = gtk_box_new(GTK_ORIENTATION_VERTICAL, 7);
+    gtk_widget_set_margin_top(pSessionRows_, 11);
+    gtk_widget_set_visible(pSessionRows_, FALSE);
+
+    GtkWidget *pInner = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_margin_start(pInner, 16);
+    gtk_widget_set_margin_end(pInner, 16);
+    gtk_widget_set_margin_top(pInner, 14);
+    gtk_widget_set_margin_bottom(pInner, 14);
+    gtk_box_append(GTK_BOX(pInner), textLabel(i18n::tr("Open sessions"), "heading"));
+    gtk_box_append(GTK_BOX(pInner), pSessionEmpty_);
+    gtk_box_append(GTK_BOX(pInner), pSessionRows_);
+
+    GtkWidget *pCard = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(pCard, "card");
+    gtk_box_append(GTK_BOX(pCard), pInner);
+    return pCard;
+}
+
+void HomePage::setSessions(const std::vector<Session> &sessions) {
+    std::vector<int> shape;
+    for (const Session &session : sessions) {
+        if (session.running) shape.push_back(session.pid);
+    }
+
+    if (shape != sessionShape_) {
+        for (GtkWidget *pChild = gtk_widget_get_first_child(pSessionRows_); pChild != nullptr;
+             pChild = gtk_widget_get_first_child(pSessionRows_)) {
+            gtk_box_remove(GTK_BOX(pSessionRows_), pChild);
+        }
+        pSessionMetas_.clear();
+
+        GtkSizeGroup *pMetaWidths = gtk_size_group_new(GTK_SIZE_GROUP_HORIZONTAL);
+        for (const Session &session : sessions) {
+            if (!session.running) continue;
+            const bool player = session.target == LaunchTarget::Player;
+            GtkWidget *pIcon = iconImage(player ? kAssetRobloxPlayer : kAssetRobloxStudio,
+                                         player ? kAssetRobloxPlayerLen : kAssetRobloxStudioLen, 20);
+            GtkWidget *pName = textLabel(player ? "Roblox Player" : "Roblox Studio", nullptr);
+            gtk_widget_set_hexpand(pName, TRUE);
+            GtkWidget *pMeta = textLabel("", "caption");
+            gtk_widget_add_css_class(pMeta, "dim-label");
+            gtk_label_set_xalign(GTK_LABEL(pMeta), 1.0f);
+            gtk_size_group_add_widget(pMetaWidths, pMeta);
+            pSessionMetas_.push_back(GTK_LABEL(pMeta));
+
+            GtkWidget *pOpen = gtk_button_new_with_label(i18n::tr("Open"));
+            gtk_widget_add_css_class(pOpen, "flat");
+            gtk_widget_add_css_class(pOpen, "session-open");
+            gtk_widget_set_valign(pOpen, GTK_ALIGN_CENTER);
+            gtk_widget_set_tooltip_text(pOpen, i18n::tr("Show this session and its log"));
+            g_object_set_data(G_OBJECT(pOpen), "tuxblox-pid", GINT_TO_POINTER(session.pid));
+            g_signal_connect(pOpen, "clicked", G_CALLBACK(onOpenSessionClicked), this);
+
+            GtkWidget *pRow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 10);
+            gtk_box_append(GTK_BOX(pRow), pIcon);
+            gtk_box_append(GTK_BOX(pRow), pName);
+            gtk_box_append(GTK_BOX(pRow), pMeta);
+            gtk_box_append(GTK_BOX(pRow), pOpen);
+            gtk_box_append(GTK_BOX(pSessionRows_), pRow);
+        }
+
+        g_object_unref(pMetaWidths);
+        sessionShape_ = shape;
+        gtk_widget_set_visible(pSessionRows_, !shape.empty());
+        gtk_widget_set_visible(pSessionEmpty_, shape.empty());
+    }
+
+    const std::time_t now = std::time(nullptr);
+    size_t index = 0;
+    for (const Session &session : sessions) {
+        if (index >= pSessionMetas_.size()) break;
+        if (!session.running) continue;
+        std::string meta = formatUptime(static_cast<long>(now - session.startedAt));
+        if (session.residentBytes > 0) meta += " \xC2\xB7 " + formatBytes(session.residentBytes);
+        setLabelText(pSessionMetas_[index], meta);
+        ++index;
+    }
+}
+
+void HomePage::onLaunchClicked(GtkButton *pButton, gpointer data) {
+    auto *pSelf = static_cast<HomePage *>(data);
+    const int target = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pButton), "tuxblox-target"));
+    const Card &card = static_cast<LaunchTarget>(target) == LaunchTarget::Player ? pSelf->player_
+                                                                                 : pSelf->studio_;
+    if (card.appliedStops) {
+        pSelf->app_.requestStopSessions(static_cast<LaunchTarget>(target));
+        return;
+    }
+    pSelf->beginLaunchCooldown();
+    pSelf->app_.requestLaunch(static_cast<LaunchTarget>(target));
+}
+
+void HomePage::onOpenSessionClicked(GtkButton *pButton, gpointer data) {
+    auto *pSelf = static_cast<HomePage *>(data);
+    pSelf->app_.showSession(GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pButton), "tuxblox-pid")));
+}
+
+void HomePage::beginLaunchCooldown() {
+    gtk_widget_set_sensitive(GTK_WIDGET(player_.pButton), FALSE);
+    gtk_widget_set_sensitive(GTK_WIDGET(studio_.pButton), FALSE);
+    g_timeout_add(2500, onLaunchCooldownOver, this);
+}
+
+gboolean HomePage::onLaunchCooldownOver(gpointer data) {
+    auto *pSelf = static_cast<HomePage *>(data);
+    // Not unconditionally sensitive: a gated Player button must stay off.
+    gtk_widget_set_sensitive(GTK_WIDGET(pSelf->player_.pButton), !pSelf->player_.appliedDisabled);
+    gtk_widget_set_sensitive(GTK_WIDGET(pSelf->studio_.pButton), !pSelf->studio_.appliedDisabled);
+    return G_SOURCE_REMOVE;
+}
+
+void HomePage::setCard(Card &card, bool installed, const std::string &versionLabel, int sessions,
+                       bool stopping, bool launchPending, bool playerEnabled) {
+    const bool gated = card.target == LaunchTarget::Player && !playerEnabled;
+    if (gated) {
+        setLabelText(card.pMeta, i18n::tr("Player support is in development"));
+    } else {
+        setLabelText(card.pMeta, installed ? versionLabel : i18n::tr("Not installed yet"));
+    }
+
+    const CardState state = cardState(card.target, installed, sessions, stopping, launchPending, playerEnabled);
+
+    if (card.applied && card.appliedInstalled == installed &&
+        card.appliedLaunchLabel == state.launchLabel && card.appliedStops == state.launchStops &&
+        card.appliedDisabled == state.launchDisabled) {
+        return;
+    }
+    card.appliedInstalled = installed;
+    card.appliedLaunchLabel = state.launchLabel;
+    card.appliedStops = state.launchStops;
+    card.appliedDisabled = state.launchDisabled;
+    card.applied = true;
+
+    setLabelText(card.pButtonLabel, state.launchLabel);
+    // Installing is the neutral grey button with a download arrow, launching the green one with a play symbol, stopping the red one with a square
+    const unsigned char *pIconData = kAssetDownload;
+    size_t iconLength = kAssetDownloadLen;
+    if (state.launchStops) {
+        pIconData = kAssetStop;
+        iconLength = kAssetStopLen;
+    } else if (installed) {
+        pIconData = kAssetPlay;
+        iconLength = kAssetPlayLen;
+    }
+    GdkPaintable *pIcon = symbolicIcon(pIconData, iconLength, 18);
+    gtk_image_set_from_paintable(GTK_IMAGE(card.pButtonIcon), pIcon);
+    g_object_unref(pIcon);
+
+    if (state.launchStops) {
+        gtk_widget_remove_css_class(GTK_WIDGET(card.pButton), "launch-green");
+        gtk_widget_add_css_class(GTK_WIDGET(card.pButton), "stop-red");
+    } else {
+        gtk_widget_remove_css_class(GTK_WIDGET(card.pButton), "stop-red");
+        if (installed && !gated) {
+            gtk_widget_add_css_class(GTK_WIDGET(card.pButton), "launch-green");
+        } else {
+            gtk_widget_remove_css_class(GTK_WIDGET(card.pButton), "launch-green");
+        }
+    }
+    gtk_widget_set_sensitive(GTK_WIDGET(card.pButton), !(state.launchStops && stopping) && !state.launchDisabled);
+}
+
+void HomePage::onRuntimeRetry(GtkButton *, gpointer data) {
+    static_cast<HomePage *>(data)->app_.requestRuntimeInstall();
+}
+
+void HomePage::setUpdateState(const std::string &text, const std::string &styleClass) {
+    setLabelText(pUpdateState_, text);
+    if (styleClass == updateStateClass_) return;
+    if (!updateStateClass_.empty()) gtk_widget_remove_css_class(GTK_WIDGET(pUpdateState_), updateStateClass_.c_str());
+    gtk_widget_add_css_class(GTK_WIDGET(pUpdateState_), styleClass.c_str());
+    updateStateClass_ = styleClass;
+}
+
+void HomePage::update(const AppSnapshot &snap) {
+    // The macOS backend has no Windows version hash: when it is enabled the
+    // Player card is ready even though the Windows version list is empty, and
+    // the flag that gates the unfinished Windows Player must not hold it back.
+    const bool macBackend = launcherFlags().macClient;
+    const bool playerPending =
+        snap.launchPending && snap.launchTarget == LaunchTarget::Player;
+    const bool studioPending =
+        snap.launchPending && snap.launchTarget == LaunchTarget::Studio;
+    // The card names the version the way the Studio card does; the backend
+    // is not something the user needs to read on the home screen.
+    const std::string macVersion = snap.macClientVersion.empty()
+                                       ? std::string()
+                                       : snap.macClientVersion + " \xC2\xB7 live";
+    setCard(player_, macBackend ? snap.macClientInstalled
+                                : !snap.versions.player.activeHash.empty(),
+            macBackend ? macVersion : versionLabel(snap.versions.player),
+            snap.sessions.player, snap.stoppingPlayer, playerPending,
+            macBackend || launcherFlags().playerButton);
+    setCard(studio_, !snap.versions.studio.activeHash.empty(), versionLabel(snap.versions.studio),
+            snap.sessions.studio, snap.stoppingStudio, studioPending, launcherFlags().playerButton);
+
+    // A Flatpak fetches its own compatibility layer, and one that does not match this release is
+    // no use: after a flatpak update the layer on disk belongs to the release before it. So the
+    // fetch takes the screen over the same way an update does, and nothing can be launched until
+    // it lands -- a card left clickable here starts Roblox against a layer that is not there.
+    const bool runtimeBusy = kFlatpakBuild && snap.update.phase == UpdatePhase::FetchingCompat;
+    const bool runtimeBlocked = kFlatpakBuild && (snap.runtimeMissing || runtimeBusy);
+
+    // Only an update actually being applied takes the screen over. Merely checking leaves the cards
+    // there and says so in the strip at the bottom, so nothing flickers in and out on startup.
+    const bool applying = snap.update.phase == UpdatePhase::PreparingUpdater || runtimeBusy;
+    gtk_widget_set_visible(pUpdateStatus_, applying);
+    gtk_widget_set_visible(pUpdateBar_, applying);
+    gtk_widget_set_visible(pCards_, !applying && !runtimeBlocked);
+    gtk_widget_set_visible(pSessions_, !applying && !runtimeBlocked);
+    gtk_widget_set_visible(GTK_WIDGET(pTitle_), applying || runtimeBlocked);
+
+    if (!applying && !runtimeBlocked) setSessions(snap.sessionList);
+
+    if (pRuntimeRetry_ != nullptr) {
+        // Set above the early return below, which is taken while a fetch is running: left until
+        // after it, a button from the attempt that failed stays on screen through the retry.
+        gtk_widget_set_visible(pRuntimeRetry_, runtimeBlocked && !runtimeBusy);
+    }
+
+    if (applying) {
+        setLabelText(pTitle_, runtimeBusy ? i18n::tr("Updating the runtime")
+                                          : i18n::tr("Updating TuxBlox"));
+        setLabelText(GTK_LABEL(pUpdateStatus_),
+                     runtimeBusy ? i18n::tr("Downloading the compatibility layer")
+                                 : i18n::tr("Preparing updater"));
+        gtk_progress_bar_set_fraction(GTK_PROGRESS_BAR(pUpdateBar_), snap.update.fraction);
+        setUpdateState(i18n::tr("Updating"), "warning");
+        showError(pError_, "");
+        return;
+    }
+
+    if (runtimeBlocked) {
+        // The fetch is not running, so this is the attempt that failed: the cards are gone and the
+        // title is all that is left to say why before the error and the retry below it.
+        setLabelText(pTitle_, i18n::tr("The runtime is not ready"));
+    }
+
+    if (snap.update.phase == UpdatePhase::Error) {
+        showError(pError_, snap.update.errorMessage);
+        setUpdateState(snap.runtimeMissing ? i18n::tr("The runtime is not installed")
+                                           : i18n::tr("Update check failed"), "error");
+        return;
+    }
+
+    showError(pError_, "");
+    const bool checking = snap.update.phase == UpdatePhase::Idle ||
+                          snap.update.phase == UpdatePhase::CheckingManifest;
+    if (checking) {
+        setUpdateState(i18n::tr("Checking…"), "dim-label");
+    } else if (snap.updateAvailableVersion) {
+        // Nothing: the button is the message, and the release it offers is named in the dialog.
+        setUpdateState("", "warning");
+    } else {
+        setUpdateState(i18n::tr("Up to date"), "success");
+    }
+}
+
+} // namespace tuxblox

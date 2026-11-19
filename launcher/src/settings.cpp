@@ -1,0 +1,270 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "settings.h"
+#include "i18n.h"
+#include "json.hpp"
+#include "seasonal.h"
+#include "system_info.h"
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+
+namespace fs = std::filesystem;
+
+namespace tuxblox {
+
+namespace {
+
+std::string settingsFilePath(const std::string& installDir) {
+    return installDir + "/settings.json";
+}
+
+bool isKnownTheme(const std::string& theme) {
+    // Christmas stops being a known name once its season is over, which is what puts somebody who chose it back on the system theme
+    //
+    // Deliberately NOT asking the flags: initLauncherFlags() calls loadSettings() to find
+    // out which channel to ask for, so a flag read from in here would seal the table
+    // before the fetch had even started, and every flag would answer with its default.
+    // Whether the theme is OFFERED and APPLIED is where tbxFlagEnableChristmasTheme is
+    // honoured instead -- see applyThemeSetting().
+    if (theme == "christmas") return christmasThemeAvailable();
+    return theme == "system" || theme == "dark" || theme == "grey" || theme == "light";
+}
+
+bool isKnownGraphics(const std::string& graphics) {
+    for (const char* choice : kGraphicsChoices) {
+        if (graphics == choice) return true;
+    }
+    return false;
+}
+
+bool isKnownChannel(const std::string& channel) {
+    return channel == "stable" || channel == "canary" || channel == "experimental";
+}
+
+// "dev" was renamed to "experimental". Migrated rather than rejected: an
+// existing settings.json still says "dev", and falling through to the unknown-
+// channel default would silently move those users to stable.
+std::string migrateChannel(const std::string& channel) {
+    return channel == "dev" ? "experimental" : channel;
+}
+
+// TuxBlox used to keep two env var lists, one for the Proton child and one
+// exported from the launcher. They are a single list now, so a settings.json
+// written before the merge has its two values joined rather than one of them
+// being silently dropped.
+std::string mergeLegacyEnvVars(const nlohmann::json& j) {
+    std::string proton = j.value("proton_env_vars", std::string());
+    std::string global = j.value("global_env_vars", std::string());
+    if (proton.empty()) return global;
+    if (global.empty()) return proton;
+    return proton + " " + global;
+}
+
+// Both directions are lenient about shape: a hand-edited or truncated
+// fast_flags block must cost the user their flags at worst, never the rest of
+// their settings.
+std::vector<FastFlag> fastFlagsFromJson(const nlohmann::json& j) {
+    std::vector<FastFlag> flags;
+    if (!j.is_array()) return flags;
+    for (const auto& entry : j) {
+        if (!entry.is_object()) continue;
+        FastFlag flag;
+        flag.name = entry.value("name", std::string());
+        flag.value = entry.value("value", std::string());
+        if (flag.name.empty()) continue;
+        flags.push_back(std::move(flag));
+    }
+    return flags;
+}
+
+// find() plus a type check, not value(): value() throws when the stored type
+// cannot convert to the default's, so a hand-edited "fast_flags": "nonsense"
+// would escape to the catch-all below and reset every other setting with it.
+std::vector<FastFlag> fastFlagsForTarget(const nlohmann::json& parent, const char* key) {
+    if (!parent.is_object()) return {};
+    const auto it = parent.find(key);
+    if (it == parent.end()) return {};
+    return fastFlagsFromJson(*it);
+}
+
+nlohmann::json fastFlagsToJson(const std::vector<FastFlag>& flags) {
+    nlohmann::json array = nlohmann::json::array();
+    for (const auto& flag : flags) {
+        if (flag.name.empty()) continue;
+        array.push_back({{"name", flag.name}, {"value", flag.value}});
+    }
+    return array;
+}
+
+} // namespace
+
+Settings loadSettings(const std::string& installDir) {
+    Settings settings;
+    try {
+        std::ifstream file(settingsFilePath(installDir));
+        if (!file) return settings;
+
+        nlohmann::json j;
+        file >> j;
+
+        settings.envVars = j.contains("env_vars") ? j.at("env_vars").get<std::string>()
+                                                   : mergeLegacyEnvVars(j);
+        settings.sendCrashReports = j.at("send_crash_reports").get<bool>();
+        // Read leniently (.value(), not .at()): unlike the three fields
+        // above, a settings.json written before this field existed must
+        // NOT wholesale-reset to defaults just because "channel" is
+        // missing -- it should just default to "stable" and keep whatever
+        // else was already there.
+        std::string channel = migrateChannel(j.value("channel", std::string("stable")));
+        settings.channel = isKnownChannel(channel) ? channel : "stable";
+        // Read leniently, same reasoning as "channel" above.
+        settings.autoUpdate = j.value("auto_update", false);
+        settings.haptics = j.value("haptics", true);
+        settings.webviewGpu = j.value("webview_gpu", true);
+        settings.noRollback = j.value("norollback", false);
+        settings.virtualDesktop = j.value("virtual_desktop", false);
+        settings.debugLogging = j.value("debug_logging", false);
+        settings.minimizeToBackground = j.value("minimize_to_background", false);
+        settings.autoUpdateRoblox = j.value("auto_update_roblox", true);
+        settings.gpu = j.value("gpu", std::string(""));
+        settings.discordRpc = j.value("discord_rpc", false);
+        settings.serverRegionNotify = j.value("server_region_notify", false);
+        settings.discordJoinButton = j.value("discord_join_button", true);
+        settings.discordGameStatus = j.value("discord_game_status", true);
+        const std::string theme = j.value("theme", std::string("system"));
+        settings.theme = isKnownTheme(theme) ? theme : "system";
+        settings.language = i18n::normalizeLanguageSetting(
+            j.value("language", std::string("system")));
+        const std::string graphics = j.value("graphics", std::string("automatic"));
+        settings.graphics = isKnownGraphics(graphics) ? graphics : "automatic";
+        // Type-checked, not just lenient: this file can be edited by hand, so "true"
+        // instead of true must not throw the whole thing away.
+        const auto welcome = j.find("welcome_seen");
+        settings.welcomeSeen = welcome != j.end() && welcome->is_boolean() && welcome->get<bool>();
+
+        const auto fastFlags = j.find("fast_flags");
+        if (fastFlags != j.end()) {
+            settings.fastFlags.player = fastFlagsForTarget(*fastFlags, "player");
+            settings.fastFlags.studio = fastFlagsForTarget(*fastFlags, "studio");
+        }
+        return settings;
+    } catch (...) {
+        // Missing file, unreadable file, parse error, or a missing/wrong-typed
+        // field -- fall back to defaults wholesale rather than partially
+        // applying whatever did parse. A corrupt settings file must never
+        // crash the launcher.
+        return Settings{};
+    }
+}
+
+void saveSettings(const std::string& installDir, const Settings& settings) {
+    try {
+        std::error_code ec;
+        fs::create_directories(installDir, ec);
+
+        nlohmann::json j;
+        j["env_vars"] = settings.envVars;
+        j["send_crash_reports"] = settings.sendCrashReports;
+        j["channel"] = settings.channel;
+        j["auto_update"] = settings.autoUpdate;
+        j["haptics"] = settings.haptics;
+        j["webview_gpu"] = settings.webviewGpu;
+        j["norollback"] = settings.noRollback;
+        j["virtual_desktop"] = settings.virtualDesktop;
+        j["debug_logging"] = settings.debugLogging;
+        j["minimize_to_background"] = settings.minimizeToBackground;
+        j["auto_update_roblox"] = settings.autoUpdateRoblox;
+        j["gpu"] = settings.gpu;
+        j["discord_rpc"] = settings.discordRpc;
+        j["server_region_notify"] = settings.serverRegionNotify;
+        j["discord_join_button"] = settings.discordJoinButton;
+        j["discord_game_status"] = settings.discordGameStatus;
+        j["theme"] = settings.theme;
+        j["language"] = settings.language;
+        j["graphics"] = settings.graphics;
+        j["welcome_seen"] = settings.welcomeSeen;
+        j["fast_flags"] = {{"player", fastFlagsToJson(settings.fastFlags.player)},
+                            {"studio", fastFlagsToJson(settings.fastFlags.studio)}};
+
+        std::ofstream file(settingsFilePath(installDir), std::ios::binary);
+        if (!file) return;
+        file << j.dump(2);
+    } catch (...) {
+        // Best-effort -- a failed settings save must not crash the launcher.
+    }
+}
+
+std::vector<std::string> parseEnvPairs(const std::string& text) {
+    std::vector<std::string> pairs;
+    std::istringstream stream(text);
+    std::string token;
+    while (stream >> token) {
+        if (token.find('=') != std::string::npos) {
+            pairs.push_back(token);
+        }
+    }
+    return pairs;
+}
+
+std::vector<std::string> launchEnvPairs(const Settings& settings) {
+    // Skipped entirely for the "Automatic" default, so the common case does
+    // not walk sysfs at all and, more importantly, adds nothing whatsoever to
+    // the environment a launch has always had.
+    std::vector<std::string> pairs;
+    if (!settings.gpu.empty()) {
+        pairs = gpuEnvForSelection(settings.gpu, enumerateGpus("/sys/class/drm"));
+    }
+
+    // Only the non-default is emitted, so a launch with vibration left on
+    // adds nothing. The layer treats an absent variable as "on", which is
+    // also what a launch started outside the launcher should get.
+    if (!settings.haptics) {
+        pairs.push_back("TUXBLOX_HAPTICS=0");
+    }
+
+    // Both states are sent, unlike haptics above. The compatibility layer's own
+    // default is off, so "on" cannot be expressed by leaving the variable out.
+    pairs.push_back(settings.webviewGpu ? "TUXBLOX_WEBVIEW_GPU=1" : "TUXBLOX_WEBVIEW_GPU=0");
+
+    // Only the non-default is emitted, as with haptics above. The layer works
+    // out the window size itself, so nothing here describes the screen.
+    if (settings.virtualDesktop) {
+        pairs.push_back("TUXBLOX_VIRTUAL_DESKTOP=1");
+    }
+
+    // Only the non-default is emitted, as with haptics above. The layer reads
+    // this and turns on the diagnostics it otherwise keeps silenced, all of
+    // which cost frame time.
+    if (settings.debugLogging) {
+        pairs.push_back("TUXBLOX_DEBUG=1");
+    }
+
+    // Appended second so that a duplicate variable here is the one that wins:
+    // every consumer applies these in order, with setenv() overwriting and the
+    // child-process environment taking the last occurrence.
+    for (auto& pair : exportedEnvPairs(settings)) {
+        pairs.push_back(std::move(pair));
+    }
+    return pairs;
+}
+
+std::vector<std::string> exportedEnvPairs(const Settings& settings) {
+    return parseEnvPairs(settings.envVars);
+}
+
+} // namespace tuxblox

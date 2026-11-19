@@ -1,0 +1,702 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "settings.h"
+#include <algorithm>
+#include <cassert>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace fs = std::filesystem;
+
+int main() {
+    using namespace tuxblox;
+
+    const std::string dir = (fs::temp_directory_path() / "tuxblox_test_settings_dir").string();
+    fs::remove_all(dir);
+
+    // Missing file -> defaults.
+    {
+        Settings s = loadSettings(dir);
+        assert(s.envVars.empty());
+        assert(s.sendCrashReports == false);
+        assert(s.channel == "stable");
+        assert(s.autoUpdate == false);
+        assert(s.language == "system");
+    }
+
+    // Round-trip, including sendCrashReports = false and a non-default channel.
+    {
+        Settings s;
+        s.envVars = "TUXBLOX_LOG=1 DXVK_HUD=fps MY_VAR=hello";
+        s.sendCrashReports = false;
+        s.channel = "canary";
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.envVars == "TUXBLOX_LOG=1 DXVK_HUD=fps MY_VAR=hello");
+        assert(loaded.sendCrashReports == false);
+        assert(loaded.channel == "canary");
+    }
+
+    // "dev" was renamed to "experimental". An existing settings.json still
+    // says "dev" and must be migrated, not treated as an unknown channel --
+    // the unknown-channel fallback would quietly move the user to stable.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "", "send_crash_reports": true, "channel": "dev"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.channel == "experimental");
+
+        // And the migrated value is what gets written back, so the old name
+        // does not survive the next save.
+        saveSettings(dir, s);
+        assert(loadSettings(dir).channel == "experimental");
+    }
+
+    // A channel that is neither current nor a known old name still falls back
+    // to stable rather than being passed through to the update checker.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "", "send_crash_reports": true, "channel": "nightly"})";
+        out.close();
+
+        assert(loadSettings(dir).channel == "stable");
+    }
+
+    // Malformed JSON -> defaults, not a crash.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << "{ not json";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars.empty());
+        assert(s.sendCrashReports == false);
+        assert(s.channel == "stable");
+    }
+
+    // Missing field -> defaults wholesale (loadSettings never throws, never
+    // partially applies).
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"proton_env_vars": "FOO=bar"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars.empty());
+        assert(s.sendCrashReports == false);
+        assert(s.channel == "stable");
+    }
+
+    // A settings.json written before "channel" existed (all three original
+    // fields present, no channel key at all) must NOT wholesale-reset --
+    // channel alone falls back to "stable" while everything else loads
+    // normally. This is the one field read leniently (.value(), not .at())
+    // specifically so upgrading the launcher doesn't wipe existing settings.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"proton_env_vars": "FOO=bar", "global_env_vars": "BAZ=qux", "send_crash_reports": false})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "FOO=bar BAZ=qux");
+        assert(s.sendCrashReports == false);
+        assert(s.channel == "stable");
+    }
+
+    // An unrecognized channel value (hand-edited or from a future version)
+    // falls back to "stable" rather than being trusted verbatim.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"proton_env_vars": "", "global_env_vars": "", "send_crash_reports": true, "channel": "nightly"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.channel == "stable");
+    }
+
+    // autoUpdate defaults to false, and (like channel) loads leniently --
+    // a settings.json written before this field existed must not
+    // wholesale-reset just because "auto_update" is missing.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"proton_env_vars": "FOO=bar", "global_env_vars": "BAZ=qux", "send_crash_reports": false, "channel": "canary"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "FOO=bar BAZ=qux");
+        assert(s.sendCrashReports == false);
+        assert(s.channel == "canary");
+        assert(s.autoUpdate == false);
+    }
+
+    // autoUpdate round-trips through save/load.
+    {
+        Settings s;
+        s.autoUpdate = true;
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.autoUpdate == true);
+    }
+
+    // gpu defaults to "" (let the system decide) and round-trips as a PCI slot.
+    {
+        Settings s;
+        assert(s.gpu.empty());
+        s.gpu = "0000:01:00.0";
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.gpu == "0000:01:00.0");
+    }
+
+    // gpu loads leniently, like channel and auto_update: a settings.json
+    // written before the graphics-card picker existed must keep everything
+    // else it holds rather than resetting to defaults.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "FOO=bar", "send_crash_reports": false, "channel": "canary", "auto_update": true})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.gpu.empty());
+        // Same leniency: a file written before this switch existed reads as on,
+        // rather than silently turning acceleration off on upgrade.
+        assert(s.webviewGpu == true);
+        assert(s.envVars == "FOO=bar");
+        assert(s.sendCrashReports == false);
+        assert(s.channel == "canary");
+        assert(s.autoUpdate == true);
+    }
+
+    // norollback is off unless the file says otherwise, and round-trips.
+    {
+        Settings s;
+        assert(s.noRollback == false);
+        s.noRollback = true;
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.noRollback == true);
+    }
+
+    // launchEnvPairs(): with the Automatic default, the graphics-card picker
+    // itself adds nothing -- the guarantee that it changes nothing for anyone
+    // who never touches it, so it is asserted rather than assumed.
+    //
+    // Web-page acceleration is the one exception to "and nothing else", and is
+    // always present: the compatibility layer treats an absent value as off,
+    // so the on default cannot be expressed by staying quiet.
+    {
+        Settings s;
+        s.envVars = "FOO=bar BAZ=qux";
+        assert(s.gpu.empty());
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 3);
+        assert(pairs[0] == "TUXBLOX_WEBVIEW_GPU=1");
+        assert(pairs[1] == "FOO=bar");
+        assert(pairs[2] == "BAZ=qux");
+    }
+
+    // launchEnvPairs(): web-page acceleration is sent in both states, so the
+    // layer never has to fall back to its own default to learn what was chosen.
+    {
+        Settings on;
+        assert(on.webviewGpu == true); // on by default
+        auto onPairs = launchEnvPairs(on);
+        assert(std::find(onPairs.begin(), onPairs.end(), std::string("TUXBLOX_WEBVIEW_GPU=1"))
+               != onPairs.end());
+
+        Settings off;
+        off.webviewGpu = false;
+        auto offPairs = launchEnvPairs(off);
+        assert(std::find(offPairs.begin(), offPairs.end(), std::string("TUXBLOX_WEBVIEW_GPU=0"))
+               != offPairs.end());
+    }
+
+    // launchEnvPairs(): a saved card that this machine does not have falls
+    // back to automatic, rather than steering rendering onto a card that
+    // isn't there. (A real PCI slot cannot be asserted here -- the test
+    // machine's own hardware is whatever it is -- but a plainly bogus slot
+    // must never match.)
+    {
+        Settings s;
+        s.gpu = "ffff:ff:ff.f";
+        s.envVars = "FOO=bar";
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 2);
+        assert(pairs[0] == "TUXBLOX_WEBVIEW_GPU=1");
+        assert(pairs[1] == "FOO=bar");
+    }
+
+    // launchEnvPairs(): the user's variables come last, which is what makes
+    // an entry in the settings box override the same variable from the
+    // picker. Order is the contract here, so it is checked directly.
+    {
+        Settings s;
+        s.envVars = "DRI_PRIME=9";
+        auto pairs = launchEnvPairs(s);
+        assert(!pairs.empty());
+        assert(pairs.back() == "DRI_PRIME=9");
+    }
+
+    // exportedEnvPairs(): the launcher sets these on its own process, so it
+    // must carry nothing but the user's own box. Everything else in
+    // launchEnvPairs() describes how Roblox should run, and the card picker
+    // in particular would move the launcher's own window onto a card that is
+    // not driving the screen. TUXBLOX_WEBVIEW_GPU stands in for the rest
+    // because it is the one entry launchEnvPairs() always emits, so this
+    // holds on a machine with any number of graphics cards.
+    {
+        Settings s;
+        s.envVars = "FOO=bar";
+
+        auto launch = launchEnvPairs(s);
+        assert(std::find(launch.begin(), launch.end(), "TUXBLOX_WEBVIEW_GPU=1") != launch.end());
+
+        auto exported = exportedEnvPairs(s);
+        assert(exported.size() == 1);
+        assert(exported[0] == "FOO=bar");
+    }
+
+    // exportedEnvPairs(): an empty box exports nothing at all, so a default
+    // install leaves the launcher's own environment exactly as it found it.
+    {
+        Settings s;
+        s.gpu = "0000:01:00.0";
+        assert(exportedEnvPairs(s).empty());
+    }
+
+    // parseEnvPairs: empty string.
+    {
+        auto pairs = parseEnvPairs("");
+        assert(pairs.empty());
+    }
+
+    // parseEnvPairs: multiple pairs, extra/repeated whitespace tolerated.
+    {
+        auto pairs = parseEnvPairs("  FOO=bar   BAZ=qux  ");
+        assert(pairs.size() == 2);
+        assert(pairs[0] == "FOO=bar");
+        assert(pairs[1] == "BAZ=qux");
+    }
+
+    // parseEnvPairs: a token with no '=' is skipped.
+    {
+        auto pairs = parseEnvPairs("FOO=bar NOTAPAIR BAZ=qux");
+        assert(pairs.size() == 2);
+        assert(pairs[0] == "FOO=bar");
+        assert(pairs[1] == "BAZ=qux");
+    }
+
+    fs::create_directories(dir);
+    // FastFlags round-trip, keeping their order and their per-target split.
+    {
+        Settings s;
+        s.fastFlags.player = {{"DFIntTaskSchedulerTargetFps", "60"}, {"FFlagA", "True"}};
+        s.fastFlags.studio = {{"FFlagStudioOnly", "False"}};
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.fastFlags.player.size() == 2);
+        assert(loaded.fastFlags.player[0].name == "DFIntTaskSchedulerTargetFps");
+        assert(loaded.fastFlags.player[0].value == "60");
+        assert(loaded.fastFlags.player[1].name == "FFlagA");
+        assert(loaded.fastFlags.studio.size() == 1);
+        assert(loaded.fastFlags.studio[0].name == "FFlagStudioOnly");
+    }
+
+    // A settings.json written before FastFlags existed keeps everything else
+    // rather than resetting, same lenient rule as channel and auto_update.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "FOO=bar", "send_crash_reports": false, "channel": "canary"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "FOO=bar");
+        assert(s.channel == "canary");
+        assert(s.sendCrashReports == false);
+        assert(s.fastFlags.player.empty());
+        assert(s.fastFlags.studio.empty());
+    }
+
+    // A malformed fast_flags block costs the flags, never the other settings:
+    // wrong type for the block, wrong type for an entry, and a nameless entry.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "FOO=bar", "send_crash_reports": true, "fast_flags": "nonsense"})";
+        out.close();
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "FOO=bar");
+        assert(s.fastFlags.player.empty());
+
+        std::ofstream out2(dir + "/settings.json", std::ios::binary);
+        out2 << R"({"send_crash_reports": true, "fast_flags": {"player": [3, {"value": "novalue"},
+                    {"name": "Good", "value": "1"}]}})";
+        out2.close();
+        Settings s2 = loadSettings(dir);
+        assert(s2.fastFlags.player.size() == 1);
+        assert(s2.fastFlags.player[0].name == "Good");
+    }
+
+    // settings.json from before the two env fields were merged: the old
+    // Proton and Global values are joined into the single field rather than
+    // one of them being dropped.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"proton_env_vars": "DXVK_HUD=fps", "global_env_vars": "MY_VAR=hello", "send_crash_reports": true})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "DXVK_HUD=fps MY_VAR=hello");
+    }
+
+    // Only one of the two legacy fields set -- no stray separator either side.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"proton_env_vars": "", "global_env_vars": "ONLY=global", "send_crash_reports": true})";
+        out.close();
+        assert(loadSettings(dir).envVars == "ONLY=global");
+
+        std::ofstream out2(dir + "/settings.json", std::ios::binary);
+        out2 << R"({"proton_env_vars": "ONLY=proton", "global_env_vars": "", "send_crash_reports": true})";
+        out2.close();
+        assert(loadSettings(dir).envVars == "ONLY=proton");
+    }
+
+    // The new field wins outright when present -- a file already migrated
+    // must not have the stale legacy keys appended a second time.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "NEW=1", "proton_env_vars": "OLD=2", "global_env_vars": "OLD=3", "send_crash_reports": true})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "NEW=1");
+    }
+
+    // haptics defaults to on. Controller vibration is what a user expects a
+    // controller to do, so the default is the working one.
+    {
+        Settings s;
+        assert(s.haptics == true);
+    }
+
+    // haptics loads leniently: a settings.json written before this field
+    // existed keeps vibration on rather than silently losing it.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "FOO=bar", "send_crash_reports": false, "channel": "canary"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.haptics == true);
+    }
+
+    // haptics round-trips through save/load, off included.
+    {
+        Settings s;
+        s.haptics = false;
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.haptics == false);
+    }
+
+    // launchEnvPairs(): haptics on is the default, and adds nothing of its own
+    // -- same guarantee the graphics-card picker keeps. Only web-page
+    // acceleration, which has to state itself either way, joins the user's
+    // own variables here.
+    {
+        Settings s;
+        s.envVars = "FOO=bar";
+        assert(s.haptics == true);
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 2);
+        assert(std::find(pairs.begin(), pairs.end(), std::string("TUXBLOX_HAPTICS=0")) ==
+               pairs.end());
+        assert(pairs[1] == "FOO=bar");
+    }
+
+    // launchEnvPairs(): turning haptics off is what emits anything at all.
+    // The compatibility layer reads this and routes the pad down the path
+    // that has no vibration.
+    {
+        Settings s;
+        s.haptics = false;
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 2);
+        assert(pairs[0] == "TUXBLOX_HAPTICS=0");
+        assert(pairs[1] == "TUXBLOX_WEBVIEW_GPU=1");
+    }
+
+    // A user variable still wins over the haptics pair, because it is
+    // appended after it.
+    {
+        Settings s;
+        s.haptics = false;
+        s.envVars = "TUXBLOX_HAPTICS=1";
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 3);
+        assert(pairs[0] == "TUXBLOX_HAPTICS=0");
+        // Last is what counts -- that is the whole point of this case.
+        assert(pairs.back() == "TUXBLOX_HAPTICS=1");
+    }
+
+    // Verifying Roblox is no longer a setting -- the compatibility layer always checks. A settings.json
+    // from before that still carries the old field must load as normal, with everything else intact,
+    // rather than being rejected as malformed and losing the user's other settings with it.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "FOO=bar", "send_crash_reports": false, "verify_integrity": false, "channel": "canary"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.envVars == "FOO=bar");
+        assert(s.channel == "canary");
+    }
+
+    // Closing the launcher when Roblox starts now defaults to OFF, so a launch lands on that
+    // session's log instead of on nothing. It used to default to on, when there was nothing to
+    // stay open for.
+    {
+        Settings s;
+        assert(s.minimizeToBackground == false);
+    }
+
+    // Still read leniently: a settings.json written before this field existed takes the new
+    // default, like any other key it does not carry.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"send_crash_reports": false})";
+        out.close();
+        assert(loadSettings(dir).minimizeToBackground == false);
+    }
+
+    // A file that states it keeps what it states. Nothing migrates an existing install, so somebody
+    // who wants the window to close goes on getting that until they change it themselves.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"send_crash_reports": false, "minimize_to_background": true})";
+        out.close();
+        assert(loadSettings(dir).minimizeToBackground == true);
+    }
+
+    // Turning it on round-trips -- a user who wants the window closed must not find it staying open.
+    {
+        Settings s;
+        s.minimizeToBackground = true;
+        saveSettings(dir, s);
+        assert(loadSettings(dir).minimizeToBackground == true);
+    }
+
+    // Detailed logging defaults to off. It costs frame time and log size, so
+    // a user who never asked for it must never pay for it.
+    {
+        Settings s;
+        assert(s.debugLogging == false);
+    }
+
+    // Detailed logging loads leniently, same reasoning as haptics above: a
+    // settings.json written before this field existed stays off.
+    {
+        std::ofstream out(dir + "/settings.json", std::ios::binary);
+        out << R"({"env_vars": "FOO=bar", "send_crash_reports": false, "channel": "canary"})";
+        out.close();
+
+        Settings s = loadSettings(dir);
+        assert(s.debugLogging == false);
+    }
+
+    // Detailed logging round-trips through save/load.
+    {
+        Settings s;
+        s.debugLogging = true;
+        saveSettings(dir, s);
+
+        Settings loaded = loadSettings(dir);
+        assert(loaded.debugLogging == true);
+    }
+
+    // launchEnvPairs(): off is the default and emits nothing at all, so a
+    // launch that never touched this setting carries exactly the environment
+    // it always did.
+    {
+        Settings s;
+        assert(s.debugLogging == false);
+
+        auto pairs = launchEnvPairs(s);
+        assert(std::find(pairs.begin(), pairs.end(), std::string("TUXBLOX_DEBUG=1")) ==
+               pairs.end());
+    }
+
+    // launchEnvPairs(): turning it on is what emits anything. Only the "on"
+    // state is sent -- the compatibility layer already treats an absent
+    // value as off.
+    {
+        Settings s;
+        s.debugLogging = true;
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 2);
+        assert(pairs[0] == "TUXBLOX_WEBVIEW_GPU=1");
+        assert(pairs[1] == "TUXBLOX_DEBUG=1");
+    }
+
+    // A user variable still wins over the debug pair, for the same reason it
+    // wins over the haptics one: it is appended after it.
+    {
+        Settings s;
+        s.debugLogging = true;
+        s.envVars = "TUXBLOX_DEBUG=0";
+
+        auto pairs = launchEnvPairs(s);
+        assert(pairs.size() == 3);
+        assert(pairs[1] == "TUXBLOX_DEBUG=1");
+        assert(pairs.back() == "TUXBLOX_DEBUG=0");
+    }
+
+    // Naming the region a server is in means asking an outside service about that server, so it is opted into rather than noticed and turned off.
+    {
+        fs::remove_all(dir);
+        Settings s = loadSettings(dir);
+        assert(s.serverRegionNotify == false);
+    }
+
+    // It survives a round trip.
+    {
+        Settings s;
+        s.serverRegionNotify = true;
+        saveSettings(dir, s);
+        Settings loaded = loadSettings(dir);
+        assert(loaded.serverRegionNotify == true);
+    }
+
+    // A settings file written before this field existed keeps what it says and reads the new one as off. send_crash_reports is in the fixture because loadSettings reads that one strictly.
+    {
+        fs::create_directories(dir);
+        {
+            std::ofstream out(dir + "/settings.json");
+            out << "{\"send_crash_reports\": false, \"discord_rpc\": true}";
+        }
+        Settings loaded = loadSettings(dir);
+        assert(loaded.discordRpc == true);
+        assert(loaded.serverRegionNotify == false);
+    }
+
+    // The join button is on unless somebody turns it off, which is how other launchers behave.
+    {
+        fs::remove_all(dir);
+        Settings s = loadSettings(dir);
+        assert(s.discordJoinButton == true);
+    }
+    {
+        Settings s;
+        s.discordJoinButton = false;
+        saveSettings(dir, s);
+        assert(loadSettings(dir).discordJoinButton == false);
+    }
+    // A file written before the setting existed keeps the button, rather than silently losing it.
+    {
+        fs::create_directories(dir);
+        {
+            std::ofstream out(dir + "/settings.json");
+            out << "{\"send_crash_reports\": false, \"discord_rpc\": true}";
+        }
+        assert(loadSettings(dir).discordJoinButton == true);
+    }
+
+    // Honouring what a game asks for is on unless somebody turns it off.
+    {
+        fs::remove_all(dir);
+        assert(loadSettings(dir).discordGameStatus == true);
+    }
+    {
+        Settings s;
+        s.discordGameStatus = false;
+        saveSettings(dir, s);
+        assert(loadSettings(dir).discordGameStatus == false);
+    }
+    {
+        fs::create_directories(dir);
+        {
+            std::ofstream out(dir + "/settings.json");
+            out << "{\"send_crash_reports\": false, \"discord_rpc\": true}";
+        }
+        assert(loadSettings(dir).discordGameStatus == true);
+    }
+
+    // An existing settings.json naming neither new field must read as tour-unseen and
+    // A file that says nothing about the tour keeps everything else it does say.
+    {
+        fs::create_directories(dir);
+        {
+            std::ofstream out(dir + "/settings.json");
+            out << R"({"send_crash_reports":true,"channel":"canary","theme":"dark"})";
+        }
+        Settings s = loadSettings(dir);
+        assert(s.welcomeSeen == false);
+        assert(s.sendCrashReports == true);
+        assert(s.channel == "canary");
+        assert(s.theme == "dark");
+        fs::remove_all(dir);
+    }
+    // This file can be edited by hand, so a typo in it must not throw the whole thing away.
+    // A number where welcome_seen wants a boolean is the obvious slip.
+    //
+    // enable_player_button was a setting here once, and the Player button is a flag now --
+    // tbxFlagDisablePlayerButton -- so a file that still names it is one more key that is
+    // simply not read. It is left in this fixture on purpose: ignoring it must stay free.
+    {
+        fs::create_directories(dir);
+        {
+            std::ofstream out(dir + "/settings.json");
+            out << R"({"send_crash_reports":false,"enable_player_button":"true","welcome_seen":1,)"
+                   R"("channel":"canary","env_vars":"A=1"})";
+        }
+        Settings s = loadSettings(dir);
+        assert(s.welcomeSeen == false);
+        assert(s.channel == "canary");   // and everything else survives
+        assert(s.envVars == "A=1");
+        fs::remove_all(dir);
+    }
+    // It round-trips.
+    {
+        Settings s;
+        s.welcomeSeen = true;
+        saveSettings(dir, s);
+        Settings back = loadSettings(dir);
+        assert(back.welcomeSeen == true);
+        fs::remove_all(dir);
+    }
+
+    fs::remove_all(dir);
+
+    printf("settings: all tests passed\n");
+    return 0;
+}

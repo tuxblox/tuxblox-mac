@@ -1,0 +1,63 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "versions_tab_state.h"
+#include <algorithm>
+
+namespace tuxblox {
+
+bool canDeleteVersion(const AppVersions& av, const std::string& hash) {
+    return std::any_of(av.installed.begin(), av.installed.end(),
+                        [&](const InstalledVersion& v) { return v.hash == hash; });
+}
+
+std::string versionRowMeta(const InstalledVersion& version) {
+    if (version.versionString.empty()) return version.channel;
+    if (version.channel.empty()) return version.versionString;
+    return version.versionString + " \xC2\xB7 " + version.channel;
+}
+
+bool versionIsActive(const AppVersions& versions, const std::string& hash) {
+    return !hash.empty() && versions.activeHash == hash;
+}
+
+std::string trimmedHash(const std::string& typed) {
+    const size_t first = typed.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const size_t last = typed.find_last_not_of(" \t\r\n");
+    return typed.substr(first, last - first + 1);
+}
+
+std::string normalizedChannel(const std::string& typed) {
+    const size_t first = typed.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const size_t last = typed.find_last_not_of(" \t\r\n");
+    std::string channel = typed.substr(first, last - first + 1);
+    for (char& letter : channel) {
+        if (letter >= 'A' && letter <= 'Z') letter = static_cast<char>(letter - 'A' + 'a');
+    }
+    return channel;
+}
+
+bool channelBoxVisibleFor(VersionSelectMode mode) {
+    return mode == VersionSelectMode::Latest || mode == VersionSelectMode::ManualHash;
+}
+
+bool nextWarningVisibleFor(VersionSelectMode mode) {
+    return mode == VersionSelectMode::Next;
+}
+
+} // namespace tuxblox

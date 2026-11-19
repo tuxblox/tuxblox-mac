@@ -1,0 +1,139 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "install_paths.h"
+#include <cstdio>
+#include <filesystem>
+#include <cstdlib>
+#include <stdexcept>
+#include <sys/statvfs.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+namespace tuxblox {
+
+namespace {
+
+// One spelling for a folder path, so a trailing separator or a "/." cannot
+// reach the paths built from it.
+std::string normalizedDir(const std::string& dir) {
+    std::string path = std::filesystem::path(dir).lexically_normal().string();
+    while (path.size() > 1 && path.back() == '/') path.pop_back();
+    return path;
+}
+
+} // namespace
+
+std::string installDir() {
+    const char* root = std::getenv("TUXBLOX_ROOT");
+    if (root && root[0] != '\0') {
+        // Resolving a relative value against the current directory would make the answer depend on where TuxBlox happened to be started from.
+        if (root[0] == '/') return normalizedDir(root);
+        fprintf(stderr, "TuxBlox: ignoring TUXBLOX_ROOT, it is not an absolute path: %s\n", root);
+    }
+
+    const std::string self = selfExePath();
+    const std::size_t slash = self.rfind('/');
+    if (slash != std::string::npos && slash > 0) {
+        return self.substr(0, slash);
+    }
+
+    const char* home = std::getenv("HOME");
+    if (!home || home[0] == '\0') {
+        throw std::runtime_error("installDir: /proc/self/exe is unreadable and HOME is not set");
+    }
+    return std::string(home) + "/.tuxblox";
+}
+
+bool hasEnoughDiskSpace(const std::string& path, uint64_t minBytes) {
+    struct statvfs st{};
+    if (statvfs(path.c_str(), &st) != 0) {
+        throw std::runtime_error("hasEnoughDiskSpace: statvfs failed for " + path);
+    }
+    uint64_t freeBytes = static_cast<uint64_t>(st.f_bavail) * static_cast<uint64_t>(st.f_frsize);
+    return freeBytes >= minBytes;
+}
+
+std::string compatDirUnder(const std::string& installDir) {
+    const std::string current = installDir + "/compat";
+    if (access(current.c_str(), F_OK) == 0) return current;
+
+    // An install made before the compatibility layer was renamed has it under
+    // the old name, and so does one made from a release manifest that still
+    // names the artifact "proton". Accept that name when the current one is
+    // not there, so neither case has to be reinstalled.
+    const std::string legacy = installDir + "/proton";
+    if (access(legacy.c_str(), F_OK) == 0) return legacy;
+
+    return current;
+}
+
+std::optional<std::string> readBinaryVersion(const std::string& bin) {
+    if (access(bin.c_str(), X_OK) != 0) return std::nullopt;
+
+    // fork/exec instead of popen: no shell involved, so installDir needs no
+    // quoting/escaping.
+    int fds[2];
+    if (pipe(fds) != 0) return std::nullopt;
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return std::nullopt;
+    }
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        execl(bin.c_str(), bin.c_str(), "--version", static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    close(fds[1]);
+
+    std::string out;
+    char buf[256];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof buf)) > 0) out.append(buf, static_cast<size_t>(n));
+    close(fds[0]);
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return std::nullopt;
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return std::nullopt;
+
+    out = out.substr(0, out.find('\n'));
+    while (!out.empty() && (out.back() == '\r' || out.back() == ' ' || out.back() == '\t')) out.pop_back();
+    if (out.empty()) return std::nullopt;
+    return out;
+}
+
+std::optional<std::string> readInstalledCompatVersion(const std::string& installDir) {
+    return readBinaryVersion(compatDirUnder(installDir) + "/main");
+}
+
+std::string selfExePath() {
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return "";
+    buf[n] = '\0';
+    return std::string(buf);
+}
+
+std::string interfaceStackRoot() {
+    const std::string self = selfExePath();
+    return self.substr(0, self.rfind('/')) + "/libtuxblox";
+}
+
+} // namespace tuxblox

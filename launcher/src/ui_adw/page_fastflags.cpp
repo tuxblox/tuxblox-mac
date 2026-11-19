@@ -1,0 +1,493 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "page_fastflags.h"
+#include "fastflag_import.h"
+#include "fastflags_page_state.h"
+#include "i18n.h"
+#include "widgets.h"
+
+#include <algorithm>
+#include <map>
+#include <set>
+#include <string>
+
+namespace tuxblox {
+
+namespace {
+
+bool sameFlags(const std::vector<FastFlag> &a, const std::vector<FastFlag> &b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (a[i].name != b[i].name || a[i].value != b[i].value) return false;
+    }
+    return true;
+}
+
+std::string trimmedText(GtkEntry *pEntry) {
+    const std::string text = gtk_editable_get_text(GTK_EDITABLE(pEntry));
+    const size_t first = text.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const size_t last = text.find_last_not_of(" \t\r\n");
+    return text.substr(first, last - first + 1);
+}
+
+} // namespace
+
+FastFlagsPage::FastFlagsPage(App &app) : app_(app) {
+    pRoot_ = adw_preferences_page_new();
+    adw_preferences_page_set_description(
+        ADW_PREFERENCES_PAGE(pRoot_),
+        i18n::tr("FastFlags are hidden Roblox settings you can change yourself. Only some of them are meant to be changed, and "
+                 "what happens to an account that changes the rest is Roblox's decision alone."));
+    GtkWidget *pToolbarGroup = adw_preferences_group_new();
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(pToolbarGroup), buildToolbar());
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(pRoot_), ADW_PREFERENCES_GROUP(pToolbarGroup));
+
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(pRoot_), buildSection(player_, "Player"));
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(pRoot_), buildSection(studio_, "Studio"));
+
+    GtkWidget *pFooterGroup = adw_preferences_group_new();
+    GtkWidget *pFooter = gtk_label_new("Saved as you type. Flags take effect the next time you launch.");
+    gtk_label_set_xalign(GTK_LABEL(pFooter), 0.0f);
+    gtk_label_set_wrap(GTK_LABEL(pFooter), TRUE);
+    gtk_widget_add_css_class(pFooter, "caption");
+    gtk_widget_add_css_class(pFooter, "dim-label");
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(pFooterGroup), pFooter);
+    adw_preferences_page_add(ADW_PREFERENCES_PAGE(pRoot_), ADW_PREFERENCES_GROUP(pFooterGroup));
+
+    applyActive();
+}
+
+GtkWidget *FastFlagsPage::widget() const {
+    return pRoot_;
+}
+
+AdwPreferencesGroup *FastFlagsPage::buildSection(Section &section, const char *pTitle) {
+    GtkWidget *pGroup = adw_preferences_group_new();
+    // Untitled: the toggle above already names which list this is.
+    (void)pTitle;
+    section.pGroup = ADW_PREFERENCES_GROUP(pGroup);
+
+    section.pEmpty = plainActionRow(i18n::tr("No flags set."), "");
+    adw_preferences_group_add(section.pGroup, section.pEmpty);
+    return section.pGroup;
+}
+
+namespace {
+
+// One half of the Player/Studio toggle: its name, and the count of flags it holds.
+GtkWidget *targetToggle(const char *pLabel, GtkLabel **ppCount) {
+    GtkWidget *pName = gtk_label_new(pLabel);
+    GtkWidget *pCount = gtk_label_new("0");
+    gtk_widget_add_css_class(pCount, "session-count");
+    *ppCount = GTK_LABEL(pCount);
+
+    GtkWidget *pBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 7);
+    gtk_widget_set_halign(pBox, GTK_ALIGN_CENTER);
+    gtk_box_append(GTK_BOX(pBox), pName);
+    gtk_box_append(GTK_BOX(pBox), pCount);
+
+    GtkWidget *pToggle = gtk_toggle_button_new();
+    gtk_button_set_child(GTK_BUTTON(pToggle), pBox);
+    return pToggle;
+}
+
+} // namespace
+
+GtkWidget *FastFlagsPage::buildToolbar() {
+    pPlayerToggle_ = targetToggle("Player", &pPlayerCount_);
+    pStudioToggle_ = targetToggle("Studio", &pStudioCount_);
+    gtk_toggle_button_set_group(GTK_TOGGLE_BUTTON(pStudioToggle_), GTK_TOGGLE_BUTTON(pPlayerToggle_));
+    gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(pPlayerToggle_), TRUE);
+    g_signal_connect(pPlayerToggle_, "toggled", G_CALLBACK(onTargetToggled), this);
+    g_signal_connect(pStudioToggle_, "toggled", G_CALLBACK(onTargetToggled), this);
+
+    GtkWidget *pSegmented = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(pSegmented, "linked");
+    gtk_box_append(GTK_BOX(pSegmented), pPlayerToggle_);
+    gtk_box_append(GTK_BOX(pSegmented), pStudioToggle_);
+
+    pSearch_ = gtk_search_entry_new();
+    gtk_widget_set_hexpand(pSearch_, TRUE);
+    gtk_editable_set_text(GTK_EDITABLE(pSearch_), "");
+    gtk_widget_set_tooltip_text(pSearch_, "Filter by flag name");
+    g_signal_connect(pSearch_, "changed", G_CALLBACK(onSearchChanged), this);
+
+    GtkWidget *pAdd = gtk_button_new_with_label("Add flag");
+    gtk_widget_add_css_class(pAdd, "suggested-action");
+    g_signal_connect(pAdd, "clicked", G_CALLBACK(onAdd), this);
+
+    // Import lives here rather than beside Add, so the toolbar carries one primary action.
+    GtkWidget *pImport = gtk_button_new_with_label("Import JSON");
+    gtk_widget_add_css_class(pImport, "flat");
+    g_signal_connect(pImport, "clicked", G_CALLBACK(onImportClicked), this);
+    GtkWidget *pMenuBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_set_margin_start(pMenuBox, 6);
+    gtk_widget_set_margin_end(pMenuBox, 6);
+    gtk_widget_set_margin_top(pMenuBox, 6);
+    gtk_widget_set_margin_bottom(pMenuBox, 6);
+    gtk_box_append(GTK_BOX(pMenuBox), pImport);
+    GtkWidget *pPopover = gtk_popover_new();
+    gtk_popover_set_child(GTK_POPOVER(pPopover), pMenuBox);
+    GtkWidget *pMore = gtk_menu_button_new();
+    gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(pMore), "view-more-symbolic");
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(pMore), pPopover);
+    gtk_widget_set_tooltip_text(pMore, "More flag actions");
+
+    GtkWidget *pBar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_append(GTK_BOX(pBar), pSegmented);
+    gtk_box_append(GTK_BOX(pBar), pSearch_);
+    gtk_box_append(GTK_BOX(pBar), pAdd);
+    gtk_box_append(GTK_BOX(pBar), pMore);
+    return pBar;
+}
+
+FastFlagsPage::Section &FastFlagsPage::activeSection() {
+    return active_ == LaunchTarget::Player ? player_ : studio_;
+}
+
+void FastFlagsPage::applyActive() {
+    const bool player = active_ == LaunchTarget::Player;
+    gtk_widget_set_visible(GTK_WIDGET(player_.pGroup), player);
+    gtk_widget_set_visible(GTK_WIDGET(studio_.pGroup), !player);
+    applyFilter();
+}
+
+void FastFlagsPage::applyFilter() {
+    Section &section = activeSection();
+    std::vector<FastFlag> shown;
+    shown.reserve(section.rows.size());
+    for (const FlagRow &row : section.rows) shown.push_back({trimmedText(row.pName), ""});
+
+    const std::vector<size_t> visible = visibleFlagIndices(shown, searchTerm_);
+    for (size_t at = 0; at < section.rows.size(); ++at) {
+        const bool keep = std::find(visible.begin(), visible.end(), at) != visible.end();
+        gtk_widget_set_visible(section.rows[at].pRow, keep);
+    }
+
+    const bool nothingShown = visible.empty();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(section.pEmpty),
+                                  section.rows.empty() ? "No flags set." : "No flags match that search.");
+    gtk_widget_set_visible(section.pEmpty, nothingShown);
+}
+
+void FastFlagsPage::updateCounts() {
+    setLabelText(pPlayerCount_, std::to_string(flagCount(collect(player_))));
+    setLabelText(pStudioCount_, std::to_string(flagCount(collect(studio_))));
+}
+
+void FastFlagsPage::onTargetToggled(GtkToggleButton *pButton, gpointer data) {
+    if (!gtk_toggle_button_get_active(pButton)) return;
+    auto *pSelf = static_cast<FastFlagsPage *>(data);
+    pSelf->active_ = pButton == GTK_TOGGLE_BUTTON(pSelf->pStudioToggle_) ? LaunchTarget::Studio
+                                                                         : LaunchTarget::Player;
+    pSelf->applyActive();
+}
+
+void FastFlagsPage::onSearchChanged(GtkEditable *pEntry, gpointer data) {
+    auto *pSelf = static_cast<FastFlagsPage *>(data);
+    pSelf->searchTerm_ = gtk_editable_get_text(pEntry);
+    pSelf->applyFilter();
+}
+
+void FastFlagsPage::addRow(Section &section, const FastFlag &flag) {
+    GtkWidget *pName = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(pName), "FlagName");
+    gtk_editable_set_text(GTK_EDITABLE(pName), flag.name.c_str());
+    gtk_widget_set_hexpand(pName, TRUE);
+
+    GtkWidget *pValue = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(pValue), i18n::tr("value"));
+    gtk_editable_set_text(GTK_EDITABLE(pValue), flag.value.c_str());
+    gtk_editable_set_width_chars(GTK_EDITABLE(pValue), 12);
+
+    GtkWidget *pRemove = gtk_button_new_with_label("\xE2\x88\x92");
+    gtk_widget_add_css_class(pRemove, "destructive-action");
+    gtk_widget_set_tooltip_text(pRemove, i18n::tr("Remove this flag"));
+
+    for (GtkWidget *pEntry : {pName, pValue}) {
+        g_signal_connect(pEntry, "activate", G_CALLBACK(onActivate), this);
+        GtkEventController *pFocus = gtk_event_controller_focus_new();
+        g_signal_connect(pFocus, "leave", G_CALLBACK(onFocusLeft), this);
+        gtk_widget_add_controller(pEntry, pFocus);
+    }
+    g_signal_connect_data(pRemove, "clicked", G_CALLBACK(onRemove), new RemoveAction{&section, GTK_ENTRY(pName)},
+                          freeRemoveAction, static_cast<GConnectFlags>(0));
+
+    GtkWidget *pBadge = gtk_label_new("overridden");
+    gtk_widget_add_css_class(pBadge, "caption");
+    gtk_widget_add_css_class(pBadge, "error");
+    gtk_widget_set_valign(pBadge, GTK_ALIGN_CENTER);
+    gtk_widget_set_visible(pBadge, FALSE);
+
+    GtkWidget *pBox = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(pBox, 12);
+    gtk_widget_set_margin_end(pBox, 12);
+    gtk_widget_set_margin_top(pBox, 8);
+    gtk_widget_set_margin_bottom(pBox, 8);
+    gtk_box_append(GTK_BOX(pBox), pName);
+    gtk_box_append(GTK_BOX(pBox), pBadge);
+    gtk_box_append(GTK_BOX(pBox), pValue);
+    gtk_box_append(GTK_BOX(pBox), pRemove);
+
+    GtkWidget *pRow = gtk_list_box_row_new();
+    gtk_list_box_row_set_activatable(GTK_LIST_BOX_ROW(pRow), FALSE);
+    gtk_list_box_row_set_child(GTK_LIST_BOX_ROW(pRow), pBox);
+    adw_preferences_group_add(section.pGroup, pRow);
+
+    section.rows.push_back({pRow, GTK_ENTRY(pName), GTK_ENTRY(pValue), pBadge});
+    refreshEmpty(section);
+}
+
+void FastFlagsPage::refreshEmpty(Section &section) {
+    gtk_widget_set_visible(section.pEmpty, section.rows.empty());
+}
+
+void FastFlagsPage::rebuild(Section &section, const std::vector<FastFlag> &flags) {
+    // Removing a focused entry fires its focus-leave, which must not save a half-emptied list
+    rebuilding_ = true;
+    for (const FlagRow &row : section.rows) adw_preferences_group_remove(section.pGroup, row.pRow);
+    section.rows.clear();
+    for (const FastFlag &flag : flags) addRow(section, flag);
+    refreshEmpty(section);
+    rebuilding_ = false;
+}
+
+std::vector<FastFlag> FastFlagsPage::collect(const Section &section) const {
+    std::vector<FastFlag> flags;
+    for (const FlagRow &row : section.rows) {
+        FastFlag flag{trimmedText(row.pName), trimmedText(row.pValue)};
+        if (flag.name.empty()) continue;
+        flags.push_back(std::move(flag));
+    }
+    return flags;
+}
+
+void FastFlagsPage::markDuplicates(Section &section) {
+    // The file is written name by name, so the LAST row of a name is the one that
+    // applies and the earlier ones are inert. Those are the rows to mark.
+    std::map<std::string, size_t> lastAt;
+    for (size_t at = 0; at < section.rows.size(); ++at) {
+        const std::string name = trimmedText(section.rows[at].pName);
+        if (!name.empty()) lastAt[name] = at;
+    }
+
+    for (size_t at = 0; at < section.rows.size(); ++at) {
+        const FlagRow &row = section.rows[at];
+        const std::string name = trimmedText(row.pName);
+        const bool overridden = !name.empty() && lastAt[name] != at;
+        if (overridden) {
+            gtk_widget_add_css_class(GTK_WIDGET(row.pName), "error");
+            gtk_widget_set_tooltip_text(GTK_WIDGET(row.pName),
+                                        i18n::tr("A later row sets this flag too, and that one is the one that applies."));
+        } else {
+            gtk_widget_remove_css_class(GTK_WIDGET(row.pName), "error");
+            gtk_widget_set_tooltip_text(GTK_WIDGET(row.pName), nullptr);
+        }
+        // Greyed because this value genuinely does nothing, not to stop an edit that would.
+        gtk_widget_set_visible(row.pBadge, overridden);
+        gtk_widget_set_sensitive(GTK_WIDGET(row.pValue), !overridden);
+    }
+}
+
+void FastFlagsPage::commit() {
+    if (rebuilding_) return;
+    markDuplicates(player_);
+    markDuplicates(studio_);
+
+    Settings updated = app_.snapshot().settings;
+    updated.fastFlags.player = collect(player_);
+    updated.fastFlags.studio = collect(studio_);
+    rendered_ = updated.fastFlags;
+    renderedOnce_ = true;
+    app_.updateSettings(updated);
+    updateCounts();
+}
+
+void FastFlagsPage::onAdd(GtkButton *, gpointer data) {
+    auto *pSelf = static_cast<FastFlagsPage *>(data);
+    Section &section = pSelf->activeSection();
+    // Not saved yet: an empty row has no name, so there is nothing to save until one is typed
+    pSelf->addRow(section, FastFlag{});
+    // Cleared, or a term still in the box would hide the row that was just added.
+    gtk_editable_set_text(GTK_EDITABLE(pSelf->pSearch_), "");
+    gtk_widget_grab_focus(GTK_WIDGET(section.rows.back().pName));
+}
+
+void FastFlagsPage::importFlags(Section &section, const std::vector<FastFlag> &flags) {
+    rebuild(section, mergeFastFlags(collect(section), flags));
+    commit();
+}
+
+void FastFlagsPage::onImportClicked(GtkButton *pButton, gpointer data) {
+    auto *pSelf = static_cast<FastFlagsPage *>(data);
+    pSelf->openImport(pSelf->activeSection(), GTK_WIDGET(pButton));
+}
+
+void FastFlagsPage::openImport(Section &section, GtkWidget *pParent) {
+    auto *pImport = new ImportDialog{this, &section};
+
+    GtkWidget *pText = gtk_text_view_new();
+    gtk_text_view_set_monospace(GTK_TEXT_VIEW(pText), TRUE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(pText), GTK_WRAP_WORD_CHAR);
+    gtk_text_view_set_top_margin(GTK_TEXT_VIEW(pText), 8);
+    gtk_text_view_set_bottom_margin(GTK_TEXT_VIEW(pText), 8);
+    gtk_text_view_set_left_margin(GTK_TEXT_VIEW(pText), 8);
+    gtk_text_view_set_right_margin(GTK_TEXT_VIEW(pText), 8);
+    pImport->pBuffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(pText));
+
+    GtkWidget *pScroll = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(pScroll), pText);
+    gtk_widget_set_vexpand(pScroll, TRUE);
+    gtk_widget_add_css_class(pScroll, "card");
+
+    pImport->pStatus = gtk_label_new(i18n::tr("Paste the flags as JSON, like {\"FlagName\": \"true\"}."));
+    gtk_label_set_wrap(GTK_LABEL(pImport->pStatus), TRUE);
+    gtk_label_set_wrap_mode(GTK_LABEL(pImport->pStatus), PANGO_WRAP_WORD_CHAR);
+    gtk_label_set_xalign(GTK_LABEL(pImport->pStatus), 0.0f);
+    gtk_widget_add_css_class(pImport->pStatus, "dim-label");
+
+    GtkWidget *pBody = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(pBody, 12);
+    gtk_widget_set_margin_end(pBody, 12);
+    gtk_widget_set_margin_top(pBody, 6);
+    gtk_widget_set_margin_bottom(pBody, 12);
+    gtk_box_append(GTK_BOX(pBody), pScroll);
+    gtk_box_append(GTK_BOX(pBody), pImport->pStatus);
+
+    GtkWidget *pCancel = gtk_button_new_with_label(i18n::tr("Cancel"));
+    g_signal_connect(pCancel, "clicked", G_CALLBACK(onImportCancel), pImport);
+    pImport->pImportButton = gtk_button_new_with_label(i18n::tr("Import"));
+    gtk_widget_add_css_class(pImport->pImportButton, "suggested-action");
+    gtk_widget_set_sensitive(pImport->pImportButton, FALSE);
+    g_signal_connect(pImport->pImportButton, "clicked", G_CALLBACK(onImportConfirm), pImport);
+
+    GtkWidget *pHeader = adw_header_bar_new();
+    adw_header_bar_set_show_start_title_buttons(ADW_HEADER_BAR(pHeader), FALSE);
+    adw_header_bar_set_show_end_title_buttons(ADW_HEADER_BAR(pHeader), FALSE);
+    adw_header_bar_pack_start(ADW_HEADER_BAR(pHeader), pCancel);
+    adw_header_bar_pack_end(ADW_HEADER_BAR(pHeader), pImport->pImportButton);
+
+    GtkWidget *pView = adw_toolbar_view_new();
+    adw_toolbar_view_add_top_bar(ADW_TOOLBAR_VIEW(pView), pHeader);
+    adw_toolbar_view_set_content(ADW_TOOLBAR_VIEW(pView), pBody);
+
+    AdwDialog *pDialog = adw_dialog_new();
+    pImport->pDialog = pDialog;
+    adw_dialog_set_title(pDialog, &section == &player_ ? i18n::tr("Import JSON into Player")
+                                                       : i18n::tr("Import JSON into Studio"));
+    adw_dialog_set_content_width(pDialog, 560);
+    adw_dialog_set_content_height(pDialog, 420);
+    adw_dialog_set_child(pDialog, pView);
+    adw_dialog_set_focus(pDialog, pText);
+    g_signal_connect(pImport->pBuffer, "changed", G_CALLBACK(onImportTextChanged), pImport);
+    g_signal_connect(pDialog, "closed", G_CALLBACK(onImportClosed), pImport);
+    adw_dialog_present(pDialog, pParent);
+}
+
+void FastFlagsPage::onImportTextChanged(GtkTextBuffer *pBuffer, gpointer data) {
+    auto *pImport = static_cast<ImportDialog *>(data);
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(pBuffer, &start, &end);
+    char *pText = gtk_text_buffer_get_text(pBuffer, &start, &end, FALSE);
+    const FastFlagImport result = parseFastFlagJson(pText);
+    const bool empty = std::string(pText).find_first_not_of(" \t\r\n") == std::string::npos;
+    g_free(pText);
+
+    pImport->parsed = result.flags;
+    gtk_widget_set_sensitive(pImport->pImportButton, result.ok);
+
+    GtkWidget *pStatus = pImport->pStatus;
+    gtk_widget_remove_css_class(pStatus, "error");
+    gtk_widget_remove_css_class(pStatus, "success");
+    gtk_widget_remove_css_class(pStatus, "dim-label");
+    if (result.ok) {
+        gtk_widget_add_css_class(pStatus, "success");
+        gtk_label_set_text(GTK_LABEL(pStatus),
+                           i18n::trn("{} flag is ready to import.", "{} flags are ready to import.",
+                                     static_cast<long long>(result.flags.size())).c_str());
+    } else if (empty) {
+        gtk_widget_add_css_class(pStatus, "dim-label");
+        gtk_label_set_text(GTK_LABEL(pStatus),
+                           i18n::tr("Paste the flags as JSON, like {\"FlagName\": \"true\"}."));
+    } else {
+        gtk_widget_add_css_class(pStatus, "error");
+        gtk_label_set_text(GTK_LABEL(pStatus), result.error.c_str());
+    }
+}
+
+void FastFlagsPage::onImportConfirm(GtkButton *, gpointer data) {
+    auto *pImport = static_cast<ImportDialog *>(data);
+    pImport->pOwner->importFlags(*pImport->pSection, pImport->parsed);
+    adw_dialog_close(pImport->pDialog);
+}
+
+void FastFlagsPage::onImportCancel(GtkButton *, gpointer data) {
+    adw_dialog_close(static_cast<ImportDialog *>(data)->pDialog);
+}
+
+void FastFlagsPage::onImportClosed(AdwDialog *, gpointer data) {
+    delete static_cast<ImportDialog *>(data);
+}
+
+void FastFlagsPage::onActivate(GtkEntry *, gpointer data) {
+    static_cast<FastFlagsPage *>(data)->commit();
+}
+
+void FastFlagsPage::onFocusLeft(GtkEventControllerFocus *, gpointer data) {
+    static_cast<FastFlagsPage *>(data)->commit();
+}
+
+void FastFlagsPage::onRemove(GtkButton *, gpointer data) {
+    auto *pAction = static_cast<RemoveAction *>(data);
+    Section &section = *pAction->pSection;
+    FastFlagsPage &self = *section.pOwner;
+    // Found by identity rather than position, since rows above it may have been removed since it was built
+    const auto found = std::find_if(section.rows.begin(), section.rows.end(),
+                                    [pAction](const FlagRow &row) { return row.pName == pAction->pName; });
+    if (found == section.rows.end()) return;
+    GtkWidget *pRow = found->pRow;
+    section.rows.erase(found);
+    self.rebuilding_ = true;
+    adw_preferences_group_remove(section.pGroup, pRow);
+    self.rebuilding_ = false;
+    self.refreshEmpty(section);
+    self.commit();
+}
+
+void FastFlagsPage::freeRemoveAction(gpointer data, GClosure *) {
+    delete static_cast<RemoveAction *>(data);
+}
+
+void FastFlagsPage::update(const AppSnapshot &snap) {
+    if (renderedOnce_ && sameFlags(snap.settings.fastFlags.player, rendered_.player) &&
+        sameFlags(snap.settings.fastFlags.studio, rendered_.studio)) {
+        return;
+    }
+    rebuild(player_, snap.settings.fastFlags.player);
+    rebuild(studio_, snap.settings.fastFlags.studio);
+    rendered_ = snap.settings.fastFlags;
+    renderedOnce_ = true;
+    // Also on a plain render, not just after an edit, or a duplicate already in
+    // settings.json stays unmarked until something else saves.
+    markDuplicates(player_);
+    markDuplicates(studio_);
+    updateCounts();
+    applyFilter();
+}
+
+} // namespace tuxblox

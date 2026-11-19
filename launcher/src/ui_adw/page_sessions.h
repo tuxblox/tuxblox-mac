@@ -1,0 +1,145 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#pragma once
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "app.h"
+#include "log_entry.h"
+#include "page.h"
+#include "session_log_reader.h"
+#include "sessions_page_state.h"
+
+// Third Parties
+#include <adwaita.h>
+
+namespace tuxblox {
+
+class SessionsPage : public Page {
+public:
+    explicit SessionsPage(App &app);
+    GtkWidget *widget() const override;
+    void update(const AppSnapshot &snap) override;
+
+private:
+    struct Toggle {
+        GtkWidget *pButton = nullptr;
+        bool on = false;
+    };
+
+    GtkWidget *buildList();
+    GtkWidget *buildLogPane();
+    GtkWidget *buildControls();
+    GtkWidget *buildFindBar();
+    GtkWidget *toggleButton(Toggle &toggle, const char *pLabel, bool on);
+    GtkWidget *buildFilterButton();
+    GtkWidget *filterCheck(const char *pLabel, bool &flag);
+
+    // What the list is showing now, so a census that says the same thing does not throw the rows away -- rebuilding them ten times a second destroys the row under the pointer before a click can land on it.
+    struct RenderedRow {
+        int pid = 0;
+        bool running = false;
+        bool crashed = false;
+    };
+    static std::vector<RenderedRow> shapeOf(const SessionsView &view);
+
+    void rebuildList(const SessionsView &view);
+    void updateMetaInPlace(const SessionsView &view);
+    void selectSession(int pid);
+    // The row and the log have to agree about which session is being looked at, and the list is built before the first one is picked.
+    void highlightSelectedRow();
+    // Keeps the reader pointed at what the session actually has now: Roblox writes its log a moment after its process exists, and when a session ends TuxBlox folds that log into its own, so the files a reader was built with go stale underneath it.
+    void reconcileReader(const AppSnapshot &snap);
+    void showEntries();
+    void appendEntry(const LogEntry &entry);
+    // Hides and shows whole kinds by tag, which costs nothing however long the log is.
+    void applyFilter();
+    void refreshCount();
+    void applyFind();
+    void scrollToTail();
+    void refreshHeader(const AppSnapshot &snap);
+
+    static void onSearchChanged(GtkEditable *pEditable, gpointer data);
+    static void onRowActivated(GtkListBox *pList, GtkListBoxRow *pRow, gpointer data);
+    static void onToggle(GtkButton *pButton, gpointer data);
+    static void onFilterToggled(GtkCheckButton *pCheck, gpointer data);
+    static void onStopClicked(GtkButton *pButton, gpointer data);
+    static void onRowStopClicked(GtkButton *pButton, gpointer data);
+    static void onCopyClicked(GtkButton *pButton, gpointer data);
+    static void onSaveClicked(GtkButton *pButton, gpointer data);
+    static void onFolderClicked(GtkButton *pButton, gpointer data);
+    static void onFindChanged(GtkEditable *pEditable, gpointer data);
+    static void onFindStep(GtkButton *pButton, gpointer data);
+    static void onJumpToEnd(GtkButton *pButton, gpointer data);
+    static void onLogPositionChanged(GtkAdjustment *pPosition, gpointer data);
+    static void onLogClick(GtkGestureClick *pGesture, int presses, double x, double y, gpointer data);
+    static gboolean finishTailScroll(gpointer data);
+
+    App &app_;
+    GtkWidget *pRoot_ = nullptr;
+
+    GtkWidget *pSearch_ = nullptr;
+    GtkWidget *pListBox_ = nullptr;
+    GtkWidget *pEmpty_ = nullptr;
+    std::vector<GtkWidget *> rows_;
+    std::vector<RenderedRow> renderedShape_;
+    std::vector<GtkLabel *> renderedMetas_;
+    std::string renderedEmpty_;
+
+    GtkLabel *pName_ = nullptr;
+    GtkLabel *pState_ = nullptr;
+    GtkLabel *pMeta_ = nullptr;
+    GtkLabel *pSources_ = nullptr;
+    GtkLabel *pSize_ = nullptr;
+    GtkWidget *pJumpToEnd_ = nullptr;
+    GtkWidget *pStop_ = nullptr;
+
+    GtkTextView *pLog_ = nullptr;
+    GtkTextBuffer *pBuffer_ = nullptr;
+    GtkWidget *pLogScroll_ = nullptr;
+    GtkWidget *pFind_ = nullptr;
+    GtkLabel *pFindCount_ = nullptr;
+
+    Toggle follow_;
+    Toggle wrap_;
+    Toggle tidy_;
+    // Kept here rather than in the settings file: which lines you want to see while reading one log is not a preference worth carrying to the next run, but it does have to survive moving between sessions.
+    LogFilter filter_;
+
+    std::unique_ptr<SessionLogReader> pReader_;
+    std::string readerCaptured_;
+    std::string readerRoblox_;
+    std::vector<LogEntry> entries_;
+    // How many of them the filter let through, so the count can say what is being hidden.
+    size_t shownEntries_ = 0;
+    int selectedPid_ = 0;
+    // Set only when the reader actually scrolls. Working it out from the scrollbar instead latches: the scroll the page asks for is carried out later, so the next tick reads a stale position, decides the reader moved away, and then never scrolls again.
+    bool readerScrolledAway_ = false;
+    // A scroll the page asked for, which must not be read back as the reader moving.
+    bool selfScrolling_ = false;
+    // Where the view sat at the last move, so the next one can be told from a line arriving.
+    LogScrollState lastLogScroll_;
+    guint tailScrollIdle_ = 0;
+    // The reader was swapped and what is on screen belongs to the old one, so it is replaced rather than cleared the moment the new one produces anything.
+    bool replacingText_ = false;
+    std::string renderedQuery_;
+    size_t currentMatch_ = 0;
+    std::vector<LogMatch> matches_;
+};
+
+} // namespace tuxblox

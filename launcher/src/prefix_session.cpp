@@ -1,0 +1,388 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "prefix_session.h"
+#include "launch_paths.h"
+#include <algorithm>
+#include <cctype>
+#include <chrono>
+#include <cstdlib>
+#include <csignal>
+#include <thread>
+#include <unistd.h>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+
+namespace fs = std::filesystem;
+
+namespace tuxblox {
+
+namespace {
+
+// Kept in sync with the image lists in compat/tuxblox/src/support/sessions.cpp.
+// Deliberately an allowlist of the apps this launcher exists to run, not a
+// denylist of helpers -- forgetting a helper only costs a wrong run option,
+// forgetting an app breaks a launch.
+const char* const kClientImages[] = {
+    "robloxplayerbeta.exe",
+    "robloxstudiobeta.exe",
+};
+
+const char* const kInstallerImages[] = {
+    "robloxplayerinstaller.exe",
+    "robloxstudioinstaller.exe",
+};
+
+std::string toLower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+std::string readWholeFile(const fs::path& path) {
+    // Opening is not enough: a process that exits mid-scan fails the READ, and libstdc++ throws
+    // from underflow whatever the exceptions mask says, which used to abort the whole launcher.
+    try {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return "";
+        return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    } catch (const std::exception&) {
+        return "";
+    }
+}
+
+// os.path.normpath's shape for our purposes: collapse the path and drop any
+// trailing separator, so ".../pfx/" and ".../pfx" compare equal. session.cpp sets
+// WINEPREFIX with a trailing slash (prefix_dir = path("pfx/"), line 774) and
+// pid_wineprefix() normpaths it away before comparing -- do the same on both
+// sides or the comparison never matches.
+std::string normalizePath(const std::string& p) {
+    if (p.empty()) return p;
+    std::string s = fs::path(p).lexically_normal().string();
+    while (s.size() > 1 && s.back() == '/') s.pop_back();
+    return s;
+}
+
+std::string wineprefixFromEnviron(const std::string& environBlob) {
+    return normalizePath(envValueFromEnviron(environBlob, "WINEPREFIX"));
+}
+
+bool imageIsPlayer(const std::string& image) { return image == kClientImages[0]; }
+
+bool imageIsStudio(const std::string& image) { return image == kClientImages[1]; }
+
+bool imageIsInstaller(const std::string& image) {
+    for (const char* candidate : kInstallerImages)
+        if (image == candidate) return true;
+    return false;
+}
+
+// The image a layer process was told to run. Its own path has no ".exe" in it,
+// so the first one in the whole command line is the Roblox executable.
+std::string layerTargetImage(const std::string& cmdlineBlob) {
+    std::string joined = cmdlineBlob;
+    for (char& c : joined) if (c == '\0') c = ' ';
+    return wineImageNameFromCmdline(joined);
+}
+
+// Symlinks resolved, not just the path collapsed: /proc/<pid>/exe is a resolved
+// path, and an install reached through a symlink spells its own paths the other
+// way, so both sides of a comparison have to be put in the same form.
+std::string resolvedPath(const std::string& p) {
+    if (p.empty()) return p;
+    std::error_code ec;
+    const fs::path resolved = fs::weakly_canonical(p, ec);
+    return normalizePath(ec ? p : resolved.string());
+}
+
+// The PPid line of /proc/<pid>/status, or -1. Read from status rather than stat because stat's second field is the executable name, which may itself contain spaces and brackets.
+int parentPidIn(const std::string& procRoot, int pid) {
+    std::ifstream file(procRoot + "/" + std::to_string(pid) + "/status");
+    if (!file) return -1;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.rfind("PPid:", 0) != 0) continue;
+        const size_t at = line.find_first_not_of(" \t", 5);
+        if (at == std::string::npos) return -1;
+        return std::atoi(line.c_str() + at);
+    }
+    return -1;
+}
+
+bool anyAlive(const std::vector<int>& pids) {
+    for (int pid : pids)
+        if (::kill(pid, 0) == 0) return true;
+    return false;
+}
+
+} // namespace
+
+std::string envValueFromEnviron(const std::string& environBlob, const std::string& key) {
+    const std::string wanted = key + "=";
+    size_t pos = 0;
+    while (pos < environBlob.size()) {
+        size_t end = environBlob.find('\0', pos);
+        if (end == std::string::npos) end = environBlob.size();
+        if (environBlob.compare(pos, wanted.size(), wanted) == 0)
+            return environBlob.substr(pos + wanted.size(), end - pos - wanted.size());
+        pos = end + 1;
+    }
+    return "";
+}
+
+std::vector<int> collectPrefixPidsIn(const std::string& procRoot, const std::string& prefixDir) {
+    std::vector<int> pids;
+    const std::string want = normalizePath(prefixDir);
+    if (want.empty()) return pids; // never match every process on the machine
+
+    std::error_code ec;
+    fs::directory_iterator it(procRoot, ec);
+    if (ec) return pids;
+
+    const int self = static_cast<int>(getpid());
+    for (const auto& entry : it) {
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
+
+        const int pid = std::atoi(name.c_str());
+        if (pid <= 0 || pid == self) continue;
+
+        // No cmdline pre-filter here: this has to catch wineserver and the
+        // Wine services, which are not in the session-holder allowlist. An
+        // unreadable environ (another user's process) simply doesn't match.
+        if (wineprefixFromEnviron(readWholeFile(entry.path() / "environ")) != want) continue;
+        pids.push_back(pid);
+    }
+    return pids;
+}
+
+int terminatePrefixProcesses(const std::string& prefixDir) {
+    std::vector<int> pids = collectPrefixPidsIn("/proc", prefixDir);
+    for (int pid : pids) ::kill(pid, SIGTERM);
+    if (pids.empty()) return 0;
+
+    // Give them a moment to exit on their own, then insist. Polling rather
+    // than one long sleep so a clean shutdown isn't made to wait.
+    for (int waited = 0; waited < 3000; waited += 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        bool anyAlive = false;
+        for (int pid : pids) {
+            if (::kill(pid, 0) == 0) { anyAlive = true; break; }
+        }
+        if (!anyAlive) return static_cast<int>(pids.size());
+    }
+    for (int pid : pids) ::kill(pid, SIGKILL);
+    return static_cast<int>(pids.size());
+}
+
+std::string wineImageNameFromCmdline(const std::string& firstCmdlineToken) {
+    // A wine process's /proc/<pid>/cmdline holds the *Windows* command line
+    // ("C:\...\RobloxStudioBeta.exe -foo"). comm is no use here: it holds
+    // whatever the app named its main thread, which for Studio is literally
+    // "Main". Cut at the first ".exe", not the first space -- the image path
+    // itself can contain spaces, and the arguments after it can contain further
+    // ".exe" paths (RobloxCrashHandler's --attachment= list, for one). Same rule
+    // as pidWineImage() in compat/tuxblox/src/launch/session.cpp.
+    const std::string lower = toLower(firstCmdlineToken);
+    const size_t cut = lower.find(".exe");
+    if (cut == std::string::npos) return "";
+    std::string image = lower.substr(0, cut + 4);
+    for (char& c : image) if (c == '/') c = '\\';
+    const size_t slash = image.rfind('\\');
+    return slash == std::string::npos ? image : image.substr(slash + 1);
+}
+
+PrefixSessions prefixSessionsIn(const std::string& procRoot, const std::string& prefixDir) {
+    PrefixSessions sessions;
+    const std::string want = normalizePath(prefixDir);
+    if (want.empty()) return sessions; // never match every process on the machine
+
+    std::error_code ec;
+    fs::directory_iterator it(procRoot, ec);
+    if (ec) return sessions; // no /proc, or not readable -- "nothing running", not an error
+
+    for (const auto& entry : it) {
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
+
+        // Image name first: cmdline is world-readable and cheap, and it narrows
+        // a few hundred processes down to the handful worth reading environ for
+        // (environ is not world-readable). Same ordering as sessions.cpp.
+        const std::string cmdline = readWholeFile(entry.path() / "cmdline");
+        const size_t nul = cmdline.find('\0');
+        const std::string first = nul == std::string::npos ? cmdline : cmdline.substr(0, nul);
+        const std::string image = wineImageNameFromCmdline(first);
+        const bool player = imageIsPlayer(image);
+        const bool studio = imageIsStudio(image);
+        if (!player && !studio && !imageIsInstaller(image)) continue;
+
+        if (wineprefixFromEnviron(readWholeFile(entry.path() / "environ")) != want) continue;
+
+        const int pid = std::atoi(name.c_str());
+        if (player) {
+            sessions.player++;
+            sessions.playerPids.push_back(pid);
+        } else if (studio) {
+            sessions.studio++;
+            sessions.studioPids.push_back(pid);
+        } else {
+            sessions.installers++;
+        }
+    }
+    return sessions;
+}
+
+PrefixSessions prefixSessions(const std::string& prefixDir) {
+    return prefixSessionsIn("/proc", prefixDir);
+}
+
+bool launchJoinsPrefix(LaunchTarget target, const PrefixSessions& sessions) {
+    const int others = target == LaunchTarget::Player ? sessions.studio
+                                                      : sessions.player + sessions.studio;
+    return others + sessions.installers > 0;
+}
+
+std::vector<int> layerProcessesForIn(const std::string& procRoot, const std::string& installDir,
+                                     LaunchTarget target) {
+    std::vector<int> pids;
+    std::error_code ec;
+    // Resolved, so an install reached through a symlink still matches: otherwise
+    // every Stop falls back to killing Roblox outright, and the layer's non-zero
+    // exit shows the crash window this exists to avoid.
+    const std::string layerBinary = resolvedPath(compatBinaryPath(installDir));
+    const std::string wantPrefix = resolvedPath(installDir + "/runtime");
+    const std::string wantImage = target == LaunchTarget::Player ? "robloxplayerbeta.exe"
+                                                                 : "robloxstudiobeta.exe";
+
+    fs::directory_iterator it(procRoot, ec);
+    if (ec) return pids;
+
+    const int self = static_cast<int>(getpid());
+    for (const auto& entry : it) {
+        const std::string name = entry.path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
+
+        const int pid = std::atoi(name.c_str());
+        if (pid <= 0 || pid == self) continue;
+
+        std::error_code linkEc;
+        const fs::path exe = fs::read_symlink(entry.path() / "exe", linkEc);
+        if (linkEc || resolvedPath(exe.string()) != layerBinary) continue;
+
+        if (layerTargetImage(readWholeFile(entry.path() / "cmdline")) != wantImage) continue;
+        if (resolvedPath(envValueFromEnviron(readWholeFile(entry.path() / "environ"),
+                                            "TUXBLOX_PREFIX")) != wantPrefix) continue;
+        pids.push_back(pid);
+    }
+    return pids;
+}
+
+std::vector<int> layerProcessesFor(const std::string& installDir, LaunchTarget target) {
+    return layerProcessesForIn("/proc", installDir, target);
+}
+
+int layerProcessForSessionIn(const std::string& procRoot, const std::string& installDir,
+                             LaunchTarget target, int robloxPid) {
+    if (robloxPid <= 0) return -1;
+    const std::vector<int> layers = layerProcessesForIn(procRoot, installDir, target);
+    if (layers.empty()) return -1;
+
+    // Bounded rather than "until pid 1", so a /proc that disagrees with itself cannot spin here.
+    int pid = robloxPid;
+    for (int step = 0; step < 32 && pid > 1; ++step) {
+        if (std::find(layers.begin(), layers.end(), pid) != layers.end()) return pid;
+        pid = parentPidIn(procRoot, pid);
+        if (pid <= 0) break;
+    }
+    return -1;
+}
+
+bool stopPrefixSession(const std::string& installDir, LaunchTarget target, int robloxPid) {
+    // The macOS backend runs the client directly: there is no compatibility
+    // layer process to signal, so stop the marked process itself.
+    {
+        std::ifstream environ("/proc/" + std::to_string(robloxPid) + "/environ", std::ios::binary);
+        std::istreambuf_iterator<char> first(environ), last;
+        const std::string blob(first, last);
+        if (envValueFromEnviron(blob, "TUXBLOX_MAC_CLIENT") == "1") {
+            const std::vector<int> client{robloxPid};
+            ::kill(robloxPid, SIGTERM);
+            for (int waited = 0; waited < 3000; waited += 100) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!anyAlive(client)) return true;
+            }
+            ::kill(robloxPid, SIGKILL);
+            return true;
+        }
+    }
+
+    const int layer = layerProcessForSessionIn("/proc", installDir, target, robloxPid);
+    if (layer <= 0) return false;
+
+    // The same stand-down the whole-app Stop uses, aimed at one session's layer process.
+    const std::vector<int> client{robloxPid};
+    ::kill(layer, SIGUSR1);
+    for (int waited = 0; waited < 5000; waited += 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!anyAlive(client)) return true;
+    }
+    ::kill(robloxPid, SIGTERM);
+    for (int waited = 0; waited < 3000; waited += 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!anyAlive(client)) return true;
+    }
+    ::kill(robloxPid, SIGKILL);
+    return true;
+}
+
+int stopPrefixSessions(const std::string& installDir, LaunchTarget target) {
+    const PrefixSessions sessions = prefixSessions(installDir + "/runtime/pfx");
+    const std::vector<int> clients = target == LaunchTarget::Player ? sessions.playerPids
+                                                                    : sessions.studioPids;
+    if (clients.empty()) return 0;
+
+    // SIGUSR1 is the compatibility layer's "stand down" signal: it closes the
+    // session and reports success, so no crash window appears. A session whose
+    // layer process has gone is stopped directly instead.
+    for (int pid : layerProcessesFor(installDir, target)) ::kill(pid, SIGUSR1);
+
+    for (int waited = 0; waited < 5000; waited += 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!anyAlive(clients)) return static_cast<int>(clients.size());
+    }
+
+    // Roblox under the runtime routinely ignores SIGTERM, the same reason
+    // terminatePrefixProcesses() escalates.
+    for (int pid : clients) ::kill(pid, SIGTERM);
+    for (int waited = 0; waited < 3000; waited += 100) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        if (!anyAlive(clients)) return static_cast<int>(clients.size());
+    }
+    for (int pid : clients) ::kill(pid, SIGKILL);
+    return static_cast<int>(clients.size());
+}
+
+bool prefixHasSessionHolderIn(const std::string& procRoot, const std::string& prefixDir) {
+    const PrefixSessions sessions = prefixSessionsIn(procRoot, prefixDir);
+    return sessions.player + sessions.studio + sessions.installers > 0;
+}
+
+bool prefixHasSessionHolder(const std::string& prefixDir) {
+    return prefixHasSessionHolderIn("/proc", prefixDir);
+}
+
+} // namespace tuxblox

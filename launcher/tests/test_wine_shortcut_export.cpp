@@ -1,0 +1,417 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "wine_shortcut_export.h"
+#include "flag_startup.h"
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+
+namespace fs = std::filesystem;
+
+static std::string readAll(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
+static void writeAll(const fs::path& p, const std::string& s) {
+    fs::create_directories(p.parent_path());
+    std::ofstream f(p, std::ios::binary | std::ios::trunc);
+    f << s;
+}
+
+// Cheap, dependency-free proxy for "would GLib's key-file parser (what GIO
+// uses under DesktopAppInfo::new_from_filename) accept this file": scans for
+// a backslash not followed by one of the spec's five defined value escapes
+// (\s \n \t \r \\). That's precisely the shape of Finding 1's bug -- writing
+// an unescaped path back into Exec= left bare `\u`-style sequences that made
+// GIO refuse to parse the whole file, not just that key.
+static bool looksLikeValidKeyFileValue(const std::string& contents) {
+    for (size_t i = 0; i < contents.size(); ++i) {
+        if (contents[i] != '\\') continue;
+        if (i + 1 >= contents.size()) return false; // trailing lone backslash
+        const char next = contents[i + 1];
+        if (next != 's' && next != 'n' && next != 't' && next != 'r' && next != '\\') return false;
+        ++i; // skip the escaped character
+    }
+    return true;
+}
+
+// A proton_shortcuts entry exactly as winemenubuilder writes it: four literal
+// backslashes per separator, and a trailing empty "" argument.
+static std::string sourceEntry(const std::string& name, const std::string& exeLeaf,
+                               const std::string& icon) {
+    return "[Desktop Entry]\n"
+           "Name=" + name + "\n"
+           "Exec=\"C:\\\\\\\\users\\\\\\\\user\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Roblox\\\\\\\\Versions"
+           "\\\\\\\\version-abc\\\\\\\\" + exeLeaf + "\" \"\"\n"
+           "Type=Application\n"
+           "StartupNotify=true\n"
+           "Icon=" + icon + "\n"
+           "StartupWMClass=" + exeLeaf + "\n";
+}
+
+int main() {
+    using namespace tuxblox;
+
+    // Four literal backslashes collapse to one.
+    assert(unescapeWinemenubuilderPath("C:\\\\\\\\users\\\\\\\\user") == "C:\\users\\user");
+    assert(unescapeWinemenubuilderPath("no backslashes") == "no backslashes");
+
+    assert(exeFromDesktopExecLine("\"C:\\\\\\\\a\\\\\\\\B.exe\" \"\"") == "C:\\a\\B.exe");
+    assert(exeFromDesktopExecLine("no quotes here").empty());
+    assert(exeFromDesktopExecLine("").empty());
+
+    // quotedExecValue() is the un-unescaped counterpart: it must return the
+    // exact same escaped (four-backslash) bytes that were in the source
+    // Exec= line, since that's what gets written back into the new one --
+    // see exportPrefixShortcutsTo()'s use of it.
+    assert(quotedExecValue("\"C:\\\\\\\\a\\\\\\\\B.exe\" \"\"") == "C:\\\\\\\\a\\\\\\\\B.exe");
+    assert(quotedExecValue("no quotes here").empty());
+    assert(quotedExecValue("").empty());
+
+    const fs::path tmp = fs::temp_directory_path() / "tuxblox_shortcut_export_test";
+    fs::remove_all(tmp);
+
+    const fs::path installDir = tmp / "install";
+    const fs::path shortcuts = installDir / "runtime" / "pfx" / "drive_c" / "proton_shortcuts";
+    const fs::path appsDir = tmp / "applications";
+    const fs::path iconsDir = tmp / "icons" / "hicolor";
+    fs::create_directories(appsDir);
+
+    // The macOS backend switch is read once for the process. Turning it on
+    // here lets the export exercise both the Windows and the macOS branches;
+    // the Windows fixtures below have no mac-client directory, so they are
+    // unaffected.
+    writeAll(installDir / "flags.json", "{\"tbxFlagEnableExperimentalMacClient\": true}\n");
+    initLauncherFlags(installDir.string());
+
+    writeAll(shortcuts / "Roblox Studio.desktop",
+             sourceEntry("Roblox Studio", "RobloxStudioBeta.exe", "393D_RobloxStudioBeta.0"));
+    writeAll(shortcuts / "Roblox Player.desktop",
+             sourceEntry("Roblox Player", "RobloxPlayerBeta.exe", "393D_RobloxPlayerBeta.0"));
+    // Not Roblox -- must be skipped, not published to the user's app menu.
+    writeAll(shortcuts / "Notepad.desktop",
+             sourceEntry("Notepad", "notepad.exe", "notepad.0"));
+
+    writeAll(shortcuts / "icons" / "48x48" / "apps" / "393D_RobloxStudioBeta.0.png", "PNG48");
+    writeAll(shortcuts / "icons" / "256x256" / "apps" / "393D_RobloxStudioBeta.0.png", "PNG256");
+
+    exportPrefixShortcutsTo(installDir.string(), "/opt/tuxblox/TuxBloxLauncher",
+                            appsDir.string(), iconsDir.string());
+
+    assert(fs::exists(appsDir / "tuxblox-roblox-studio.desktop"));
+    assert(fs::exists(appsDir / "tuxblox-roblox-player.desktop"));
+    assert(!fs::exists(appsDir / "tuxblox-roblox-notepad.desktop"));
+
+    const std::string studio = readAll(appsDir / "tuxblox-roblox-studio.desktop");
+    assert(studio.find("Name=Roblox Studio\n") != std::string::npos);
+    assert(studio.find("Comment=via TuxBlox\n") != std::string::npos);
+    // Application searches read Keywords but not Comment, so an entry named
+    // "Roblox Studio" is otherwise unfindable by "tuxblox" or "wine".
+    assert(studio.find("Keywords=Wine;TuxBlox;Roblox;Game;\n") != std::string::npos);
+    // Finding 1 regression pin: the Exec= value must be written back in its
+    // still-ESCAPED (winemenubuilder four-backslash) form -- the same bytes
+    // that were in the source entry's own Exec= line -- not the human-
+    // readable single-backslash path. A single backslash here is `\u`, an
+    // invalid key-file escape, and GIO refuses to load the *entire* file
+    // over it (not just this key). See wine_shortcut_export.cpp's comment on
+    // escapedExe for the reasoning; this used to assert exactly the broken
+    // single-backslash bytes, pinning the bug instead of catching it.
+    assert(studio.find(
+               "Exec=\"/opt/tuxblox/TuxBloxLauncher\" --run-exe "
+               "\"C:\\\\\\\\users\\\\\\\\user\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Roblox\\\\\\\\Versions"
+               "\\\\\\\\version-abc\\\\\\\\RobloxStudioBeta.exe\"\n")
+           != std::string::npos);
+    // Cheap stand-in for "GIO's key-file parser accepts this file": every
+    // backslash in a Desktop Entry value must begin one of the five defined
+    // escapes (\s \n \t \r \\); anything else -- like the bare `\u` the
+    // original bug produced -- is what made GIO refuse the whole file. This
+    // is checked without linking GLib/GIO or shelling out to python3, so it
+    // runs everywhere ctest does; the interactive python3+GObject-Introspection
+    // check in the design doc is the authoritative, heavier proof against the
+    // real library.
+    assert(looksLikeValidKeyFileValue(studio));
+    // Icons are renamed to a deterministic, TuxBlox-owned name so uninstall can
+    // remove exactly what we installed without touching another prefix's icons.
+    assert(studio.find("Icon=tuxblox-roblox-studio\n") != std::string::npos);
+    assert(readAll(iconsDir / "48x48" / "apps" / "tuxblox-roblox-studio.png") == "PNG48");
+    assert(readAll(iconsDir / "256x256" / "apps" / "tuxblox-roblox-studio.png") == "PNG256");
+
+    // No icon in the source tree -> fall back to the TuxBlox icon.
+    const std::string player = readAll(appsDir / "tuxblox-roblox-player.desktop");
+    assert(player.find("Icon=tuxblox\n") != std::string::npos);
+
+    // Pruning: a source entry that disappears takes its export with it.
+    fs::remove(shortcuts / "Roblox Player.desktop");
+    exportPrefixShortcutsTo(installDir.string(), "/opt/tuxblox/TuxBloxLauncher",
+                            appsDir.string(), iconsDir.string());
+    assert(!fs::exists(appsDir / "tuxblox-roblox-player.desktop"));
+    assert(fs::exists(appsDir / "tuxblox-roblox-studio.desktop"));
+
+    // A missing prefix is a no-op, not a crash, and must not delete the
+    // launcher's own entry.
+    writeAll(appsDir / "tuxblox-launcher.desktop", "[Desktop Entry]\n");
+    exportPrefixShortcutsTo((tmp / "nonexistent").string(), "/opt/tuxblox/TuxBloxLauncher",
+                            appsDir.string(), iconsDir.string());
+    assert(fs::exists(appsDir / "tuxblox-launcher.desktop"));
+
+    // Correction to the brief: exportPrefixShortcutsTo() must create appsDir
+    // itself rather than assume the caller already did. The real call path
+    // (watch_launch.cpp, after a session ends) has no reason to have created
+    // ~/.local/share/applications first.
+    {
+        const fs::path freshTmp = tmp / "fresh";
+        const fs::path freshInstall = freshTmp / "install";
+        const fs::path freshShortcuts =
+            freshInstall / "runtime" / "pfx" / "drive_c" / "proton_shortcuts";
+        const fs::path freshAppsDir = freshTmp / "does" / "not" / "exist" / "applications";
+        const fs::path freshIconsDir = freshTmp / "icons" / "hicolor";
+
+        writeAll(freshShortcuts / "Roblox Studio.desktop",
+                 sourceEntry("Roblox Studio", "RobloxStudioBeta.exe", "393D_RobloxStudioBeta.0"));
+
+        assert(!fs::exists(freshAppsDir));
+        exportPrefixShortcutsTo(freshInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                freshAppsDir.string(), freshIconsDir.string());
+        assert(fs::exists(freshAppsDir / "tuxblox-roblox-studio.desktop"));
+    }
+
+    // TuxBlox's own downloader installs Roblox without ever creating a Windows
+    // shortcut, so there is nothing to convert. The entry still has to appear,
+    // carrying the window class, or a taskbar cannot recognise the window and
+    // refuses to pin it.
+    {
+        const fs::path noLnkTmp = tmp / "nolnk";
+        const fs::path noLnkInstall = noLnkTmp / "install";
+        const fs::path noLnkApps = noLnkTmp / "applications";
+        const fs::path noLnkIcons = noLnkTmp / "icons" / "hicolor";
+        const fs::path versions = noLnkInstall / "runtime" / "pfx" / "drive_c" / "users" /
+                                  "user" / "AppData" / "Local" / "Roblox" / "Versions";
+
+        // Studio installed, Player not, and no proton_shortcuts directory.
+        writeAll(versions / "version-abc123" / "RobloxStudioBeta.exe", "MZ");
+
+        exportPrefixShortcutsTo(noLnkInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                noLnkApps.string(), noLnkIcons.string());
+
+        assert(fs::exists(noLnkApps / "tuxblox-roblox-studio.desktop"));
+        // Not installed -- must not be advertised.
+        assert(!fs::exists(noLnkApps / "tuxblox-roblox-player.desktop"));
+
+        const std::string entry = readAll(noLnkApps / "tuxblox-roblox-studio.desktop");
+        // The window class is the whole point of the entry.
+        assert(entry.find("StartupWMClass=robloxstudiobeta.exe\n") != std::string::npos);
+        assert(entry.find("Name=Roblox Studio\n") != std::string::npos);
+        // Launches through TuxBlox, so it follows whichever version is
+        // installed rather than pinning the one present right now.
+        assert(entry.find("--launch-studio\n") != std::string::npos);
+        assert(entry.find("version-abc123") == std::string::npos);
+        // No icon was copied for this one, so it falls back.
+        assert(entry.find("Icon=tuxblox\n") != std::string::npos);
+
+        // Once Roblox is gone the entry goes with it.
+        fs::remove_all(versions);
+        exportPrefixShortcutsTo(noLnkInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                noLnkApps.string(), noLnkIcons.string());
+        assert(!fs::exists(noLnkApps / "tuxblox-roblox-studio.desktop"));
+    }
+
+    // A drive whose account folder carries the real account name is still
+    // read. Getting this wrong deletes the user's Roblox menu entries on
+    // every launch, silently, because nothing looks installed any more.
+    {
+        const fs::path renamedInstall = tmp / "renamed-install";
+        const fs::path renamedApps = tmp / "renamed-apps";
+        const fs::path renamedIcons = tmp / "renamed-icons";
+        fs::create_directories(renamedApps);
+        fs::create_directories(renamedIcons);
+
+        const fs::path versions = renamedInstall / "runtime" / "pfx" / "drive_c" / "users" /
+                                  "cherry" / "AppData" / "Local" / "Roblox" / "Versions";
+        writeAll(versions / "version-abc123" / "RobloxStudioBeta.exe", "MZ");
+
+        exportPrefixShortcutsTo(renamedInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                renamedApps.string(), renamedIcons.string());
+
+        assert(fs::exists(renamedApps / "tuxblox-roblox-studio.desktop"));
+        assert(!fs::exists(renamedApps / "tuxblox-roblox-player.desktop"));
+
+        // And it still goes when Roblox really is gone.
+        fs::remove_all(versions);
+        exportPrefixShortcutsTo(renamedInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                renamedApps.string(), renamedIcons.string());
+        assert(!fs::exists(renamedApps / "tuxblox-roblox-studio.desktop"));
+    }
+
+    // The macOS backend keeps the Player outside the Windows version tree, and
+    // its client creates no Windows shortcut to translate. The menu entry still
+    // has to appear, with the artwork the launcher already carries.
+    {
+        const fs::path macTmp = tmp / "mac";
+        const fs::path macInstall = macTmp / "install";
+        const fs::path macApps = macTmp / "applications";
+        const fs::path macIcons = macTmp / "icons" / "hicolor";
+        const fs::path macRoot = macInstall / "mac-client" / "player";
+
+        writeAll(macRoot / "current", "version-abc123\n0.748.0.7481526\n");
+        const fs::path app = macRoot / "version-abc123" / "RobloxPlayer.app";
+        writeAll(app / "Contents" / "MacOS" / "RobloxPlayer", "MZ");
+
+        auto bigEndian = [](uint32_t value) {
+            std::string out;
+            out.push_back(static_cast<char>((value >> 24) & 0xff));
+            out.push_back(static_cast<char>((value >> 16) & 0xff));
+            out.push_back(static_cast<char>((value >> 8) & 0xff));
+            out.push_back(static_cast<char>(value & 0xff));
+            return out;
+        };
+        const std::string png = std::string("\x89PNG\r\n\x1a\n", 8) + "ICON";
+        const std::string icnsEntry = "ic13" + bigEndian(static_cast<uint32_t>(8 + png.size())) + png;
+        const std::string icns =
+            "icns" + bigEndian(static_cast<uint32_t>(8 + icnsEntry.size())) + icnsEntry;
+        writeAll(app / "Contents" / "Resources" / "AppIcon.icns", icns);
+
+        // A Windows Player left a shortcut behind. It must not replace the
+        // entry that starts the macOS client.
+        const fs::path macShortcuts =
+            macInstall / "runtime" / "pfx" / "drive_c" / "proton_shortcuts";
+        writeAll(macShortcuts / "Roblox Player.desktop",
+                 sourceEntry("Roblox Player", "RobloxPlayerBeta.exe", "393D_RobloxPlayerBeta.0"));
+
+        exportPrefixShortcutsTo(macInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                macApps.string(), macIcons.string());
+
+        assert(fs::exists(macApps / "tuxblox-roblox-player.desktop"));
+        const std::string entry = readAll(macApps / "tuxblox-roblox-player.desktop");
+        assert(entry.find("Name=Roblox Player\n") != std::string::npos);
+        assert(entry.find("Comment=via TuxBlox\n") != std::string::npos);
+        assert(entry.find("Exec=\"/opt/tuxblox/TuxBloxLauncher\" --launch-player\n") !=
+               std::string::npos);
+        assert(entry.find("--run-exe") == std::string::npos);
+        assert(entry.find("Icon=tuxblox-roblox-player\n") != std::string::npos);
+        // The SDL app id the mac client is started with, not a Windows exe name.
+        assert(entry.find("StartupWMClass=net.tuxblox.TuxBlox.Player\n") != std::string::npos);
+        // The PNG is taken out of the client's own .icns.
+        assert(readAll(macIcons / "256x256" / "apps" / "tuxblox-roblox-player.png") == png);
+        assert(!fs::exists(macIcons / "scalable" / "apps" / "tuxblox-roblox-player.svg"));
+
+        // Removing the client and its leftover Windows shortcut takes the
+        // entry away again.
+        fs::remove_all(macShortcuts);
+        fs::remove_all(macRoot);
+        exportPrefixShortcutsTo(macInstall.string(), "/opt/tuxblox/TuxBloxLauncher",
+                                macApps.string(), macIcons.string());
+        assert(!fs::exists(macApps / "tuxblox-roblox-player.desktop"));
+    }
+
+    // The icon a client installs on the desktop. It carries a mark of its own, because the file is
+    // named the way a Roblox shortcut would be and nothing else could tell it apart from one
+    // somebody wrote themselves.
+    {
+        const std::string entry = tuxblox::clientDesktopEntry(
+            tuxblox::LaunchTarget::Player, "/home/a/.tuxblox/TuxBloxLauncher", true);
+        assert(entry.find("Name=Roblox Player\n") != std::string::npos);
+        // The flag, not a recorded path, so it opens whichever version is installed at the time.
+        assert(entry.find("Exec=\"/home/a/.tuxblox/TuxBloxLauncher\" --launch-player\n") !=
+               std::string::npos);
+        assert(entry.find("Icon=tuxblox-roblox-player\n") != std::string::npos);
+        assert(entry.find("StartupWMClass=robloxplayerbeta.exe\n") != std::string::npos);
+        // The menu entry is what feeds search; this one would only duplicate it there.
+        assert(entry.find("NoDisplay=true\n") != std::string::npos);
+        assert(entry.find("X-TuxBlox-Generated=true\n") != std::string::npos);
+
+        const std::string studio = tuxblox::clientDesktopEntry(
+            tuxblox::LaunchTarget::Studio, "/home/a/.tuxblox/TuxBloxLauncher", false);
+        assert(studio.find("Name=Roblox Studio\n") != std::string::npos);
+        assert(studio.find("--launch-studio\n") != std::string::npos);
+        // Roblox's own icon is only there once a session has exported it.
+        assert(studio.find("Icon=tuxblox\n") != std::string::npos);
+    }
+
+    // Only a file TuxBlox wrote is ever removed, however it is named.
+    {
+        const fs::path desktop = fs::temp_directory_path() / "tuxblox_test_desktop_icons";
+        fs::remove_all(desktop);
+        fs::create_directories(desktop);
+
+        const fs::path ours = desktop / "Roblox Player.desktop";
+        {
+            std::ofstream out(ours);
+            out << tuxblox::clientDesktopEntry(tuxblox::LaunchTarget::Player,
+                                               "/home/a/.tuxblox/TuxBloxLauncher", true);
+        }
+        const fs::path theirs = desktop / "My Own Shortcut.desktop";
+        { std::ofstream out(theirs); out << "[Desktop Entry]\nType=Application\nName=Mine\n"; }
+        const fs::path lookalike = desktop / "Roblox Studio.desktop";
+        { std::ofstream out(lookalike); out << "[Desktop Entry]\nName=Roblox Studio\n"; }
+
+        assert(tuxblox::removeGeneratedDesktopShortcuts(desktop.string()) == 1);
+        assert(!fs::exists(ours));
+        assert(fs::exists(theirs));
+        // Named exactly as ours would be, but we did not write it, so it stays.
+        assert(fs::exists(lookalike));
+
+        assert(tuxblox::removeGeneratedDesktopShortcuts((desktop / "nothing").string()) == 0);
+        fs::remove_all(desktop);
+    }
+
+    // A Windows shortcut Roblox leaves on the desktop becomes the entry that replaces it, and
+    // anything else there is left exactly as it was.
+    {
+        const fs::path lnkInstall = tmp / "lnk-install";
+        const fs::path desktop =
+            lnkInstall / "runtime" / "pfx" / "drive_c" / "users" / "user" / "Desktop";
+
+        writeAll(desktop / "Roblox Player.lnk",
+                 std::string("\0\0L\0\0", 5) +
+                     "C:\\users\\user\\AppData\\Local\\Roblox\\Versions\\version-abc\\RobloxPlayerBeta.exe");
+        writeAll(desktop / "Solitaire.lnk", "C:\\windows\\system32\\solitaire.exe");
+        writeAll(desktop / "Notes.txt", "mine");
+
+        assert(translateDesktopShortcuts(lnkInstall.string(), "/opt/tuxblox/TuxBloxLauncher") == 1);
+        assert(!fs::exists(desktop / "Roblox Player.lnk"));
+
+        const std::string entry = readAll(desktop / "Roblox Player.desktop");
+        assert(entry.find("--launch-player\n") != std::string::npos);
+        assert(entry.find("X-TuxBlox-Generated=true") != std::string::npos);
+
+        // Not one of ours to translate, so neither of these is touched.
+        assert(fs::exists(desktop / "Solitaire.lnk"));
+        assert(fs::exists(desktop / "Notes.txt"));
+
+        // Nothing left to do, and nothing to report.
+        assert(translateDesktopShortcuts(lnkInstall.string(), "/opt/tuxblox/TuxBloxLauncher") == 0);
+
+        // The compatibility layer takes a shortcut off the desktop as soon as it reads one, so the
+        // entry replacing it is written from where it was moved to.
+        writeAll(lnkInstall / "runtime" / "pfx" / "drive_c" / "proton_shortcuts" / "Roblox Studio.lnk",
+                 std::string("\0\0L\0\0", 5) +
+                     "C:\\users\\user\\AppData\\Local\\Roblox\\Versions\\version-def\\RobloxStudioBeta.exe");
+        assert(translateDesktopShortcuts(lnkInstall.string(), "/opt/tuxblox/TuxBloxLauncher") == 1);
+        assert(readAll(desktop / "Roblox Studio.desktop").find("--launch-studio\n") != std::string::npos);
+        assert(!fs::exists(lnkInstall / "runtime" / "pfx" / "drive_c" / "proton_shortcuts" / "Roblox Studio.lnk"));
+        // A drive with no desktop folder at all.
+        assert(translateDesktopShortcuts((tmp / "no-drive").string(), "/opt/tuxblox/TuxBloxLauncher") == 0);
+    }
+
+    fs::remove_all(tmp);
+    std::printf("wine_shortcut_export: all tests passed\n");
+    return 0;
+}

@@ -1,0 +1,364 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#pragma once
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include "lnk_resolver.h"
+#include "prefix_session.h"
+#include "session_list.h"
+#include "settings.h"
+#include "updater.h"
+#include "versions_manifest.h"
+
+namespace tuxblox {
+
+enum class Tab { Start, About, Settings, Versions, FastFlags, Sessions };
+
+// What the window does once a launch is on its way.
+enum class LaunchFollowUp { CloseWindow, ShowSessions };
+
+// A launch started from the window's own buttons takes you to that session's log, unless Minimise to background is on, in which case the window is going away and there is nothing to take you to. A launch from a link or a shortcut opens no window in the first place.
+LaunchFollowUp launchFollowUp(bool minimizeToBackground, bool startedFromTheWindow);
+
+enum class VersionSelectMode { Latest, Previous, Next, ManualHash };
+
+// The mark an install leaves on the version, saying how it was picked. The update check
+// reads it back to decide what it may replace.
+std::string sourceForMode(VersionSelectMode mode);
+
+enum class VersionInstallPhase { Idle, ResolvingVersion, DownloadingManifest, DownloadingPackages, Extracting, Done, Error };
+
+struct VersionInstallProgress {
+    VersionInstallPhase phase = VersionInstallPhase::Idle;
+    double fraction = 0.0;
+    std::string errorMessage;
+    LaunchTarget target = LaunchTarget::Player; // which app this progress belongs to
+};
+
+struct UninstallProgress {
+    // True from the moment requestUninstall() is called until either the
+    // uninstaller handoff fires (App::needsUninstallHandoff()) or it fails
+    // (errorMessage gets set) -- drives the Settings tab's button showing a
+    // disabled "Uninstalling..." state instead of the two-click confirm.
+    bool inProgress = false;
+    std::string errorMessage; // non-empty iff the last attempt failed
+};
+
+// Same shape as UninstallProgress, for the Wipe Prefix button.
+struct WipePrefixProgress {
+    bool inProgress = false;
+    std::string errorMessage;
+};
+
+// Same shape again, for the Terminate button. `signalled` is how many processes
+// the last run closed, or -1 before one has finished.
+struct TerminateProgress {
+    bool inProgress = false;
+    int signalled = -1;
+};
+
+struct AppSnapshot {
+    UpdateProgress update;
+    UninstallProgress uninstall;
+    WipePrefixProgress wipePrefix;
+    TerminateProgress terminate;
+    Tab activeTab = Tab::Start;
+    Settings settings;
+    // Set once at startup (App's constructor) if running inside a
+    // Distrobox container without an apparent GPU device node -- empty if
+    // there's nothing to warn about. Never cleared back to empty by the
+    // UI -- only whether it has already been *shown* is tracked, in Ui's
+    // own state (see ui.h).
+    std::string containerWarning;
+    // Set by updateCheckThreadMain() when a newer version exists AND
+    // Settings::autoUpdate is false -- the Qt UI's UpdatePopup shows
+    // whenever this is non-empty. std::nullopt otherwise, including
+    // whenever autoUpdate is true (that path re-execs into the installer
+    // directly instead -- see updateCheckThreadMain()'s comment). Cleared
+    // by dismissUpdateNotification().
+    std::optional<std::string> updateAvailableVersion;
+    // This install is ahead of its channel, so it was built here rather than downloaded.
+    bool internalBuild = false;
+    // The components that move, filled in the same critical section as the version above, so a
+    // reader that has seen one has seen the other. Empty until an update is offered.
+    std::vector<ComponentChange> updateChanges;
+    // A Flatpak whose own launcher is behind the release. Only flatpak can replace that one, since
+    // it lives in a read-only /app, so the offer has to say so instead of offering to do it.
+    bool flatpakBundleBehindRelease = false;
+    // A Flatpak with no usable compatibility layer: it fetches that itself, and until it has one
+    // nothing can launch. Set when the fetch fails, so the Home tab and the tour can offer a retry
+    // rather than leaving a launcher that cannot say why it will not start anything.
+    bool runtimeMissing = false;
+
+    VersionsManifest versions;
+    VersionInstallProgress versionInstall;
+
+    // What is running in the virtual drive, refreshed about once a second by
+    // App's own thread. The Home cards read it to decide whether their button
+    // launches or stops.
+    PrefixSessions sessions;
+    // What the Sessions page lists: every session alive in the drive, plus the ones this run watched end. Richer than the census above, which only counts.
+    std::vector<Session> sessionList;
+    // True from a Stop click until that app's sessions are actually gone. The
+    // census is up to a second old, so without this the button would go on
+    // offering Stop for a moment after being clicked.
+    bool stoppingPlayer = false;
+    bool stoppingStudio = false;
+    // A launch started from the window that has not produced a session yet. Most of an install looks like this, since Roblox has to be fetched before anything can run.
+    bool launchPending = false;
+    // Which card started that pending launch. Only that card says "Starting".
+    LaunchTarget launchTarget = LaunchTarget::Player;
+    // Whether the macOS client is already installed, for the Player card and
+    // the welcome tour. The full integrity check still runs when it is used.
+    bool macClientInstalled = false;
+    // The installed macOS build, so Versions can name it. Empty when there is none.
+    std::string macClientUpload;
+    std::string macClientVersion;
+};
+
+class App {
+public:
+    App(std::string installDir, std::string launcherExePath);
+    ~App();
+
+    void startUpdateCheck();
+
+    // Blocks until the update check has reached a verdict, or `timeout` passes;
+    // true iff it reached one. Only the pre-window wait in main() uses this,
+    // and only when Auto-Update is on: an update that is about to be applied
+    // should not flash a window up first, but one that is merely being offered
+    // must not hold the window back. Bounded because the check makes two
+    // requests of 30s each, so a dead network would otherwise keep the
+    // launcher from appearing at all for a minute.
+    bool waitForUpdateCheck(std::chrono::milliseconds timeout);
+
+    // True once the update check has determined a verified installer
+    // binary is ready to be exec'd -- the caller should stop the render
+    // loop, exec() installerHandoffPath(), and never return.
+    bool needsInstallerHandoff() const;
+    std::string installerHandoffPath() const;
+
+    // The file the installer is told to read the release from, written just before the handoff.
+    // Empty when there is no release to hand over, which is the uninstall path.
+    std::string releaseHandoffPath() const;
+
+    void setActiveTab(Tab tab);
+    // Asks for one session to be shown: the Sessions tab opens and that session's log is the one in it.
+    void showSession(int pid);
+    // The session asked for since the last call, or 0. Taking it is what marks it answered, so a request cannot keep overriding what the reader clicks on afterwards.
+    int takeSessionToShow();
+
+    // Spawns a fully detached "--watch-launch" process (see watch_launch.h)
+    // that starts `target` via Proton and, from that point on, is the only
+    // thing tracking it: it waits for the process, shows a crash popup if
+    // warranted, and otherwise produces no UI at all. This process has no
+    // further involvement -- no tray icon, no hidden window kept around.
+    //
+    // Whether the window then closes is Settings::minimizeToBackground, on by
+    // default: on, it closes (shouldQuit() below drives that); off, it stays
+    // open and can launch again, since the watcher owns the launch either way.
+    // Tried backgrounding
+    // to a system tray icon first; abandoned after extensive testing showed
+    // xembedsniproxy (KDE's XEmbed-to-StatusNotifierItem proxy) takes over
+    // the icon window once docked and rejects any further property/attribute
+    // change against it under this desktop's specific KWin/XWayland setup,
+    // regardless of which standard mechanism was tried (override_redirect,
+    // EWMH dock/skip-taskbar hints, before or after the dock handshake).
+    void requestLaunch(LaunchTarget target);
+    // True once requestLaunch() has successfully spawned the detached
+    // watcher process -- Ui's render loop checks this to end immediately.
+    bool shouldQuit() const;
+
+    // Fetches the latest release's manifest for the current channel,
+    // ensures a verified TuxBloxInstaller binary is staged at
+    // <installDir>/TuxBloxInstaller (same fetch-verify dance as an update
+    // handoff -- see updater.h's ensureInstallerBinary), and once ready
+    // sets needsUninstallHandoff(). Runs in the background; snapshot().uninstall
+    // reflects progress/errors for the UI. A no-op while already in
+    // progress (repeat clicks on a disabled button shouldn't restart it).
+    void requestUninstall();
+    // True once requestUninstall() has a verified installer ready to be
+    // exec'd with --uninstall -- the caller should stop the render loop,
+    // exec() installerHandoffPath() with that flag, and never return.
+    bool needsUninstallHandoff() const;
+
+    // Deletes the contents of <installDir>/runtime (the Wine prefix) in the
+    // background, leaving the runtime/ directory itself in place empty --
+    // the next launch recreates whatever it needs inside it. Purely local
+    // (no network, unlike requestUninstall()), but still backgrounded since
+    // a heavily-used prefix can be a few GB and this shouldn't freeze the
+    // UI thread. snapshot().wipePrefix reflects progress/errors. A no-op
+    // while already in progress.
+    void requestWipePrefix();
+
+    // Closes every running session of `target` -- the Home cards' Stop buttons.
+    // Runs on its own thread, since it waits for Roblox to actually exit, and a
+    // second request while one is still running is ignored.
+    void requestStopSessions(LaunchTarget target);
+
+    // Closes one session, leaving the others of the same app alone. Ignored if that session is not in the current list.
+    void requestStopSession(int pid);
+
+    // Stops everything running inside the prefix -- Roblox, wineserver and
+    // the Wine services -- without touching the launcher itself. Runs on its own
+    // thread, because closing the sessions properly first can take several
+    // seconds and this is called from the interface; snapshot().terminate
+    // reports progress and how many processes were closed.
+    void requestTerminateProcesses();
+
+    // Opens the virtual drive's registry editor, which is a tool for looking at the drive rather
+    // than a session: nothing follows it, and it is not listed among the sessions. False when the
+    // drive has not been built yet, which is an install nothing has been launched from.
+    bool openRegistryEditor();
+
+    // Where the Studio MCP gateway is, for pasting into an MCP client's configuration. Empty when
+    // it is not installed, so the caller can say so rather than hand out a path to nothing: the
+    // point of showing it at all is that nobody should be guessing.
+    std::string mcpGatewayPath() const;
+
+    AppSnapshot snapshot() const;
+
+    // Persists `settings` (settings.json), re-applies Global Environment
+    // Variables to the launcher's own process, and updates the snapshot.
+    void updateSettings(Settings settings);
+
+    // Called when the user clicks the UpdatePopup -- fetches the installer
+    // for the release updateCheckThreadMain() offered and hands off to it,
+    // exactly as if Settings::autoUpdate had been true from the start. The
+    // fetch runs on its own thread, since this is called from the UI thread.
+    // A no-op if there's no update currently offered
+    // (snapshot_.updateAvailableVersion is empty) -- guards a stale click
+    // racing a dismiss -- or if a click is already being acted on.
+    void requestUpdateNow();
+
+    // Fetches the compatibility layer again after a failed attempt. Only a Flatpak needs this: every
+    // other install hands the whole job to the installer. Ignores a click while one is already
+    // running, and does nothing when the release that would be fetched is not known yet.
+    void requestRuntimeInstall();
+
+    // Hides the current UpdatePopup notification for this run. Only
+    // clears the snapshot field -- doesn't persist anywhere and doesn't
+    // suppress a future update check, since there's only ever one per
+    // launch (started once from main() via startUpdateCheck()).
+    void dismissUpdateNotification();
+
+    // Resolves (per `mode`/`channel`/`manualHash`), downloads, verifies, and
+    // extracts a Roblox version in the background. snapshot().versionInstall
+    // reflects progress/errors. A no-op while an install for either app type
+    // is already in progress (mirrors requestUninstall()'s repeat-click guard).
+    void requestInstallVersion(LaunchTarget target, VersionSelectMode mode, const std::string& channel,
+                                const std::string& manualHash = "");
+    // Switches which installed version is "active" for `target` -- a no-op
+    // if `hash` isn't in that app's installed list.
+    void requestSetActiveVersion(LaunchTarget target, const std::string& hash);
+    // Deletes an installed, non-active version's directory and its
+    // versions.json entry. A no-op if `hash` is the currently active
+    // version (must pin a different one first) or isn't installed.
+    void requestDeleteVersion(LaunchTarget target, const std::string& hash);
+    // Removes the installed macOS client (the verified bundle, not the
+    // Rosemary binary). The next launch downloads and verifies it again.
+    void requestDeleteMacClient();
+
+private:
+    void updateCheckThreadMain();
+    void updateApplyThreadMain();
+    void runtimeInstallThreadMain();
+    // Fetches and verifies the installer for `manifest` and records it as the handoff target. False means it could not be prepared, and the reason is already in the snapshot.
+    bool prepareInstallerHandoff(const ReleaseFile& release, const std::string& releaseJson);
+    void uninstallThreadMain();
+    void wipePrefixThreadMain();
+    void sessionPollThreadMain();
+    void refreshVersionsIfChanged();
+    void stopSessionsThreadMain(LaunchTarget target);
+    void stopOneSessionThreadMain(int pid, LaunchTarget target);
+    // Fills in which log files belong to which session, and why an ended one ended.
+    void resolveSessionLogs(std::vector<Session>& sessions);
+    void terminateThreadMain();
+    void versionInstallThreadMain(LaunchTarget target, VersionSelectMode mode, std::string channel,
+                                   std::string manualHash);
+    void applyEnvVars(const Settings& settings);
+
+    std::string installDir_;
+    // "x.y.z-channel" -- what this build answers --version with, and what
+    // every other binary in the install is checked against.
+    std::string launcherExePath_;
+
+    mutable std::mutex mutex_;
+    AppSnapshot snapshot_;
+    std::atomic<bool> needsInstallerHandoff_{false};
+    std::atomic<bool> needsUninstallHandoff_{false};
+    std::atomic<bool> shouldQuit_{false};
+    // Written once by whichever of the update-check, update-apply and
+    // uninstall threads gets there first, strictly before that same thread
+    // sets its handoff flag -- same happens-before idiom as
+    // needsInstallerHandoff_ itself. Their write windows don't overlap in
+    // practice (uninstall and applying an update are explicit user actions,
+    // one of which ends this process; update-check runs once at startup), so
+    // a single shared field is fine without extra synchronization.
+    std::string installerHandoffPath_;
+    std::string releaseHandoffPath_;
+    // The release updateCheckThreadMain() offered without applying, kept so requestUpdateNow() can fetch its installer if the user does ask for it.
+    // The release an offered update would apply, and its published bytes -- held rather than
+    // re-fetched, because the pointer can move between the check and the user saying yes.
+    ReleaseFile pendingRelease_;
+    std::string pendingReleaseJson_;
+    std::atomic<bool> updateApplyStarted_{false};
+    std::atomic<bool> runtimeInstallStarted_{false};
+    std::atomic<bool> updateCancel_{false};
+    std::atomic<bool> uninstallCancel_{false};
+    std::atomic<bool> versionInstallCancel_{false};
+    std::atomic<bool> sessionPollStop_{false};
+    // Set when a launch from the window should land on its session once one exists, cleared when it does or when waiting any longer stops being reasonable.
+    std::atomic<bool> stopOneBusy_{false};
+    std::atomic<bool> showSessionWhenItStarts_{false};
+    // The detached --watch-launch process for the pending launch, or -1 when
+    // none was recorded. Used to clear "Starting" when it exits without ever
+    // producing a session (a failed install, a missing runtime).
+    std::atomic<int> launchWatcherPid_{-1};
+    int sessionToShow_ = 0;
+    std::atomic<long long> launchRequestedAt_{0};
+    // Which app the pending launch was for, so an unrelated session starting in the same pass is not mistaken for it.
+    std::atomic<int> launchRequestedTarget_{0};
+    std::atomic<bool> stopPlayerBusy_{false};
+    std::atomic<bool> stopStudioBusy_{false};
+    std::atomic<bool> terminateBusy_{false};
+
+    std::thread sessionPollThread_;
+    std::thread stopOneThread_;
+    // Sessions this launcher asked to stop, so an exit it caused is not reported as a crash. Only ever added to once a stop has actually been carried out, so a stop that could not be carried out does not claim one that was.
+    std::vector<int> stoppedByUs_;
+    std::thread stopPlayerThread_;
+    std::thread stopStudioThread_;
+    std::thread terminateThread_;
+    std::thread updateThread_;
+    std::thread updateApplyThread_;
+    std::thread runtimeInstallThread_;
+    std::thread uninstallThread_;
+    std::thread versionInstallThread_;
+    // No cancel flag: unlike the two threads above (both network-bound,
+    // hence cancellable so shutdown isn't held hostage by a slow download),
+    // this is a local fs::remove_all with no cancellation point of its own
+    // -- the destructor just joins it and accepts the (typically brief)
+    // wait.
+    std::thread wipePrefixThread_;
+};
+
+} // namespace tuxblox
