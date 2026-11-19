@@ -416,6 +416,11 @@ buildFreetype() {
     mesonBuild freetype -Dharfbuzz="$$harfbuzz" -Dbrotli=disabled -Dpng=enabled -Dzlib=system -Dbzip2=disabled
 }
 
+buildFontconfig() {
+    extractSource "fontconfig-$${FONTCONFIG_VERSION}.tar.xz" /build/fontconfig
+    mesonBuild fontconfig -Ddoc=disabled -Dtests=disabled -Dtools=disabled -Dnls=disabled -Dcache-build=disabled
+}
+
 buildCairo() {
     extractSource "cairo-$${CAIRO_VERSION}.tar.xz" /build/cairo
     mesonBuild cairo -Dtests=disabled
@@ -515,6 +520,7 @@ runStep fribidi "$$FRIBIDI_VERSION" buildFribidi
 runStep freetype-pass1 "$$FREETYPE_VERSION" buildFreetype
 runStep harfbuzz "$$HARFBUZZ_VERSION" buildHarfbuzz
 runStep freetype-pass2 "$$FREETYPE_VERSION" buildFreetype
+runStep fontconfig "$$FONTCONFIG_VERSION" buildFontconfig
 runStep cairo "$$CAIRO_VERSION" buildCairo
 runStep pango "$$PANGO_VERSION" buildPango
 runStep gdk-pixbuf "$$GDK_PIXBUF_VERSION" buildGdkPixbuf
