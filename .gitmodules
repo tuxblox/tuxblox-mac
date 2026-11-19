@@ -1,0 +1,21 @@
+[submodule "shared/ui/libadwaita"]
+	path = shared/ui/libadwaita
+	url = https://github.com/cherrypath0/libadwaita-compat.git
+[submodule "shared/crypto/openssl"]
+	path = shared/crypto/openssl
+	url = https://github.com/openssl/openssl.git
+[submodule "shared/network/libcurl"]
+	path = shared/network/libcurl
+	url = https://github.com/curl/curl.git
+[submodule "shared/network/nghttp2"]
+	path = shared/network/nghttp2
+	url = https://github.com/nghttp2/nghttp2.git
+[submodule "shared/fs/libarchive"]
+	path = shared/fs/libarchive
+	url = https://github.com/libarchive/libarchive.git
+[submodule "shared/fs/zstd"]
+	path = shared/fs/zstd
+	url = https://github.com/facebook/zstd.git
+[submodule "shared/fs/zlib"]
+	path = shared/fs/zlib
+	url = https://github.com/madler/zlib.git
