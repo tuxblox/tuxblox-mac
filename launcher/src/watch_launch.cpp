@@ -56,19 +56,6 @@ int runWatchAndLaunch(const std::string& installDir, LaunchTarget target, const 
     Settings settings = loadSettings(installDir);
     i18n::initializeFromSetting(settings.language);
 
-    const bool macPlayer = target == LaunchTarget::Player && launcherFlags().macClient;
-    if (!macPlayer && !compatLayerAvailable(installDir)) {
-        showErrorMessageBox(i18n::tr("TuxBlox Error"),
-            i18n::tr("This launcher was installed without the TuxBlox compatibility layer, so the Windows Player and Roblox Studio cannot start.\n\nInstall TuxBlox first, then run this launcher from its directory. The macOS Player does not need the compatibility layer."));
-        return 1;
-    }
-
-    // Runs before the active version is resolved below, so a freshly
-    // installed version is the one that launches and gets its FastFlags.
-    // The Windows deploy has nothing to do with the macOS client: that
-    // backend gets its build from ensureCurrent() on the launch path instead.
-    if (!macPlayer)
-        runRobloxUpdateCheck(installDir, target, settings);
     // Straight after the install rather than only once the session ends, so a
     // first-ever install gets its menu entry right away.
     exportPrefixShortcuts(installDir, selfExePath());
@@ -91,10 +78,8 @@ int runWatchAndLaunch(const std::string& installDir, LaunchTarget target, const 
     }
 
     const bool player = target == LaunchTarget::Player;
-    // This is also the wait for the session to end, so it runs whether or not either feature is on.
-    // The macOS client writes into the captured Rosemary output, not into the
-    // Windows Roblox log folder findSessionLog() looks in.
-    const std::string presenceLog = macPlayer ? outcome.logPath : "";
+    // The client writes into the captured Rosemary output, not a Roblox log folder.
+    const std::string presenceLog = outcome.logPath;
     runPresenceLoop(installDir, target, settings, launchStart,
                     [&] { return launcher.pollIsRunning(target); },
                     makeServerRegionWatcher(serverRegionNotifyEnabled(settings.serverRegionNotify),
@@ -179,7 +164,7 @@ int runWatchAndLaunch(const std::string& installDir, LaunchTarget target, const 
         uploadCrashReport(report);
     };
 
-    // tbxFlagDisableCrashTelemetry takes the whole feature away, the Report button included:
+    // FFlagDisableCrashTelemetry takes the whole feature away, the Report button included:
     // a switch that stopped the automatic send but left a button that did it anyway would not
     // be a way to stop reports arriving.
     if (!launcherFlags().crashTelemetry) {

@@ -36,7 +36,7 @@ const char *const Themes[] = {"system", "dark", "grey", "light", "christmas", nu
 const char *const ThemeLabels[] = {"System theme", "Dark", "Grey", "Light", "Christmas", nullptr};
 
 guint themeCount() {
-    return christmasThemeAvailable() && launcherFlags().christmasTheme ? 5 : 4;
+    return seasonalThemeAvailable() && launcherFlags().seasonalTheme ? 5 : 4;
 }
 
 // "system" plus one entry per catalogue this build carries, so a new language is a .po file and no C++.
@@ -47,7 +47,7 @@ std::vector<std::string> languageTags() {
 }
 
 // One label per kGraphicsChoices entry, in the same order
-const char *const GraphicsLabels[] = {"Automatic", "DirectX 11", "Vulkan", "OpenGL", nullptr};
+const char *const GraphicsLabels[] = {"Automatic", "Metal", "Vulkan", "OpenGL", nullptr};
 static_assert(G_N_ELEMENTS(GraphicsLabels) == G_N_ELEMENTS(kGraphicsChoices) + 1,
               "every renderer the setting stores needs a label, and the two lists are read by index");
 
@@ -213,7 +213,7 @@ void SettingsPage::buildEnvironment() {
 
     GtkWidget *pGraphics = adw_combo_row_new();
     adw_preferences_row_set_title(ADW_PREFERENCES_ROW(pGraphics), i18n::tr("Graphics API"));
-    const char *const graphicsLabels[] = {i18n::tr("Automatic"), "DirectX 11", "Vulkan", "OpenGL", nullptr};
+    const char *const graphicsLabels[] = {i18n::tr("Automatic"), "Metal", "Vulkan", "OpenGL", nullptr};
     static_assert(G_N_ELEMENTS(graphicsLabels) == G_N_ELEMENTS(kGraphicsChoices) + 1,
                   "every renderer the setting stores needs a label, and the two lists are read by index");
     GtkStringList *pGraphicsChoices = gtk_string_list_new(graphicsLabels);

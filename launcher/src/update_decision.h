@@ -77,7 +77,7 @@ struct UpdateDecision {
 // choosing canary asked for. Empty for stable, which has nothing above it, so a stable install
 // makes no extra request at all.
 //
-// This is what tbxFlagEnableChannelToUpperChannelUpgradeOnBuildPromotion switches on; with it
+// This is what SFFlagEnableChannelPromotion switches on; with it
 // off the list is empty for every channel and an install follows only its own.
 std::vector<std::string> channelsAbove(const std::string& channel);
 

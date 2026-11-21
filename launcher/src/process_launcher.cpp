@@ -15,6 +15,7 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #include "flag_startup.h"
+#include "FlagManager.h"
 #include "process_launcher.h"
 #include "i18n.h"
 #include "root_guard.h"
@@ -357,14 +358,30 @@ bool launchRegistryEditor(const std::string& installDir) {
     return true;
 }
 
-// The experimental macOS Player backend. The client is downloaded, verified
-// and installed by macclient::ensureCurrent() before anything is started; a
-// refusal there is a hard failure, never a reason to fall back to an
-// unverified bundle. The Windows path below is untouched.
-static LaunchOutcome launchMacPlayer(const std::string& installDir, TrackedProcess& p,
-                                     const std::string& uri,
+// Rosemary's own menu placements; anything else, "default" included, leaves
+// it to pick by the window decorations.
+static std::string menuBar(const std::string& asked) {
+    if (asked == "intitle") return "titlebar";
+    if (asked == "belowtitle") return "strip";
+    if (asked == "hidden") return "none";
+    return std::string();
+}
+
+// Rosemary's own mode names; anything else leaves it at its default.
+static std::string presentationMode(const std::string& asked) {
+    if (asked == "immediate") return "immediate";
+    if (asked == "mailbox") return "mailbox";
+    if (asked == "vsync") return "fifo";
+    if (asked == "avsync") return "fifo_relaxed";
+    return std::string();
+}
+
+// The client is verified and installed before anything starts; a refusal
+// there is never a reason to fall back to an unverified bundle.
+static LaunchOutcome launchMacClient(LaunchTarget target, const std::string& installDir,
+                                     TrackedProcess& p, const std::string& uri,
                                      const std::vector<std::string>& extraEnv) {
-    const macclient::EnsureResult prepared = macclient::ensureCurrent(installDir, "");
+    const macclient::EnsureResult prepared = macclient::ensureCurrent(installDir, "", {}, target);
     if (!prepared.ok)
         return {false, std::string(i18n::tr("could not prepare the Roblox client")) + ": " +
                            prepared.error,
@@ -378,32 +395,46 @@ static LaunchOutcome launchMacPlayer(const std::string& installDir, TrackedProce
     // The graphics choice writes Windows renderer flags (D3D11/Vulkan/OpenGL);
     // the macOS client renders through Metal and ignores them. Only the
     // flags the user actually entered are carried over.
-    const std::string flags = renderClientAppSettings(settings.fastFlags.player);
+    const std::string flags = renderClientAppSettings(
+        target == LaunchTarget::Studio ? settings.fastFlags.studio : settings.fastFlags.player);
     const std::string flagError = macclient::writeAppSettings(prepared.build, flags);
     if (!flagError.empty())
         return {false, std::string(i18n::tr("could not write the Roblox settings")) + ": " +
                            flagError,
                 "", false};
 
-    std::vector<std::string> env = launchEnvVars(installDir, LaunchTarget::Player);
+    std::vector<std::string> env = launchEnvVars(installDir, target);
     for (const std::string& kv : flagEnvVars(installDir)) env.push_back(kv);
     env.insert(env.end(), extraEnv.begin(), extraEnv.end());
     env.push_back(std::string("ROSEMARY_PREFIX=") +
-                  (fs::path(installDir) / "mac-client" / "prefix").string());
+                  (fs::path(installDir) / "runtime" / "prefix").string());
     env.push_back("ROSEMARY_PREFIX_SETUP=download");
     // The Player must see an Intel Mac so it downloads the x86-64 build the
     // native backend runs directly.
     env.push_back("ROSEMARY_PROC_TRANSLATED=0");
-    env.push_back("SDL_APP_ID=net.tuxblox.TuxBlox.Player");
+    env.push_back(std::string("ROSEMARY_DECORATIONS=") +
+                  (flagBool("FFlagEnableMacTitleBar") ? "client" : "server"));
+    env.push_back(std::string("ROSEMARY_PLAIN_CTRL_CLICK=") +
+                  (flagBool("FFlagPlainCtrlClick") ? "1" : "0"));
+    if (const int64_t hz = flagInt("FIntReportedRefreshRate"); hz > 0)
+        env.push_back("ROSEMARY_SCREEN_REFRESH_RATE=" + std::to_string(hz));
+    const std::string mode = presentationMode(flagString("FStringMetalPresentationMode"));
+    if (!mode.empty()) env.push_back("ROSEMARY_METAL_PRESENTATION_MODE=" + mode);
+    const std::string debugChannels = flagString("DFStringRosemaryDebug");
+    if (!debugChannels.empty()) env.push_back("ROSEMARY_DEBUG=" + debugChannels);
+    const std::string menu = menuBar(flagString("DFStringMenuBar"));
+    if (!menu.empty()) env.push_back("ROSEMARY_MENU=" + menu);
+    env.push_back(std::string("SDL_APP_ID=net.tuxblox.TuxBlox.") +
+                  (target == LaunchTarget::Studio ? "Studio" : "Player"));
     // Marks this process as a macOS-client session so the window's session
     // census can find it without the Windows prefix's WINEPREFIX match.
     env.push_back("TUXBLOX_MAC_CLIENT=1");
 
     std::error_code ec;
     fs::create_directories(installDir + "/logs", ec);
-    const std::string logPath = launchLogPath(installDir, LaunchTarget::Player);
+    const std::string logPath = launchLogPath(installDir, target);
     std::vector<std::string> argv{macclient::resolveRosemary(installDir)};
-    const auto guestArgs = macclient::playerLaunchArgs(prepared.build.exe, uri);
+    const auto guestArgs = macclient::clientLaunchArgs(prepared.build.exe, uri);
     argv.insert(argv.end(), guestArgs.begin(), guestArgs.end());
 
     if (!p.start(argv, env, logPath))
@@ -417,8 +448,7 @@ LaunchOutcome ProcessLauncher::launch(LaunchTarget target, const std::string& ur
     if (p.isRunning()) {
         return {false, i18n::tr("already running"), "", false};
     }
-    if (target == LaunchTarget::Player && launcherFlags().macClient)
-        return launchMacPlayer(installDir_, p, uri, extraEnv);
+    return launchMacClient(target, installDir_, p, uri, extraEnv);
     // The macOS repository ships the launcher, not compat/. Refuse before the
     // Windows installer is downloaded or a missing binary is exec'd.
     if (!compatLayerAvailable(installDir_))

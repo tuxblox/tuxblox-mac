@@ -24,36 +24,65 @@ int main() {
 
     // The prefix states the type, as Roblox's own flags do.
     {
-        assert(flagTypeForName("tbxFlagEnableChristmasTheme").value() == FlagType::Bool);
-        assert(flagTypeForName("tbxStringPrivacyPolicyVersion").value() == FlagType::String);
-        assert(flagTypeForName("tbxIntRobloxInstallerParallelWorkers").value() == FlagType::Int);
+        assert(flagTypeForName("SFFlagEnableSeasonalTheme").value() == FlagType::Bool);
+        assert(flagTypeForName("SFStringPrivacyPolicyVersion").value() == FlagType::String);
+        assert(flagTypeForName("SFIntRobloxInstallerParallelWorkers").value() == FlagType::Int);
         assert(!flagTypeForName("somethingElse").has_value());
-        assert(!flagTypeForName("tbxFlag").has_value());   // a prefix and nothing else is not a name
-        assert(!flagTypeForName("tbx").has_value());
+        assert(!flagTypeForName("FFlag").has_value());   // a prefix and nothing else is not a name
+        assert(!flagTypeForName("SF").has_value());
         assert(!flagTypeForName("").has_value());
+    }
+
+    // S before D before F, and F is always last.
+    {
+        assert(flagTypeForName("FFlagX").value() == FlagType::Bool);
+        assert(flagTypeForName("DFFlagX").value() == FlagType::Bool);
+        assert(flagTypeForName("SFFlagX").value() == FlagType::Bool);
+        assert(flagTypeForName("SDFFlagX").value() == FlagType::Bool);
+        assert(flagTypeForName("SDFIntX").value() == FlagType::Int);
+        assert(flagTypeForName("DFStringX").value() == FlagType::String);
+        assert(!flagTypeForName("DSFFlagX").has_value());  // D before S
+        assert(!flagTypeForName("FSFlagX").has_value());   // F is not first
+        assert(!flagTypeForName("SFlagX").has_value());    // no F at all
+        assert(!flagTypeForName("FlagX").has_value());     // F eaten, no type word left
+    }
+
+    // Only a synchronized name may come from the server.
+    {
+        assert(!isLocalOnlyFlag("SDFFlagX"));
+        assert(isLocalOnlyFlag("DFFlagX"));
+        assert(isLocalOnlyFlag("FFlagX"));
+    }
+
+    // The flags version is compiled in: no source may replace it.
+    {
+        assert(flagTypeForName("FStringFlagsVersion").value() == FlagType::String);
+        assert(parseFlagJson(R"({"FStringFlagsVersion":"9.9.9"})", false).empty());
+        assert(parseFlagJson(R"({"FStringFlagsVersion":"9.9.9"})", true).empty());
+        assert(flagString("FStringFlagsVersion") == "2.0.0");
     }
 
     // A value that contradicts its own name is dropped, so the next source down answers.
     // Keeping it would mean every install guessing the same wrong thing.
     {
-        assert(parseFlagJson(R"({"tbxFlagA":"yes","tbxIntB":4})", false).size() == 1);
-        assert(parseFlagJson(R"({"tbxIntB":"4"})", false).empty());
-        assert(parseFlagJson(R"({"tbxStringC":9})", false).empty());
-        assert(parseFlagJson(R"({"tbxFlagA":1})", false).empty());       // 1 is not true
-        assert(parseFlagJson(R"({"tbxIntB":4.5})", false).empty());      // not an integer
+        assert(parseFlagJson(R"({"SFFlagA":"yes","SFIntB":4})", false).size() == 1);
+        assert(parseFlagJson(R"({"SFIntB":"4"})", false).empty());
+        assert(parseFlagJson(R"({"SFStringC":9})", false).empty());
+        assert(parseFlagJson(R"({"SFFlagA":1})", false).empty());       // 1 is not true
+        assert(parseFlagJson(R"({"SFIntB":4.5})", false).empty());      // not an integer
         // Past int64: nlohmann parses this as UNSIGNED, is_number_integer() is true, and
         // get<int64_t>() wraps it to a large negative. A flag set large and positive
         // would arrive at every install as its negative twin, so it is refused instead.
-        assert(parseFlagJson(R"({"tbxIntB":9223372036854775808})", false).empty());
-        assert(parseFlagJson(R"({"tbxIntB":18446744073709551615})", false).empty());
-        assert(parseFlagJson(R"({"tbxIntB":1e300})", false).empty());
+        assert(parseFlagJson(R"({"SFIntB":9223372036854775808})", false).empty());
+        assert(parseFlagJson(R"({"SFIntB":18446744073709551615})", false).empty());
+        assert(parseFlagJson(R"({"SFIntB":1e300})", false).empty());
         // The edges themselves still work.
-        assert(parseFlagJson(R"({"tbxIntB":9223372036854775807})", false)
-                   .at("tbxIntB").integer == 9223372036854775807LL);
+        assert(parseFlagJson(R"({"SFIntB":9223372036854775807})", false)
+                   .at("SFIntB").integer == 9223372036854775807LL);
         assert(parseFlagJson(R"({"unknownPrefix":true})", false).empty());
-        assert(parseFlagJson(R"({"tbxFlagA":{"nested":true}})", false).empty());
-        assert(parseFlagJson(R"({"tbxFlagA":[true]})", false).empty());
-        assert(parseFlagJson(R"({"tbxFlagA":null})", false).empty());
+        assert(parseFlagJson(R"({"SFFlagA":{"nested":true}})", false).empty());
+        assert(parseFlagJson(R"({"SFFlagA":[true]})", false).empty());
+        assert(parseFlagJson(R"({"SFFlagA":null})", false).empty());
     }
 
     // Not a flat object at all. Every one of these leaves the lower sources alone.
@@ -68,53 +97,51 @@ int main() {
     }
 
     // The client enforces the local-only list; the server is not trusted to respect it.
-    // tbxFlagDisableUpdater from the server would be a kill switch that cannot be
+    // FFlagDisableUpdater from the server would be a kill switch that cannot be
     // corrected by updating, because updating is what it stops.
     {
-        assert(isLocalOnlyFlag("tbxFlagDisableUpdater"));
+        assert(isLocalOnlyFlag("FFlagDisableUpdater"));
         // Read before any route has loaded the flags, so a value from the server could not be seen anyway.
-        assert(isLocalOnlyFlag("tbxFlagBypassSystemRequirements"));
-        assert(isLocalOnlyFlag("tbxFlagEnableExperimentalMacClient"));
-        assert(parseFlagJson(R"({"tbxFlagEnableExperimentalMacClient":true})", true).empty());
-        assert(!isLocalOnlyFlag("tbxFlagEnableChristmasTheme"));
-        assert(parseFlagJson(R"({"tbxFlagDisableUpdater":true})", true).empty());
-        assert(parseFlagJson(R"({"tbxFlagDisableUpdater":true})", false).size() == 1);
+        assert(isLocalOnlyFlag("FFlagBypassSystemRequirements"));
+        assert(!isLocalOnlyFlag("SFFlagEnableSeasonalTheme"));
+        assert(parseFlagJson(R"({"FFlagDisableUpdater":true})", true).empty());
+        assert(parseFlagJson(R"({"FFlagDisableUpdater":true})", false).size() == 1);
         // The rest of a server answer survives its presence.
-        assert(parseFlagJson(R"({"tbxFlagDisableUpdater":true,"tbxFlagA":true})", true).size() == 1);
+        assert(parseFlagJson(R"({"FFlagDisableUpdater":true,"SFFlagA":true})", true).size() == 1);
     }
 
     // Values round-trip with their type.
     {
         const FlagTable t = parseFlagJson(
-            R"({"tbxFlagA":true,"tbxStringB":"2026-10-16","tbxIntC":6})", false);
+            R"({"SFFlagA":true,"SFStringB":"2026-10-16","SFIntC":6})", false);
         assert(t.size() == 3);
-        assert(t.at("tbxFlagA").boolean == true);
-        assert(t.at("tbxStringB").text == "2026-10-16");
-        assert(t.at("tbxIntC").integer == 6);
+        assert(t.at("SFFlagA").boolean == true);
+        assert(t.at("SFStringB").text == "2026-10-16");
+        assert(t.at("SFIntC").integer == 6);
         // A negative and a large integer survive as themselves.
-        const FlagTable big = parseFlagJson(R"({"tbxIntA":-1,"tbxIntB":9007199254740993})", false);
-        assert(big.at("tbxIntA").integer == -1);
-        assert(big.at("tbxIntB").integer == 9007199254740993LL);
+        const FlagTable big = parseFlagJson(R"({"SFIntA":-1,"SFIntB":9007199254740993})", false);
+        assert(big.at("SFIntA").integer == -1);
+        assert(big.at("SFIntB").integer == 9007199254740993LL);
     }
 
     // Merge is per key: a key the higher source does not set is left alone, and a key
     // only the higher source has is added -- which is how a flag is introduced ahead of
     // the release that reads it.
     {
-        FlagTable base = parseFlagJson(R"({"tbxFlagA":false,"tbxIntB":1})", false);
-        const FlagTable higher = parseFlagJson(R"({"tbxFlagA":true,"tbxStringC":"x"})", false);
+        FlagTable base = parseFlagJson(R"({"SFFlagA":false,"SFIntB":1})", false);
+        const FlagTable higher = parseFlagJson(R"({"SFFlagA":true,"SFStringC":"x"})", false);
         mergeFlagsOver(base, higher);
         assert(base.size() == 3);
-        assert(base.at("tbxFlagA").boolean == true);   // overridden
-        assert(base.at("tbxIntB").integer == 1);       // untouched
-        assert(base.at("tbxStringC").text == "x");     // introduced
+        assert(base.at("SFFlagA").boolean == true);   // overridden
+        assert(base.at("SFIntB").integer == 1);       // untouched
+        assert(base.at("SFStringC").text == "x");     // introduced
     }
 
     // Merging an empty table changes nothing -- which is what a failed fetch looks like.
     {
-        FlagTable base = parseFlagJson(R"({"tbxFlagA":true})", false);
+        FlagTable base = parseFlagJson(R"({"SFFlagA":true})", false);
         mergeFlagsOver(base, FlagTable{});
-        assert(base.size() == 1 && base.at("tbxFlagA").boolean == true);
+        assert(base.size() == 1 && base.at("SFFlagA").boolean == true);
     }
 
     printf("flag_table: all tests passed\n");

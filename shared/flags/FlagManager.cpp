@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <unistd.h>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -35,42 +36,66 @@ namespace tuxblox {
 
 namespace {
 
-constexpr std::array<std::pair<const char*, FlagType>, 3> kPrefixes = {{
-    {"tbxFlag", FlagType::Bool},
-    {"tbxString", FlagType::String},
-    {"tbxInt", FlagType::Int},
+constexpr std::array<std::pair<const char*, FlagType>, 3> kTypeWords = {{
+    {"Flag", FlagType::Bool},
+    {"String", FlagType::String},
+    {"Int", FlagType::Int},
 }};
 
-// Flags the server may not set, enforced here rather than trusted to the server. Adding
-// to this list takes a release, which is the point.
-constexpr std::array<const char*, 3> kLocalOnly = {{
-    "tbxFlagDisableUpdater",
-    "tbxFlagBypassSystemRequirements",
-    // Switching the client runtime is not a remote switch: a server that could flip
-    // it would move every install onto an experimental path with no local say.
-    "tbxFlagEnableExperimentalMacClient",
+// Values compiled in that no source may replace, so a reader can trust what they mean.
+constexpr std::array<std::pair<const char*, const char*>, 1> kBaked = {{
+    {"FStringFlagsVersion", "2.0.0"},
 }};
 
-bool startsWith(const std::string& name, const char* prefix) {
-    const std::string p = prefix;
-    return name.size() > p.size() && name.compare(0, p.size(), p) == 0;
+struct FlagName {
+    bool synchronized = false;
+    bool dynamic = false;
+    FlagType type = FlagType::Bool;
+};
+
+std::optional<FlagName> parseFlagName(const std::string& name) {
+    FlagName out;
+    size_t at = 0;
+    if (at < name.size() && name[at] == 'S') { out.synchronized = true; ++at; }
+    if (at < name.size() && name[at] == 'D') { out.dynamic = true; ++at; }
+    if (at >= name.size() || name[at] != 'F') return std::nullopt;
+    ++at;
+    for (const auto& entry : kTypeWords) {
+        const std::string word = entry.first;
+        if (name.size() > at + word.size() && name.compare(at, word.size(), word) == 0) {
+            out.type = entry.second;
+            return out;
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<FlagValue> bakedFlag(const std::string& name) {
+    for (const auto& entry : kBaked) {
+        if (name != entry.first) continue;
+        FlagValue value;
+        value.type = FlagType::String;
+        value.text = entry.second;
+        return value;
+    }
+    return std::nullopt;
 }
 
 } // namespace
 
 std::optional<FlagType> flagTypeForName(const std::string& name) {
-    for (const auto& entry : kPrefixes) {
-        if (startsWith(name, entry.first)) return entry.second;
-    }
-    return std::nullopt;
+    const std::optional<FlagName> parsed = parseFlagName(name);
+    if (!parsed.has_value()) return std::nullopt;
+    return parsed->type;
 }
 
+// A missing S is the refusal: only a synchronized flag is one the server may set.
 bool isLocalOnlyFlag(const std::string& name) {
-    for (const char* local : kLocalOnly) {
-        if (name == local) return true;
-    }
-    return false;
+    const std::optional<FlagName> parsed = parseFlagName(name);
+    return !parsed.has_value() || !parsed->synchronized;
 }
+
+bool isBakedFlag(const std::string& name) { return bakedFlag(name).has_value(); }
 
 FlagTable parseFlagJson(const std::string& json, bool fromServer) {
     FlagTable table;
@@ -93,7 +118,11 @@ FlagTable parseFlagJson(const std::string& json, bool fromServer) {
     for (auto it = parsed.begin(); it != parsed.end(); ++it) {
         const std::optional<FlagType> type = flagTypeForName(it.key());
         if (!type.has_value()) {
-            fprintf(stderr, "TuxBlox: ignoring the flag \"%s\": its name says no type\n",
+            fprintf(stderr, "Warning: unrecognized flag '%s'.\n", it.key().c_str());
+            continue;
+        }
+        if (isBakedFlag(it.key())) {
+            fprintf(stderr, "TuxBlox: ignoring the flag \"%s\": its value is compiled in\n",
                     it.key().c_str());
             continue;
         }
@@ -181,9 +210,9 @@ void applyFlaggedHttpVersion(void* curl, const std::string& url) {
     if (curl == nullptr) return;
     std::string asked;
     switch (httpDestinationFor(url)) {
-        case HttpDestination::RobloxCdn: asked = flagString("tbxStringHttpProtocolRbxCdn"); break;
-        case HttpDestination::TuxbloxCdn: asked = flagString("tbxStringHttpProtocolCdn"); break;
-        case HttpDestination::Other: asked = flagString("tbxStringHttpProtocolOther"); break;
+        case HttpDestination::RobloxCdn: asked = flagString("FStringHttpProtocolRbxCdn"); break;
+        case HttpDestination::TuxbloxCdn: asked = flagString("FStringHttpProtocolCdn"); break;
+        case HttpDestination::Other: asked = flagString("FStringHttpProtocolOther"); break;
     }
     long version = 0;
     if (asked == "1.0") version = CURL_HTTP_VERSION_1_0;
@@ -284,6 +313,53 @@ std::string readFile(const std::string& path) {
 
 // Collects whatever the fetch produced, applies the server's answer and then the user's
 // override, and seals. Called once, by the first read; the caller holds stateMutex().
+// Flags named directly in the environment: the name is the variable, so the
+// grammar alone says which variables are flags and every other one is skipped.
+FlagTable flagsFromEnvironment() {
+    FlagTable table;
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string text = *entry;
+        const size_t eq = text.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string name = text.substr(0, eq);
+        const std::optional<FlagType> type = flagTypeForName(name);
+        if (!type.has_value()) continue;
+        if (isBakedFlag(name)) {
+            fprintf(stderr, "TuxBlox: ignoring the flag \"%s\": its value is compiled in\n",
+                    name.c_str());
+            continue;
+        }
+        const std::string text_value = text.substr(eq + 1);
+        FlagValue value;
+        value.type = *type;
+        if (*type == FlagType::Bool) {
+            std::string lowered = text_value;
+            for (char& c : lowered) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+            if (lowered == "true" || lowered == "1") {
+                value.boolean = true;
+            } else if (lowered == "false" || lowered == "0") {
+                value.boolean = false;
+            } else {
+                fprintf(stderr, "Warning: flag '%s' is not a boolean.\n", name.c_str());
+                continue;
+            }
+        } else if (*type == FlagType::String) {
+            value.text = text_value;
+        } else {
+            try {
+                size_t used = 0;
+                value.integer = std::stoll(text_value, &used);
+                if (used != text_value.size()) throw std::invalid_argument("trailing");
+            } catch (const std::exception&) {
+                fprintf(stderr, "Warning: flag '%s' is not an integer.\n", name.c_str());
+                continue;
+            }
+        }
+        table[name] = value;
+    }
+    return table;
+}
+
 void sealLocked(State& s) {
     if (s.sealed) return;
     s.sealed = true;
@@ -299,15 +375,19 @@ void sealLocked(State& s) {
     }
     // Last, so it wins: this file is the one a person wrote by hand. Skipped entirely
     // when there is no install directory, rather than consulting the filesystem root.
-    if (s.installDir.empty()) return;
-    const std::string override = readFile(s.installDir + "/flags.json");
-    // Not logged: the file is read on every start and saying so told a reader nothing about theirs.
-    if (!override.empty()) mergeFlagsOver(s.table, parseFlagJson(override, false));
+    if (!s.installDir.empty()) {
+        const std::string override = readFile(s.installDir + "/flags.json");
+        // Not logged: the file is read on every start and saying so told a reader nothing about theirs.
+        if (!override.empty()) mergeFlagsOver(s.table, parseFlagJson(override, false));
+    }
+    // Over even that file: a variable is set for one run, on purpose.
+    mergeFlagsOver(s.table, flagsFromEnvironment());
 }
 
 // Returns a COPY, not a pointer: a pointer dereferenced after the lock is released is a
 // use-after-free the moment anything clears the table.
 std::optional<FlagValue> lookup(const std::string& name) {
+    if (const std::optional<FlagValue> baked = bakedFlag(name)) return baked;
     std::lock_guard<std::mutex> lock(stateMutex());
     State& s = state();
     if (s.table.empty() && !s.sealed) s.table = defaultTable();

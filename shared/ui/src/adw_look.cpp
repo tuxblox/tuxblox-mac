@@ -43,7 +43,7 @@ namespace {
 // Grey is libadwaita's own colours, which is what TuxBlox looked like before the website palette existed
 bool isKnownTheme(const std::string &theme) {
     // Christmas stops being a known name once its season is over, which is what makes every caller fall back to the system theme on its own
-    if (theme == "christmas") return christmasThemeAvailable();
+    if (theme == "christmas") return seasonalThemeAvailable();
     return theme == "system" || theme == "dark" || theme == "grey" || theme == "light";
 }
 

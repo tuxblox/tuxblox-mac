@@ -16,6 +16,7 @@
 
 #include "wine_shortcut_export.h"
 #include "asset_roblox_player.h"
+#include "asset_roblox_studio.h"
 #include "flag_startup.h"
 #include "mac_client.h"
 #include "prefix_user.h"
@@ -234,11 +235,12 @@ std::string trimIconPng(const std::string& png) {
 // Player icon the client itself ships, which is the artwork people recognise
 // and stays legible on both light and dark panels; fall back to the embedded
 // one if a build ever stops carrying it.
-std::string writeMacPlayerIcon(const std::string& installDir, const std::string& iconsDir) {
-    const std::string name = "tuxblox-roblox-player";
+std::string writeMacClientIcon(const std::string& installDir, const std::string& iconsDir,
+                               LaunchTarget target, const std::string& slug) {
+    const std::string name = "tuxblox-roblox-" + slug;
 
     macclient::Build build;
-    if (macclient::installedBuild(installDir, build)) {
+    if (macclient::installedBuild(installDir, build, target)) {
         const fs::path icns = fs::path(build.app) / "Contents" / "Resources" / "AppIcon.icns";
         std::error_code ec;
         if (fs::is_regular_file(icns, ec) && !ec) {
@@ -262,7 +264,10 @@ std::string writeMacPlayerIcon(const std::string& installDir, const std::string&
     std::error_code ec;
     fs::create_directories(dir, ec);
     if (ec) return std::string();
-    const std::string svg(reinterpret_cast<const char *>(kAssetRobloxPlayer), kAssetRobloxPlayerLen);
+    const bool player = target == LaunchTarget::Player;
+    const std::string svg(
+        reinterpret_cast<const char *>(player ? kAssetRobloxPlayer : kAssetRobloxStudio),
+        player ? kAssetRobloxPlayerLen : kAssetRobloxStudioLen);
     if (!writeFileAtomic(dir / (name + ".svg"), svg)) return std::string();
     return name;
 }
@@ -500,11 +505,8 @@ void exportPrefixShortcutsTo(const std::string& installDir, const std::string& l
         std::error_code mkEc;
         fs::create_directories(appsDir, mkEc);
 
-        // While the macOS backend is active, a Windows Player shortcut must
-        // not replace the entry that starts through it. The macOS client is
-        // the Player this install would launch.
-        const bool macPlayer = launcherFlags().macClient &&
-                               macclient::hasInstalledClient(installDir);
+        const bool macPlayer = macclient::hasInstalledClient(installDir);
+        const bool macStudio = macclient::hasInstalledClient(installDir, LaunchTarget::Studio);
 
         std::vector<std::string> produced;
 
@@ -532,6 +534,7 @@ void exportPrefixShortcutsTo(const std::string& installDir, const std::string& l
                     if (leaf == t.exeLeaf) slug = t.slug;
                 if (!slug) continue; // not Roblox -- don't publish it
                 if (macPlayer && std::string(slug) == "player") continue;
+                if (macStudio && std::string(slug) == "studio") continue;
 
                 std::string name = desktopValue(contents, "Name");
                 if (name.empty()) name = windowsBasename(exe);
@@ -579,12 +582,16 @@ void exportPrefixShortcutsTo(const std::string& installDir, const std::string& l
             // tree, so the usual check cannot see it. The entry is only useful
             // while the backend is on: with the flag off, --launch-player would
             // look for a Windows Player that was never installed.
-            const bool macPlayerTarget = macPlayer && std::string(t.slug) == "player";
-            if (macPlayerTarget || isTargetInstalled(installDir, t.exeLeaf)) {
-                if (macPlayerTarget) writeMacPlayerIcon(installDir, iconsDir);
+            const bool isStudio = std::string(t.slug) == "studio";
+            const bool macTarget = isStudio ? macStudio : macPlayer;
+            const LaunchTarget target = isStudio ? LaunchTarget::Studio : LaunchTarget::Player;
+            if (macTarget || isTargetInstalled(installDir, t.exeLeaf)) {
+                if (macTarget) writeMacClientIcon(installDir, iconsDir, target, t.slug);
+                const std::string appId =
+                    std::string("net.tuxblox.TuxBlox.") + (isStudio ? "Studio" : "Player");
                 writeFileAtomic(fs::path(appsDir) / id,
                                 builtinEntry(t, launcherExePath, iconsDir,
-                                             macPlayerTarget ? "net.tuxblox.TuxBlox.Player" : t.exeLeaf));
+                                             macTarget ? appId.c_str() : t.exeLeaf));
                 continue;
             }
             std::error_code rmEc;
@@ -602,9 +609,7 @@ void exportPrefixShortcuts(const std::string& installDir, const std::string& lau
                              std::string(home) + "/.local/share/applications",
                              std::string(home) + "/.local/share/icons/hicolor");
     // After the entries above, because the icon on the desktop is one of them.
-    if (launcherFlags().translateWindowsShortcuts) {
-        translateDesktopShortcuts(installDir, launcherExePath);
-    }
+    translateDesktopShortcuts(installDir, launcherExePath);
 }
 
 } // namespace tuxblox

@@ -31,7 +31,7 @@ const struct {
     const char* choice;
     const char* flag;
 } GraphicsFlags[] = {
-    {"d3d11", "FFlagDebugGraphicsPreferD3D11"},
+    {"metal", "FFlagDebugGraphicsPreferMetal"},
     {"vulkan", "FFlagDebugGraphicsPreferVulkan"},
     {"opengl", "FFlagDebugGraphicsPreferOpenGL"},
 };

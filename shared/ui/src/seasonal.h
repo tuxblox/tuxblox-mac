@@ -20,9 +20,9 @@
 namespace tuxblox {
 
 // Whether the Christmas theme is offered, for a given moment. Decided in UTC so the season turns at the same instant everywhere rather than drifting with the clock a machine happens to keep.
-bool christmasThemeAvailable(std::time_t now);
+bool seasonalThemeAvailable(std::time_t now);
 
 // The same, for right now.
-bool christmasThemeAvailable();
+bool seasonalThemeAvailable();
 
 } // namespace tuxblox

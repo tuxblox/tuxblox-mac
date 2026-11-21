@@ -67,7 +67,7 @@ const std::vector<std::string>& previewPackages() {
 }
 
 // Enough connections to keep the link busy without hammering Roblox's CDN. How many is
-// tbxIntRobloxInstallerParallelWorkers, and whether at all is the flag beside it, so a
+// SFIntRobloxInstallerParallelWorkers, and whether at all is the flag beside it, so a
 // CDN that answers badly under load can be given one connection again without a release.
 
 const char* titleFor(Mode mode) {
@@ -101,7 +101,7 @@ App::~App() {
 void App::start() {
     if (thread_.joinable()) return;
     // The bootstrapper is reached before main() gets anywhere near initLauncherFlags(), and
-    // it is the very thing tbxFlagEnableParallelWorkersForRobloxInstaller describes -- so it
+    // it is the very thing SFFlagEnableParallelWorkersForRobloxInstaller describes -- so it
     // loads the flags itself. Without this the first read would seal an empty table and
     // every flag would answer "off", which here means downloading Roblox one file at a time.
     initLauncherFlags(config_.installDir);

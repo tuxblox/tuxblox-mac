@@ -215,7 +215,7 @@ void VersionsPage::openInstallSheet() {
     gtk_widget_set_halign(pModes, GTK_ALIGN_START);
     for (GtkWidget *pMode : {pSheet->pLatest, pSheet->pPrevious, pSheet->pNext, pSheet->pCustom}) {
         // Next is the one Roblox has uploaded and not released, so it is the one that can
-        // stop being installable without warning. tbxFlagEnableRobloxNextVersionDownload
+        // stop being installable without warning. SFFlagEnableRobloxNextVersionDownload
         // takes it out of the row rather than leaving a button that fails when pressed.
         if (pMode == pSheet->pNext && !launcherFlags().robloxNextVersion) continue;
         gtk_box_append(GTK_BOX(pModes), pMode);
@@ -357,7 +357,7 @@ void VersionsPage::applyReadOnly(bool readOnly) {
 }
 
 void VersionsPage::rebuild(List &list, const AppVersions &versions,
-                           const std::string &macVersion) {
+                           const std::string &macVersion, const std::string &macUpload) {
     for (GtkWidget *pRow : list.rows) adw_preferences_group_remove(list.pGroup, pRow);
     list.rows.clear();
 
@@ -367,7 +367,8 @@ void VersionsPage::rebuild(List &list, const AppVersions &versions,
     if (list.target == LaunchTarget::Player && !macVersion.empty()) {
         GtkWidget *pMacRow = adw_action_row_new();
         adw_preferences_row_set_title(ADW_PREFERENCES_ROW(pMacRow),
-                                      i18n::tr("Roblox Player"));
+                                      macUpload.empty() ? i18n::tr("Roblox Player")
+                                                        : macUpload.c_str());
         const std::string subtitle = macVersion + " \xC2\xB7 live";
         adw_action_row_set_subtitle(ADW_ACTION_ROW(pMacRow), subtitle.c_str());
 
@@ -479,8 +480,8 @@ void VersionsPage::update(const AppSnapshot &snap) {
         renderedMacVersion_ == snap.macClientVersion) {
         return;
     }
-    rebuild(player_, snap.versions.player, snap.macClientVersion);
-    rebuild(studio_, snap.versions.studio, "");
+    rebuild(player_, snap.versions.player, snap.macClientVersion, snap.macClientUpload);
+    rebuild(studio_, snap.versions.studio, "", "");
     rendered_ = snap.versions;
     renderedMacVersion_ = snap.macClientVersion;
     renderedOnce_ = true;

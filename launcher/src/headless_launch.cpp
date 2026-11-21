@@ -53,27 +53,11 @@ int runHeadlessQuickLaunch(const std::string& installDir, LaunchTarget target, c
     // launcher's own window.
     const std::vector<std::string> extraEnv = launchEnvPairs(settings);
 
-    // The macOS Player has its own install, verification and launch path. The
-    // Windows updater and version tree must not run for it: a menu entry or a
-    // roblox: link would otherwise download the Windows Player and never start
-    // the client that is actually installed.
-    const bool macPlayer = target == LaunchTarget::Player && launcherFlags().macClient;
-    if (!macPlayer && !compatLayerAvailable(installDir)) {
-        fprintf(stderr, "TuxBlox: %s\n",
-                i18n::tr("This launcher was installed without the TuxBlox compatibility layer, so the Windows Player and Roblox Studio cannot start. Install TuxBlox first, then run this launcher from its directory."));
-        return 1;
-    }
-
-    // Before the exe is resolved, so a version installed by this check is the
-    // one that starts.
-    if (!macPlayer) runRobloxUpdateCheck(installDir, target, settings);
-    // Needed here as much as on the watched path: a link in a web browser, a menu entry and a desktop icon all come through here, and without it the file keeps whatever the last launch from the TuxBlox window put in it, so a flag deleted since then goes on applying.
-    if (!macPlayer) applyFastFlags(installDir, target, settings);
     // This process execs into the game below, so the menu entry has to be
     // written here rather than after the session, as the watched path does.
     exportPrefixShortcuts(installDir, selfExePath());
 
-    if (macPlayer) {
+    {
         // Rosemary and the client are children of this process, and the
         // session has to be watched until they finish: there is no Proton
         // binary to exec into. The captured log is also what the server-region

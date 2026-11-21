@@ -208,7 +208,7 @@ bool systemPrefersDark() {
 
 std::string launcherThemeFor(const std::string &theme) {
     if (theme != "christmas") return theme;
-    return christmasThemeAvailable() && launcherFlags().christmasTheme ? theme : "system";
+    return seasonalThemeAvailable() && launcherFlags().seasonalTheme ? theme : "system";
 }
 
 void applyLauncherTheme(const std::string &wanted) {

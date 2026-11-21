@@ -40,11 +40,10 @@ NATIVE := $(BUILD)/native
 LAUNCHER := $(NATIVE)/TuxBloxLauncher
 INSTALLER := $(NATIVE)/TuxBloxInstaller
 STUDIO_MCP := $(NATIVE)/studio-mcp
-COMPAT := $(NATIVE)/compat/main
+ROSEMARY := $(NATIVE)/compat/rosemary
 UI_STACK_VERSION := $(shell sed -n 's/^UI_STACK_VERSION=//p' shared/ui/versions.env)
 UI := $(UI_DIST)/ui-stack-$(UI_STACK_VERSION)-x86_64.tar.zst
 LIBS := $(ART)/shared/lib/libcurl.a
-PATCHES := $(ART)/.patches
 PODMAN := $(ART)/.podman
 
 COMPAT_VERSION := $(shell cat compat/VERSION 2>/dev/null)
@@ -58,6 +57,7 @@ LIBADWAITA_HEAD = $(shell d=$(LIBADWAITA_DIR); [ "$$(git -C $$d rev-parse --show
 LIBADWAITA_SHORT = $(shell d=$(LIBADWAITA_DIR); [ "$$(git -C $$d rev-parse --show-toplevel 2>/dev/null)" = "$$d" ] || exit 0; printf '%s%s' "$$(git -C $$d rev-parse --short HEAD)" "$$([ -n "$$(git -C $$d status --porcelain)" ] && echo -dirty)")
 LIBADWAITA_COMMIT = $(shell for t in $(UI_DIST)/ui-stack-*.tar.zst; do [ -f "$$t" ] || continue; c=$$(zstd -dc "$$t" 2>/dev/null | tar -xO LIBADWAITA_COMMIT 2>/dev/null | tr -d '[:space:]'); if [ -n "$$c" ]; then printf '%s' "$$c"; exit 0; fi; done; printf '%s' "$(LIBADWAITA_HEAD)")
 CCACHE_DIR ?= $(HOME)/.ccache
+CARGO_DIR ?= $(HOME)/.cargo-tuxblox
 
 UI_MOUNTS := -v $(CURDIR)/shared/ui/src:/ui-src:ro -v $(CURDIR)/shared/ui/dist/dev:/ui-dev:ro
 UI_ARGS := -DTUXBLOX_UI_STACK_DEV=/ui-dev -DTUXBLOX_UI_SRC=/ui-src
@@ -83,9 +83,7 @@ INSTALLER_SRC := $(shell $(FIND) installer/src installer/CMakeLists.txt -type f 
 STUDIO_MCP_SRC := $(shell $(FIND) studio-mcp/src studio-mcp/CMakeLists.txt -type f 2>/dev/null)
 # third_party_licenses and LICENSE are staged into the layer below, so a licence that arrives or
 # leaves has to rebuild it: the layer ships its own copy and nothing else would notice.
-COMPAT_SRC := $(shell $(FIND) compat/tuxblox compat/wine/dlls compat/wine/programs compat/patches \
-	compat/Makefile.in compat/configure.sh compat/webkitgtk/prebuilt \
-	third_party_licenses LICENSE -type f 2>/dev/null)
+COMPAT_SRC := $(shell $(FIND) compat/crates compat/Cargo.toml compat/Cargo.lock -type f 2>/dev/null)
 
 export TUXBLOX_SKIP_DEPS := 1
 export TUXBLOX_MAKE_JOBS := $(JOBS)
@@ -150,8 +148,8 @@ appimage:
 	cp $(ART)/installer/TuxBloxInstaller-ui $(APPIMAGE_APPDIR)/usr/TuxBloxInstaller-ui
 	cp $(APPIMAGE_DIR)/TuxBloxInstaller $(APPIMAGE_APPDIR)/usr/bin/TuxBloxInstaller
 	@if [ -f $(ROSEMARY) ]; then \
-	    mkdir -p $(APPIMAGE_APPDIR)/usr/bin/rosemary; \
-	    cp "$(ROSEMARY)" "$(APPIMAGE_APPDIR)/usr/bin/rosemary/rosemary"; \
+	    mkdir -p $(APPIMAGE_APPDIR)/usr/bin/compat; \
+	    cp "$(ROSEMARY)" "$(APPIMAGE_APPDIR)/usr/bin/compat/rosemary"; \
 	else \
 	    echo "!! Rosemary was not built; the AppImage has no macOS client backend" >&2; \
 	fi
@@ -201,11 +199,7 @@ flatpak:
 	@printf ':: install it with: flatpak install --user %s\n' '$(FLATPAK_BUNDLE)'
 	@printf ':: the Flatpak variant stays in %s, build/native/TuxBloxLauncher is untouched\n' '$(FLATPAK_DIR)'
 studio-mcp: bump-build record-provenance $(STUDIO_MCP)
-ifdef NODIST
-compat: bump-build record-provenance compat-build
-else
-compat: bump-build record-provenance $(COMPAT)
-endif
+compat: bump-build record-provenance $(ROSEMARY)
 
 .PHONY: bump-build
 bump-build:
@@ -252,10 +246,6 @@ $(PODMAN): Containerfile
 	podman build -t tuxblox-builder -f $(ROOT)/Containerfile $(ROOT)
 	@touch $@
 
-$(PATCHES): compat/Makefile.in $(wildcard compat/patches/*/*)
-	@mkdir -p $(dir $@)
-	$(ROOT)/compat/apply-patches.sh
-	@touch $@
 
 LIBS_SUBMODULES := shared/crypto/openssl:OPENSSL_COMMIT shared/network/libcurl:CURL_COMMIT \
     shared/network/nghttp2:NGHTTP2_COMMIT shared/fs/libarchive:LIBARCHIVE_COMMIT \
@@ -1011,34 +1001,17 @@ define prepare_layer
 	cd $(PROTON)/obj-wine-x86_64 && make nls/locale.nls
 endef
 
-$(COMPAT): $(COMPAT_SRC) $(PATCHES) $(LIBS) $(LAUNCHER) $(WEBVIEW) | $(PODMAN)
-	$(prepare_layer)
-	cd $(PROTON) && make -j$(JOBS) TUXBLOX_COMPAT_VERSION=$(COMPAT_VERSION)
-	@printf '%s' "$$BUILD_ENTRY_POINT" | bash -s -- $(PROTON)
-	@if [ -n "$(TUXBLOX_RM_DIST)" ]; then cd $(PROTON) && rm -rf obj-* dst-* && \
-	    rm -f .*-configure .*-build .*-post-build .*-dist; fi
-	rm -rf $(NATIVE)/compat && mv $(PROTON)/dist $(NATIVE)/compat
-	rm -f $(PROTON)/.*-dist
-	cp -a LICENSE $(NATIVE)/compat/LICENSE
-	rm -rf $(NATIVE)/compat/third_party_licenses
-	cp -a third_party_licenses $(NATIVE)/compat/third_party_licenses
-	@Skeleton=$(NATIVE)/compat/files/share/default_pfx; \
-	    Stamp=$$(printf '%x' $$(( ($(SOURCE_DATE_EPOCH) + 11644473600) * 10000000 ))); \
-	    sed -i -e "s/^#time=.*/#time=$$Stamp/" \
-	        -e "s/^\(\[.*\]\) [0-9][0-9]*$$/\1 $(SOURCE_DATE_EPOCH)/" "$$Skeleton"/*.reg; \
-	    printf '%s\n' "$(SOURCE_DATE_EPOCH)" > "$$Skeleton/.update-timestamp"
-	@python3 shared/tools/strip-pe-timestamps.py $(NATIVE)/compat
+# The image's default cc is gcc-14, which has no libgcc_s.so.
+$(ROSEMARY): $(COMPAT_SRC) | $(PODMAN)
+	@mkdir -p $(CARGO_DIR) $(dir $@)
+	podman run --rm --userns=keep-id -e CARGO_HOME=/cargo -e CARGO_TERM_COLOR=never \
+	    -e CC=x86_64-linux-gnu-gcc-10 \
+	    -e RUSTFLAGS="-C linker=x86_64-linux-gnu-gcc-10" \
+	    -v $(ROOT)/compat:/src:Z -v $(CARGO_DIR):/cargo:z -w /src \
+	    tuxblox-builder cargo build --release --locked --bin rosemary
+	install -m 755 compat/target/release/rosemary $@
 
-.PHONY: compat-build
-compat-build: $(COMPAT_SRC) $(PATCHES) $(LIBS) | $(PODMAN)
-	$(prepare_layer)
-	cd $(PROTON) && make -j$(JOBS) TUXBLOX_COMPAT_VERSION=$(COMPAT_VERSION) all-build
-	@echo ":: Compiled, not staged. build/compat is untouched, so run make compat to get a usable layer."
-
-# Experimental macOS-client backend: a pinned upstream Rosemary executable,
-# kept as a separate binary next to the launcher. Not part of `components`:
-# adding a 130 MB download to every build would be wrong for a local-only flag.
-ROSEMARY := $(NATIVE)/rosemary/rosemary
+# The pinned upstream executable, for when building it from source is not wanted.
 .PHONY: rosemary
 rosemary:
 	@mkdir -p "$$(dirname "$(ROSEMARY)")"
@@ -1073,7 +1046,7 @@ StagedLayer="$${2:-staged}"
 StackDirName="libtuxblox"
 GlibcFloor="GLIBC_2.29"
 
-GlibcNames='^(libc|libm|libdl|libpthread|librt|libresolv|libutil|libanl)\.so\.[0-9]+$$'
+GlibcNames='^(libc|libm|libdl|libpthread|librt|libresolv|libutil|libanl|libgcc_s)\.so\.[0-9]+$$'
 HostGraphicsNames='^lib(X11|X11-xcb|Xau|Xdmcp|Xext|Xrender|Xi|Xrandr|Xcursor|Xdamage|Xfixes|Xinerama|Xtst|Xss|xcb|xcb-render|xcb-shm|xcb-dri2|xcb-dri3|xcb-glx|xcb-present|xcb-sync|xcb-xfixes|xcb-randr|xcb-shape|xcb-util|xshmfence|drm|gbm|GL|GLX|EGL|GLdispatch|OpenGL|wayland-client|wayland-cursor|wayland-egl|xkbcommon|xkbcommon-x11)\.so\.[0-9]+$$'
 
 Binaries=(
@@ -1081,12 +1054,6 @@ Binaries=(
     "studio-mcp:no"
     "TuxBloxLauncher:yes"
 )
-if [[ "$$StagedLayer" == staged ]]; then
-    Binaries+=("compat/main:no")
-else
-    echo ":: the layer was compiled but not staged, so it is not checked here"
-fi
-
 Failures=0
 
 note() {

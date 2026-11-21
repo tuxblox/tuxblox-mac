@@ -18,7 +18,7 @@
 
 namespace tuxblox {
 
-bool christmasThemeAvailable(std::time_t now) {
+bool seasonalThemeAvailable(std::time_t now) {
     std::tm utc{};
     if (gmtime_r(&now, &utc) == nullptr) return false;
 
@@ -32,8 +32,8 @@ bool christmasThemeAvailable(std::time_t now) {
     return false;
 }
 
-bool christmasThemeAvailable() {
-    return christmasThemeAvailable(std::time(nullptr));
+bool seasonalThemeAvailable() {
+    return seasonalThemeAvailable(std::time(nullptr));
 }
 
 } // namespace tuxblox

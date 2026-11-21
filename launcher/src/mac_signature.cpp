@@ -473,13 +473,21 @@ std::string executableName(const std::string& infoPlist) {
 fs::path codeTarget(const fs::path& contents, const std::string& name) {
     fs::path target = contents / name;
     if (fs::is_directory(target)) {
-        // A nested .app is sealed as a bundle, not as a single file. Its
-        // Info.plist says which Mach-O inside it carries the signature.
-        const auto bytes = readFile(target / "Contents" / "Info.plist");
+        // An .app keeps its Info.plist under Contents; a .framework keeps it
+        // under the version Current points at, beside the binary.
+        fs::path plistPath = target / "Contents" / "Info.plist";
+        fs::path binaryDir = target / "Contents" / "MacOS";
+        if (!fs::exists(plistPath)) {
+            plistPath = target / "Versions" / "Current" / "Resources" / "Info.plist";
+            binaryDir = target / "Versions" / "Current";
+        }
+        const auto bytes = readFile(plistPath);
         const std::string plist(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-        const std::string exe = executableName(plist);
+        std::string exe = executableName(plist);
+        // What macOS falls back to when the key is absent or empty.
+        if (exe.empty()) exe = target.stem().string();
         if (exe.empty()) refuse("nested bundle has no CFBundleExecutable");
-        target = target / "Contents" / "MacOS" / exe;
+        target = binaryDir / exe;
     }
     return target;
 }

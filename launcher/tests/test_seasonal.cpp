@@ -35,25 +35,25 @@ std::time_t utc(int year, int month, int day, int hour, int minute, int second) 
 } // namespace
 
 int main() {
-    using tuxblox::christmasThemeAvailable;
+    using tuxblox::seasonalThemeAvailable;
 
     // The window opens on 9 November 2026 and closes at the end of 6 January 2027, in UTC
-    assert(!christmasThemeAvailable(utc(2026, 11, 8, 23, 59, 59)));
-    assert(christmasThemeAvailable(utc(2026, 11, 9, 0, 0, 0)));
-    assert(christmasThemeAvailable(utc(2026, 11, 30, 12, 0, 0)));
-    assert(christmasThemeAvailable(utc(2026, 12, 25, 12, 0, 0)));
-    assert(christmasThemeAvailable(utc(2026, 12, 31, 23, 59, 59)));
-    assert(christmasThemeAvailable(utc(2027, 1, 1, 0, 0, 0)));
-    assert(christmasThemeAvailable(utc(2027, 1, 6, 23, 59, 59)));
-    assert(!christmasThemeAvailable(utc(2027, 1, 7, 0, 0, 0)));
+    assert(!seasonalThemeAvailable(utc(2026, 11, 8, 23, 59, 59)));
+    assert(seasonalThemeAvailable(utc(2026, 11, 9, 0, 0, 0)));
+    assert(seasonalThemeAvailable(utc(2026, 11, 30, 12, 0, 0)));
+    assert(seasonalThemeAvailable(utc(2026, 12, 25, 12, 0, 0)));
+    assert(seasonalThemeAvailable(utc(2026, 12, 31, 23, 59, 59)));
+    assert(seasonalThemeAvailable(utc(2027, 1, 1, 0, 0, 0)));
+    assert(seasonalThemeAvailable(utc(2027, 1, 6, 23, 59, 59)));
+    assert(!seasonalThemeAvailable(utc(2027, 1, 7, 0, 0, 0)));
 
     // A one-off for this season, so neither the year before nor the year after offers it
-    assert(!christmasThemeAvailable(utc(2025, 12, 25, 12, 0, 0)));
-    assert(!christmasThemeAvailable(utc(2027, 12, 25, 12, 0, 0)));
-    assert(!christmasThemeAvailable(utc(2028, 1, 1, 12, 0, 0)));
+    assert(!seasonalThemeAvailable(utc(2025, 12, 25, 12, 0, 0)));
+    assert(!seasonalThemeAvailable(utc(2027, 12, 25, 12, 0, 0)));
+    assert(!seasonalThemeAvailable(utc(2028, 1, 1, 12, 0, 0)));
 
     // A clock far enough out to be nonsense still answers rather than reading uninitialised time
-    assert(!christmasThemeAvailable(0));
+    assert(!seasonalThemeAvailable(0));
 
     return 0;
 }

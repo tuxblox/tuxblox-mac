@@ -80,26 +80,23 @@ const LauncherFlags& launcherFlags() {
     // happens there and not under a window that is trying to draw.
     static const LauncherFlags flags = [] {
         LauncherFlags out;
-        out.playerButton = !flagBool("tbxFlagDisablePlayerButton");
-        out.christmasTheme = flagBool("tbxFlagEnableChristmasTheme");
-        out.geoTool = !flagBool("tbxFlagDisableGeoTool");
-        out.crashTelemetry = !flagBool("tbxFlagDisableCrashTelemetry");
-        out.robloxNextVersion = flagBool("tbxFlagEnableRobloxNextVersionDownload");
-        out.updater = !flagBool("tbxFlagDisableUpdater");
+        out.seasonalTheme = flagBool("SFFlagEnableSeasonalTheme");
+        out.geoTool = !flagBool("FFlagDisableGeoTool");
+        out.crashTelemetry = !flagBool("FFlagDisableCrashTelemetry");
+        out.robloxNextVersion = flagBool("SFFlagEnableRobloxNextVersionDownload");
+        out.updater = !flagBool("FFlagDisableUpdater");
         out.followPromotedBuild =
-            flagBool("tbxFlagEnableChannelToUpperChannelUpgradeOnBuildPromotion");
-        out.translateWindowsShortcuts = flagBool("tbxFlagTranslateWindowsShortcuts");
-        out.macClient = flagBool("tbxFlagEnableExperimentalMacClient");
-        if (flagBool("tbxFlagEnableParallelWorkersForRobloxInstaller")) {
-            const int64_t asked = flagInt("tbxIntRobloxInstallerParallelWorkers");
+            flagBool("SFFlagEnableChannelPromotion");
+        if (flagBool("SFFlagEnableParallelWorkersForRobloxInstaller")) {
+            const int64_t asked = flagInt("SFIntRobloxInstallerParallelWorkers");
             // Clamped rather than trusted: this is a thread count, and a set of flags that
             // predates the number would otherwise read as 0 and download nothing at all.
             out.robloxInstallerWorkers =
                 asked <= 0 ? kDefaultInstallerWorkers
                            : static_cast<int>(std::min<int64_t>(asked, kMaxInstallerWorkers));
         }
-        out.privacyPolicyVersion = flagString("tbxStringPrivacyPolicyVersion");
-        out.termsOfUseVersion = flagString("tbxStringTermsOfUseVersion");
+        out.privacyPolicyVersion = flagString("SFStringPrivacyPolicyVersion");
+        out.termsOfUseVersion = flagString("SFStringTermsOfUseVersion");
         return out;
     }();
     return flags;

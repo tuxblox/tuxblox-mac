@@ -95,11 +95,6 @@ int main() {
     const fs::path iconsDir = tmp / "icons" / "hicolor";
     fs::create_directories(appsDir);
 
-    // The macOS backend switch is read once for the process. Turning it on
-    // here lets the export exercise both the Windows and the macOS branches;
-    // the Windows fixtures below have no mac-client directory, so they are
-    // unaffected.
-    writeAll(installDir / "flags.json", "{\"tbxFlagEnableExperimentalMacClient\": true}\n");
     initLauncherFlags(installDir.string());
 
     writeAll(shortcuts / "Roblox Studio.desktop",
@@ -268,7 +263,7 @@ int main() {
         const fs::path macInstall = macTmp / "install";
         const fs::path macApps = macTmp / "applications";
         const fs::path macIcons = macTmp / "icons" / "hicolor";
-        const fs::path macRoot = macInstall / "mac-client" / "player";
+        const fs::path macRoot = macInstall / "runtime" / "player";
 
         writeAll(macRoot / "current", "version-abc123\n0.748.0.7481526\n");
         const fs::path app = macRoot / "version-abc123" / "RobloxPlayer.app";

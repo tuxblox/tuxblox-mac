@@ -39,9 +39,9 @@ bool isKnownTheme(const std::string& theme) {
     // Deliberately NOT asking the flags: initLauncherFlags() calls loadSettings() to find
     // out which channel to ask for, so a flag read from in here would seal the table
     // before the fetch had even started, and every flag would answer with its default.
-    // Whether the theme is OFFERED and APPLIED is where tbxFlagEnableChristmasTheme is
+    // Whether the theme is OFFERED and APPLIED is where SFFlagEnableSeasonalTheme is
     // honoured instead -- see applyThemeSetting().
-    if (theme == "christmas") return christmasThemeAvailable();
+    if (theme == "christmas") return seasonalThemeAvailable();
     return theme == "system" || theme == "dark" || theme == "grey" || theme == "light";
 }
 

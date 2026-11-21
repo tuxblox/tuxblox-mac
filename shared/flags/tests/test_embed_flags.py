@@ -43,14 +43,14 @@ def run(flags_text):
         return done.returncode, done.stderr, header
 
 
-# Mirrors LOCAL_ONLY in tools/embed-flags.py.
-LOCAL_ONLY = {"tbxFlagDisableUpdater", "tbxFlagBypassSystemRequirements",
-              "tbxFlagEnableExperimentalMacClient"}
+# Mirrors is_local_only in tools/embed-flags.py.
+def is_local_only(name):
+    return not name.startswith("S")
 
 GOOD = json.dumps({
-    "tbxFlagEnableChristmasTheme": True,
-    "tbxStringPrivacyPolicyVersion": "2026-10-16",
-    "tbxIntRobloxInstallerParallelWorkers": 6,
+    "SFFlagEnableSeasonalTheme": True,
+    "SFStringPrivacyPolicyVersion": "2026-10-16",
+    "SFIntRobloxInstallerParallelWorkers": 6,
 })
 
 
@@ -59,7 +59,7 @@ class EmbedFlagsTests(unittest.TestCase):
         code, _, header = run(GOOD)
         self.assertEqual(code, 0)
         self.assertIn("kTestFlags", header)
-        self.assertIn("tbxFlagEnableChristmasTheme", header)
+        self.assertIn("SFFlagEnableSeasonalTheme", header)
         self.assertIn("#pragma once", header)
 
     def test_a_name_with_no_known_prefix_fails_the_build(self):
@@ -68,8 +68,8 @@ class EmbedFlagsTests(unittest.TestCase):
         self.assertIn("somethingElse", err)
 
     def test_a_value_that_contradicts_its_prefix_fails_the_build(self):
-        for flags in ({"tbxFlagA": "yes"}, {"tbxIntB": "4"}, {"tbxStringC": 9},
-                      {"tbxFlagA": 1}, {"tbxIntB": 4.5}):
+        for flags in ({"SFFlagA": "yes"}, {"SFIntB": "4"}, {"SFStringC": 9},
+                      {"SFFlagA": 1}, {"SFIntB": 4.5}):
             code, err, _ = run(json.dumps(flags))
             self.assertNotEqual(code, 0, str(flags))
             self.assertIn(list(flags)[0], err)
@@ -78,15 +78,15 @@ class EmbedFlagsTests(unittest.TestCase):
         # Beyond 2^53 a JSON number no longer survives the trip unchanged, and beyond
         # 2^63 the launcher would read it as a large negative. Refused at the source.
         for value in (2 ** 53, 2 ** 63, -(2 ** 53), 2 ** 64):
-            code, err, _ = run(json.dumps({"tbxIntA": value}))
+            code, err, _ = run(json.dumps({"SFIntA": value}))
             self.assertNotEqual(code, 0, str(value))
-            self.assertIn("tbxIntA", err)
+            self.assertIn("SFIntA", err)
         # The largest that does survive is still allowed.
-        code, _, _ = run(json.dumps({"tbxIntA": 2 ** 53 - 1}))
+        code, _, _ = run(json.dumps({"SFIntA": 2 ** 53 - 1}))
         self.assertEqual(code, 0)
 
     def test_malformed_json_fails_the_build(self):
-        code, _, _ = run('{"tbxFlagA":')
+        code, _, _ = run('{"SFFlagA":')
         self.assertNotEqual(code, 0)
 
     def test_a_file_that_is_not_an_object_fails_the_build(self):
@@ -95,9 +95,9 @@ class EmbedFlagsTests(unittest.TestCase):
             self.assertNotEqual(code, 0, text)
 
     def test_a_nested_value_fails_the_build(self):
-        code, err, _ = run(json.dumps({"tbxFlagA": {"nested": True}}))
+        code, err, _ = run(json.dumps({"SFFlagA": {"nested": True}}))
         self.assertNotEqual(code, 0)
-        self.assertIn("tbxFlagA", err)
+        self.assertIn("SFFlagA", err)
 
     def test_an_empty_set_is_allowed(self):
         # Shipping with no defaults at all is a legitimate state, not an error.
@@ -107,7 +107,7 @@ class EmbedFlagsTests(unittest.TestCase):
 
     def test_the_generated_header_survives_awkward_string_values(self):
         # A quote, a backslash and a non-ASCII character must come back out intact.
-        awkward = {"tbxStringA": 'he said "x"', "tbxStringB": "a\\b", "tbxStringC": "café"}
+        awkward = {"SFStringA": 'he said "x"', "SFStringB": "a\\b", "SFStringC": "café"}
         code, _, header = run(json.dumps(awkward))
         self.assertEqual(code, 0)
         self.assertNotIn('\n', header.split('"')[1] if '"' in header else '')
@@ -160,12 +160,12 @@ class ShippedFilesTests(unittest.TestCase):
     # cannot quietly publish a different set from the one in the repository.
     def test_publishing_drops_a_local_only_flag_rather_than_refusing_it(self):
         code, stderr, published = self.publish(json.dumps({
-            "tbxFlagDisableUpdater": True,
-            "tbxFlagEnableChristmasTheme": True,
+            "FFlagDisableUpdater": True,
+            "SFFlagEnableSeasonalTheme": True,
         }))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(published, {"tbxFlagEnableChristmasTheme": True})
-        self.assertIn("tbxFlagDisableUpdater", stderr)
+        self.assertEqual(published, {"SFFlagEnableSeasonalTheme": True})
+        self.assertIn("FFlagDisableUpdater", stderr)
 
     def test_publishing_the_shipped_flags_keeps_everything_else(self):
         path = os.path.join(self.FLAGS_DIR, self.REAL)
@@ -173,7 +173,7 @@ class ShippedFilesTests(unittest.TestCase):
             source = json.load(handle)
         code, stderr, published = self.publish(json.dumps(source))
         self.assertEqual(code, 0, stderr)
-        self.assertEqual(set(published), set(source) - LOCAL_ONLY)
+        self.assertEqual(set(published), {n for n in source if not is_local_only(n)})
         for name, value in published.items():
             self.assertEqual(value, source[name])
 
@@ -187,7 +187,7 @@ class ShippedFilesTests(unittest.TestCase):
     def test_a_flag_may_be_shipped_ahead_of_the_release_that_reads_it(self):
         # Nothing reads it, so compiling it in costs nothing and publishing it is how it
         # reaches the release that will.
-        code, _, _ = run(json.dumps({"tbxFlagSomethingNotYetShipped": True}))
+        code, _, _ = run(json.dumps({"FFlagSomethingNotYetShipped": True}))
         self.assertEqual(code, 0)
 
 

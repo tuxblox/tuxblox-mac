@@ -61,24 +61,19 @@ void initLauncherFlags(const std::string& installDir);
 // waits for the server's answer, so doing it from a window tick would stall the window;
 // this is also the one list of what the launcher actually lets a flag decide.
 struct LauncherFlags {
-    bool playerButton = false;        // tbxFlagDisablePlayerButton
-    bool christmasTheme = false;      // tbxFlagEnableChristmasTheme
-    bool geoTool = false;             // tbxFlagDisableGeoTool
-    bool crashTelemetry = false;      // tbxFlagDisableCrashTelemetry
-    bool robloxNextVersion = false;   // tbxFlagEnableRobloxNextVersionDownload
-    bool updater = true;              // tbxFlagDisableUpdater, which only this machine may set
-    bool followPromotedBuild = false; // tbxFlagEnableChannelToUpperChannelUpgradeOnBuildPromotion
-    bool translateWindowsShortcuts = true; // tbxFlagTranslateWindowsShortcuts
-    // Local-only: enables the macOS client runtime. Off unless the install's own
-    // flags.json asks for it; the config server cannot turn this one on.
-    bool macClient = false;               // tbxFlagEnableExperimentalMacClient
+    bool seasonalTheme = false;      // SFFlagEnableSeasonalTheme
+    bool geoTool = false;             // FFlagDisableGeoTool
+    bool crashTelemetry = false;      // FFlagDisableCrashTelemetry
+    bool robloxNextVersion = false;   // SFFlagEnableRobloxNextVersionDownload
+    bool updater = true;              // FFlagDisableUpdater, which only this machine may set
+    bool followPromotedBuild = false; // SFFlagEnableChannelPromotion
     // How many of the Roblox installer's downloads run at once. 1 when the flag that
     // enables them is off, so the switch is "parallel or not" and the number is "how much".
     int robloxInstallerWorkers = 1;
     // What the server says the current documents are. Empty when it said nothing, which
     // is an install that has never reached the server and must not be nagged.
-    std::string privacyPolicyVersion;  // tbxStringPrivacyPolicyVersion
-    std::string termsOfUseVersion;     // tbxStringTermsOfUseVersion
+    std::string privacyPolicyVersion;  // SFStringPrivacyPolicyVersion
+    std::string termsOfUseVersion;     // SFStringTermsOfUseVersion
 };
 
 // Valid once initLauncherFlags() has run. Reading it before that answers the compiled-in

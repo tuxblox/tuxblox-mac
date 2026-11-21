@@ -37,7 +37,7 @@ struct FastFlagSet {
 };
 
 // The renderer Roblox is asked to use, in the order the setting offers them. "automatic" is the default and asks for nothing.
-inline constexpr const char* kGraphicsChoices[] = {"automatic", "d3d11", "vulkan", "opengl"};
+inline constexpr const char* kGraphicsChoices[] = {"automatic", "metal", "vulkan", "opengl"};
 
 struct Settings {
     // Space-separated "VAR=VALUE" pairs.

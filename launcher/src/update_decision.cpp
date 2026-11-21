@@ -17,11 +17,21 @@
 #include "update_decision.h"
 
 #include "release_file.h"
+#include "version.h"
 
 
 namespace tuxblox {
 
 namespace {
+
+// The installer is a tool fetched to apply an update rather than part of the running install, and
+// ensureInstallerBinary() checks it against the release before running it, so its release says
+// nothing about whether this install is whole. A Flatpak carries no interface libraries either.
+bool carriedHere(const std::string& name) {
+    if (name == "installer") return false;
+    if constexpr (kFlatpakBuild) return name != "libtuxblox";
+    return true;
+}
 
 // By the names TuxBlox uses everywhere else, not by the keys the release file happens to use:
 // this ends up on a terminal and in bug reports.
@@ -84,6 +94,7 @@ UpdateDecision decideUpdate(const InstallState& state, const std::string& namedR
     // all of them name the same one. A component that is absent, or that cannot be asked, is as
     // much a half-applied update as one naming a different release.
     for (const std::string& name : componentNames()) {
+        if (!carriedHere(name)) continue;
         const auto installed = state.installedIdentities.find(name);
         if (installed == state.installedIdentities.end() ||
             installed->second != state.installedRelease) {

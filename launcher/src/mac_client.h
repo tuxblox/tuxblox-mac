@@ -16,6 +16,7 @@
 
 #pragma once
 #include <cstdint>
+#include "lnk_resolver.h"
 #include <functional>
 #include <string>
 #include <vector>
@@ -37,21 +38,24 @@ struct EnsureResult {
 };
 
 // Root for the macOS Player build, kept apart from the Windows prefix and
-// its version scanner: <install>/mac-client/player.
-std::string playerRoot(const std::string& installDir);
+// its version scanner: <install>/runtime/player.
+std::string clientRoot(const std::string& installDir, LaunchTarget target);
 
 // The build named by the current marker, if it is still complete. Does not
 // contact the network and does not check the signature again; use
 // integrityIntact() for that.
-bool installedBuild(const std::string& installDir, Build& out);
+bool installedBuild(const std::string& installDir, Build& out,
+                    LaunchTarget target = LaunchTarget::Player);
 
 // Cheap check for the UI: a current marker and an executable are enough to
 // say the client has been installed. The full integrity check runs on launch.
-bool hasInstalledClient(const std::string& installDir);
+bool hasInstalledClient(const std::string& installDir,
+                        LaunchTarget target = LaunchTarget::Player);
 
 // Compares the installed bundle with the manifest written at installation.
 // Anything added, removed or changed refuses the build.
-bool integrityIntact(const std::string& installDir);
+bool integrityIntact(const std::string& installDir,
+                     LaunchTarget target = LaunchTarget::Player);
 
 // Fetches the current version from Roblox, downloads the bundle from the
 // setup CDN and verifies its signature before replacing anything. On any
@@ -59,24 +63,26 @@ bool integrityIntact(const std::string& installDir);
 // the client: the only file written inside it afterwards is
 // ClientAppSettings.json, through writeAppSettings().
 EnsureResult ensureCurrent(const std::string& installDir, const std::string& channel,
-                           const std::function<void(uint64_t, uint64_t)>& onProgress = {});
+                           const std::function<void(uint64_t, uint64_t)>& onProgress = {},
+                           LaunchTarget target = LaunchTarget::Player);
 
 // Writes engine flags inside the bundle. Called on every launch, because a
 // client update replaces the file. Returns an error string, empty on success.
 std::string writeAppSettings(const Build& build, const std::string& settingsJson);
 
 // Where the Rosemary executable is. TUXBLOX_ROSEMARY wins, then the copy
-// beside this install, then "rosemary" on PATH.
+// in this install's compat folder, then "rosemary" on PATH.
 std::string resolveRosemary(const std::string& installDir);
 
 // "run <executable>" plus "-protocolString <link>" when a deep link was
 // supplied. Arguments after the executable belong to the guest.
-std::vector<std::string> playerLaunchArgs(const std::string& executable,
+std::vector<std::string> clientLaunchArgs(const std::string& executable,
                                           const std::string& deepLink);
 
 // Pure helpers, exposed for tests.
 bool validUpload(const std::string& upload);
 std::string setupUrl(const std::string& host, const std::string& channel,
-                     const std::string& upload);
+                     const std::string& upload,
+                     LaunchTarget target = LaunchTarget::Player);
 
 } // namespace tuxblox::macclient

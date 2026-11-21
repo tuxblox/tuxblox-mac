@@ -132,6 +132,8 @@ struct AppSnapshot {
     // The installed macOS build, so Versions can name it. Empty when there is none.
     std::string macClientUpload;
     std::string macClientVersion;
+    bool macStudioInstalled = false;
+    std::string macStudioVersion;
 };
 
 class App {

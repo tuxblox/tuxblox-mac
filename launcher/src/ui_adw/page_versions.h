@@ -63,7 +63,7 @@ private:
     GtkWidget *buildToolbar();
     void buildProgressGroup();
     AdwPreferencesGroup *buildList(List &list, const char *pTitle);
-    void rebuild(List &list, const AppVersions &versions, const std::string &macVersion);
+    void rebuild(List &list, const AppVersions &versions, const std::string &macVersion, const std::string &macUpload);
     GtkWidget *versionRow(LaunchTarget target, const AppVersions &versions, const InstalledVersion &version);
     LaunchTarget selectedTarget() const;
     // Which list is on screen.

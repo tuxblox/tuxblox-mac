@@ -39,10 +39,23 @@ namespace tuxblox::macclient {
 
 namespace {
 
-constexpr const char* kPlayerIdentifier = "com.roblox.RobloxPlayer";
-constexpr const char* kAppName = "RobloxPlayer.app";
-constexpr const char* kExeName = "RobloxPlayer";
-constexpr const char* kZipName = "RobloxPlayer.zip";
+struct Kind {
+    const char* dir;
+    const char* identifier;
+    const char* app;
+    const char* exe;
+    const char* zip;
+    const char* binaryType;
+};
+
+constexpr Kind kPlayer{"player", "com.roblox.RobloxPlayer", "RobloxPlayer.app",
+                       "RobloxPlayer", "RobloxPlayer.zip", "MacPlayer"};
+constexpr Kind kStudio{"studio", "com.Roblox.RobloxStudio", "RobloxStudio.app",
+                       "RobloxStudio", "RobloxStudioApp.zip", "MacStudio"};
+
+const Kind& kindFor(LaunchTarget target) {
+    return target == LaunchTarget::Studio ? kStudio : kPlayer;
+}
 
 const std::array<const char*, 3> kSetupHosts = {{
     "https://setup.rbxcdn.com",
@@ -89,17 +102,18 @@ std::string manifestFor(const fs::path& app) {
     return out;
 }
 
-Build buildAt(const fs::path& root, const std::string& upload, const std::string& version) {
+Build buildAt(const fs::path& root, const std::string& upload, const std::string& version,
+              const Kind& kind) {
     const fs::path dir = root / upload;
-    const fs::path app = dir / kAppName;
+    const fs::path app = dir / kind.app;
     return Build{upload, version, dir.string(), app.string(),
-                 (app / "Contents" / "MacOS" / kExeName).string()};
+                 (app / "Contents" / "MacOS" / kind.exe).string()};
 }
 
 } // namespace
 
-std::string playerRoot(const std::string& installDir) {
-    return (fs::path(installDir) / "mac-client" / "player").string();
+std::string clientRoot(const std::string& installDir, LaunchTarget target) {
+    return (fs::path(installDir) / "runtime" / kindFor(target).dir).string();
 }
 
 bool validUpload(const std::string& upload) {
@@ -110,37 +124,37 @@ bool validUpload(const std::string& upload) {
 }
 
 std::string setupUrl(const std::string& host, const std::string& channel,
-                     const std::string& upload) {
+                     const std::string& upload, LaunchTarget target) {
     std::string base = host;
     while (!base.empty() && base.back() == '/') base.pop_back();
     if (!channel.empty() && channel != "live" && channel != "production")
         base += "/channel/" + channel + "/common";
-    return base + "/mac/" + upload + "-" + kZipName;
+    return base + "/mac/" + upload + "-" + kindFor(target).zip;
 }
 
-bool installedBuild(const std::string& installDir, Build& out) {
-    const fs::path root(playerRoot(installDir));
+bool installedBuild(const std::string& installDir, Build& out, LaunchTarget target) {
+    const fs::path root(clientRoot(installDir, target));
     const std::string marker = readFirstLines(root / "current", 2);
     std::istringstream in(marker);
     std::string upload, version;
     if (!std::getline(in, upload) || !std::getline(in, version)) return false;
     if (!validUpload(upload)) return false;
-    const Build build = buildAt(root, upload, version);
+    const Build build = buildAt(root, upload, version, kindFor(target));
     std::error_code ec;
     if (!fs::is_regular_file(build.exe, ec) || ec) return false;
     out = build;
     return true;
 }
 
-bool hasInstalledClient(const std::string& installDir) {
+bool hasInstalledClient(const std::string& installDir, LaunchTarget target) {
     Build build;
-    return installedBuild(installDir, build);
+    return installedBuild(installDir, build, target);
 }
 
-bool integrityIntact(const std::string& installDir) {
+bool integrityIntact(const std::string& installDir, LaunchTarget target) {
     Build build;
-    if (!installedBuild(installDir, build)) return false;
-    const fs::path root(playerRoot(installDir));
+    if (!installedBuild(installDir, build, target)) return false;
+    const fs::path root(clientRoot(installDir, target));
     std::ifstream saved(root / (build.upload + ".integrity"));
     if (!saved) return false;
     std::set<std::string> expected;
@@ -162,9 +176,9 @@ namespace {
 // whole point of the order is that nothing replaces an installed build until
 // the new one has been verified.
 bool fetchVersion(const std::string& channel, std::string& upload, std::string& version,
-                  std::string& error) {
+                  std::string& error, const Kind& kind) {
     try {
-        const std::string json = fetchClientVersionJson("MacPlayer", normalizeChannel(channel));
+        const std::string json = fetchClientVersionJson(kind.binaryType, normalizeChannel(channel));
         upload = parseClientVersionHash(json);
         version = parseClientVersionNumber(json);
     } catch (const std::exception& e) {
@@ -179,11 +193,13 @@ bool fetchVersion(const std::string& channel, std::string& upload, std::string& 
 }
 
 bool downloadZip(const fs::path& root, const std::string& channel, const std::string& upload,
-                 const std::function<void(uint64_t, uint64_t)>& onProgress, std::string& error) {
+                 const std::function<void(uint64_t, uint64_t)>& onProgress, std::string& error,
+                 LaunchTarget target) {
     const fs::path zip = root / (upload + ".zip");
     for (const char* host : kSetupHosts) {
         const DownloadOutcome outcome = downloadFile(
-            setupUrl(host, normalizeChannel(channel), upload), zip.string(), onProgress, nullptr);
+            setupUrl(host, normalizeChannel(channel), upload, target), zip.string(), onProgress,
+            nullptr);
         std::error_code ec;
         if (outcome.result == DownloadResult::Ok && fs::is_regular_file(zip, ec) &&
             fs::file_size(zip, ec) > 0)
@@ -194,7 +210,7 @@ bool downloadZip(const fs::path& root, const std::string& channel, const std::st
 }
 
 bool stageAndVerify(const fs::path& root, const std::string& upload, const std::string& version,
-                    Build& staged, std::string& error) {
+                    Build& staged, std::string& error, const Kind& kind) {
     std::error_code ec;
     const fs::path staging = root / (upload + ".partial");
     fs::remove_all(staging, ec);
@@ -213,9 +229,9 @@ bool stageAndVerify(const fs::path& root, const std::string& upload, const std::
 
     // extractZip puts RobloxPlayer.app directly in staging; the upload-named
     // parent is only added when staging is renamed into place later.
-    const fs::path app = staging / kAppName;
+    const fs::path app = staging / kind.app;
     staged = Build{upload, version, staging.string(), app.string(),
-                   (app / "Contents" / "MacOS" / kExeName).string()};
+                   (app / "Contents" / "MacOS" / kind.exe).string()};
     auto refuse = [&](const std::string& why) {
         fs::remove_all(staging, ec);
         error = why;
@@ -223,7 +239,7 @@ bool stageAndVerify(const fs::path& root, const std::string& upload, const std::
     };
     if (!fs::is_regular_file(app / "Contents" / "Info.plist"))
         return refuse("the downloaded bundle has no Info.plist");
-    const std::string reason = verifyAppSignature(staged.app, kPlayerIdentifier);
+    const std::string reason = verifyAppSignature(staged.app, kind.identifier);
     if (!reason.empty()) return refuse("client signature refused: " + reason);
     return true;
 }
@@ -259,20 +275,22 @@ void removeStaleBuilds(const fs::path& root, const std::string& upload) {
 } // namespace
 
 EnsureResult ensureCurrent(const std::string& installDir, const std::string& channel,
-                           const std::function<void(uint64_t, uint64_t)>& onProgress) {
+                           const std::function<void(uint64_t, uint64_t)>& onProgress,
+                           LaunchTarget target) {
     EnsureResult result;
-    const fs::path root(playerRoot(installDir));
+    const Kind& kind = kindFor(target);
+    const fs::path root(clientRoot(installDir, target));
     std::string error;
 
     std::string upload, version;
-    if (!fetchVersion(channel, upload, version, error)) {
+    if (!fetchVersion(channel, upload, version, error, kind)) {
         result.error = error;
         return result;
     }
 
     Build current;
-    if (installedBuild(installDir, current) && current.upload == upload &&
-        current.version == version && integrityIntact(installDir)) {
+    if (installedBuild(installDir, current, target) && current.upload == upload &&
+        current.version == version && integrityIntact(installDir, target)) {
         result.ok = true;
         result.build = current;
         return result;
@@ -285,12 +303,12 @@ EnsureResult ensureCurrent(const std::string& installDir, const std::string& cha
         return result;
     }
 
-    if (!downloadZip(root, channel, upload, onProgress, error)) {
+    if (!downloadZip(root, channel, upload, onProgress, error, target)) {
         result.error = error;
         return result;
     }
     Build staged;
-    if (!stageAndVerify(root, upload, version, staged, error)) {
+    if (!stageAndVerify(root, upload, version, staged, error, kind)) {
         result.error = error;
         return result;
     }
@@ -301,7 +319,7 @@ EnsureResult ensureCurrent(const std::string& installDir, const std::string& cha
     removeStaleBuilds(root, upload);
 
     result.ok = true;
-    result.build = buildAt(root, upload, version);
+    result.build = buildAt(root, upload, version, kind);
     return result;
 }
 
@@ -321,7 +339,7 @@ std::string writeAppSettings(const Build& build, const std::string& settingsJson
 std::string resolveRosemary(const std::string& installDir) {
     if (const char* env = std::getenv("TUXBLOX_ROSEMARY"))
         if (*env != '\0') return env;
-    const fs::path beside = fs::path(installDir) / "rosemary" / "rosemary";
+    const fs::path beside = fs::path(installDir) / "compat" / "rosemary";
     std::error_code ec;
     if (fs::is_regular_file(beside, ec) &&
         (fs::status(beside, ec).permissions() & fs::perms::owner_exec) != fs::perms::none)
@@ -329,7 +347,7 @@ std::string resolveRosemary(const std::string& installDir) {
     return "rosemary";
 }
 
-std::vector<std::string> playerLaunchArgs(const std::string& executable,
+std::vector<std::string> clientLaunchArgs(const std::string& executable,
                                           const std::string& deepLink) {
     std::vector<std::string> args{"run", executable};
     if (!deepLink.empty()) {

@@ -1,45 +1,17 @@
-# The one build image. Everything TuxBlox builds is built in here: the layer, the launcher, the
-# installer, the Studio MCP gateway, the shared libraries and the GTK interface stack.
-#
-# One image because the layer needs this SDK specifically and nothing else needs a different one.
-# Only this SDK carries the mingw-w64 cross compilers the layer configures with (--with-mingw=gcc);
-# the plain steamrt sniper SDK does not. Everything else either already had what it needed in here
-# or wanted three more packages, so a second base bought nothing but another multi-gigabyte pull.
-#
-# Valve build Proton in the steamrt4 SDK (Debian 13, glibc 2.41) because real
-# Proton runs inside the Steam runtime container, which carries that glibc with
-# it. TuxBlox runs the layer straight on the user's system, so the glibc it is
-# built against becomes a hard requirement on everybody's machine -- 2.41 left
-# every Ubuntu 22.04, Mint 21, RHEL 9 and Debian 11 install unable to start
-# wineserver at all. Sniper is Debian 11 (glibc 2.31) with the same gcc 14.2
-# and mingw-w64 14.2 the steamrt4 SDK has, so the floor drops without changing
-# compilers.
 FROM registry.gitlab.steamos.cloud/proton/sniper/sdk:3.0.20250519.130773-0
 
-# sniper ships meson 1.0.1; gstreamer needs 1.4 and gst-orc needs 1.3.
 ARG MESON_VERSION=1.7.0
 RUN curl -sSfL "https://github.com/mesonbuild/meson/releases/download/${MESON_VERSION}/meson-${MESON_VERSION}.tar.gz" \
         | tar -xz -C /opt \
     && ln -sf "/opt/meson-${MESON_VERSION}/meson.py" /usr/local/bin/meson \
     && meson --version
 
-# libsoup's dependencies. The steamrt4 SDK carries these; sniper does not, and
-# a missing one fails the configure step outright rather than degrading. Both
-# architectures, because the layer is built 32- and 64-bit.
 RUN dpkg --add-architecture i386 && apt-get update && apt-get install -y --no-install-recommends \
         libsqlite3-dev libsqlite3-dev:i386 \
         libpsl-dev libpsl-dev:i386 \
         libbrotli-dev libbrotli-dev:i386 \
     && rm -rf /var/lib/apt/lists/*
 
-# nghttp2's headers, unpacked rather than installed. Two Debian 11 facts get in
-# the way of `apt-get install libnghttp2-dev`: it is not Multi-Arch: same there
-# (Debian 13's, which the steamrt4 SDK uses, is), so the two architectures'
-# -dev packages refuse to co-exist; and bullseye-security still indexes
-# 1.43.0-1+deb11u3 while no longer carrying the file, so apt's own candidate
-# 404s. The runtime library is already in the image for both architectures and
-# the headers are architecture-independent, so unpacking the bullseye -dev
-# package and writing a .pc per architecture gives both builds what they need.
 RUN set -eu; \
     apt-get update; \
     cd /tmp; \
@@ -55,13 +27,6 @@ RUN set -eu; \
     done; \
     rm -rf /tmp/nghttp2 /tmp/libnghttp2-dev_*.deb /var/lib/apt/lists/*
 
-# glib 2.70. libsoup 3.7.1 needs it (GTlsProtocolVersion and
-# G_URI_FLAGS_SCHEME_NORMALIZE arrived in 2.70 and 2.68), and Debian 11 carries
-# 2.66. 2.70.5 is the lowest version that satisfies libsoup, which matters
-# because glib is NOT shipped inside the layer: gstreamer and libsoup resolve
-# it from the user's own system at run time, so whatever is built against here
-# becomes a second floor. The steamrt4 SDK's 2.84 put that floor above every
-# distro older than Ubuntu 24.04.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libffi-dev libffi-dev:i386 \
         libpcre3-dev libpcre3-dev:i386 \
@@ -71,11 +36,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gettext \
     && rm -rf /var/lib/apt/lists/*
 
-# Wayland, for Wine's second display backend and for GTK. Wine falls back to it when there is no X
-# display to open, and the interface stack is built in here too, where GTK silently drops its
-# Wayland backend when these are missing, leaving a stack that looks fine and is quietly X11-only.
-# Do not remove them: the layer's post-build check and the Makefile's UI_BUILD both fail over it.
-# wayland-protocols is not needed, only wayland-scanner (libwayland-bin) to compile protocol XML.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libwayland-dev libwayland-dev:i386 \
         libwayland-bin \
@@ -116,9 +76,18 @@ RUN set -eu; \
     pkg-config --modversion glib-2.0; \
     PKG_CONFIG_LIBDIR=/usr/lib/i386-linux-gnu/pkgconfig pkg-config --modversion glib-2.0
 
-# The things nothing else in here already provides: patchelf rewrites the interface stack's
-# RPATHs, sassc and rsvg-convert build its stylesheets and icons, and librsvg2-dev supplies the
-# pkg-config file GTK's SVG support needs when the stack is built from source.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         patchelf sassc librsvg2-bin librsvg2-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# The base image's cargo predates Rosemary's 2024 edition.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+ARG RUST_CHANNEL=1.100.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libcurl4-openssl-dev zlib1g-dev libxkbcommon-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain $RUST_CHANNEL \
+    && rustc --version && cargo --version

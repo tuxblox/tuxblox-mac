@@ -54,22 +54,22 @@ int main() {
 
     // Pinned here rather than written as literals below: these change whenever the
     // policy does, and a test that breaks on a policy bump is a test nobody trusts.
-    const std::string kCompiledInPolicy = flagString("tbxStringPrivacyPolicyVersion");
-    const std::string kCompiledInTerms = flagString("tbxStringTermsOfUseVersion");
+    const std::string kCompiledInPolicy = flagString("SFStringPrivacyPolicyVersion");
+    const std::string kCompiledInTerms = flagString("SFStringTermsOfUseVersion");
 
     // Read before anything is initialised: the compiled-in defaults answer. Some code
     // will read a flag earlier than anyone planned, and it must not see an empty table.
     {
         assert(!kCompiledInPolicy.empty());
-        assert(!flagString("tbxStringPrivacyPolicyVersion").empty());
+        assert(!flagString("SFStringPrivacyPolicyVersion").empty());
     }
 
     // A name no source defines reads the same as "defined and off". An offline install
     // whose defaults predate a flag cannot tell those two apart, so nor may a caller.
     {
-        assert(flagBool("tbxFlagNobodyDefines") == false);
-        assert(flagInt("tbxIntNobodyDefines") == 0);
-        assert(flagString("tbxStringNobodyDefines").empty());
+        assert(flagBool("SFFlagNobodyDefines") == false);
+        assert(flagInt("SFIntNobodyDefines") == 0);
+        assert(flagString("SFStringNobodyDefines").empty());
     }
 
     // No recorded release means no request at all -- that is every local run out of build/.
@@ -78,7 +78,7 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_norelease", nullptr), "stable", false, 5,
                   [&](const std::string&, int) { asked = true; return std::string(); });
-        (void)flagBool("tbxFlagDisableUpdater");
+        (void)flagBool("FFlagDisableUpdater");
         assert(!asked);
     }
 
@@ -88,7 +88,7 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_url", nullptr), "canary", true, 5,
                   [&](const std::string& url, int) { seen = url; return std::string("{}"); });
-        (void)flagBool("tbxFlagDisableUpdater");
+        (void)flagBool("FFlagDisableUpdater");
         assert(seen == clientFlagsUrl("canary", "x86_64"));
     }
 
@@ -97,11 +97,11 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_server", nullptr), "stable", true, 5,
                   [](const std::string&, int) {
-                      return std::string(R"({"tbxStringPrivacyPolicyVersion":"2030-01-01"})");
+                      return std::string(R"({"SFStringPrivacyPolicyVersion":"2030-01-01"})");
                   });
-        assert(flagString("tbxStringPrivacyPolicyVersion") == "2030-01-01");
+        assert(flagString("SFStringPrivacyPolicyVersion") == "2030-01-01");
         // A flag the answer did not mention keeps its compiled-in value.
-        assert(flagString("tbxStringTermsOfUseVersion") == kCompiledInTerms);
+        assert(flagString("SFStringTermsOfUseVersion") == kCompiledInTerms);
     }
 
     // The server may not set a local-only flag, whatever it sends.
@@ -109,51 +109,31 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_localonly", nullptr), "stable", true, 5,
                   [](const std::string&, int) {
-                      return std::string(R"({"tbxFlagDisableUpdater":true})");
+                      return std::string(R"({"FFlagDisableUpdater":true})");
                   });
-        assert(flagBool("tbxFlagDisableUpdater") == false);
-    }
-
-    // The client-runtime switch is local-only too: the server cannot move an install
-    // onto the experimental path, whatever it sends.
-    {
-        resetFlags();
-        initFlags(rootWith("tuxblox_test_flags_macclient_server", nullptr), "stable", true, 5,
-                  [](const std::string&, int) {
-                      return std::string(R"({"tbxFlagEnableExperimentalMacClient":true})");
-                  });
-        assert(flagBool("tbxFlagEnableExperimentalMacClient") == false);
-    }
-
-    // The install's own flags.json can turn it on.
-    {
-        resetFlags();
-        initFlags(rootWith("tuxblox_test_flags_macclient_local",
-                           R"({"tbxFlagEnableExperimentalMacClient":true})"),
-                  "stable", true, 5, [](const std::string&, int) { return std::string("{}"); });
-        assert(flagBool("tbxFlagEnableExperimentalMacClient") == true);
+        assert(flagBool("FFlagDisableUpdater") == false);
     }
 
     // flags.json wins over the server, per key.
     {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_override",
-                           R"({"tbxStringPrivacyPolicyVersion":"2040-01-01"})"),
+                           R"({"SFStringPrivacyPolicyVersion":"2040-01-01"})"),
                   "stable", true, 5,
                   [](const std::string&, int) {
-                      return std::string(R"({"tbxStringPrivacyPolicyVersion":"2030-01-01",)"
-                                         R"("tbxStringTermsOfUseVersion":"2031-01-01"})");
+                      return std::string(R"({"SFStringPrivacyPolicyVersion":"2030-01-01",)"
+                                         R"("SFStringTermsOfUseVersion":"2031-01-01"})");
                   });
-        assert(flagString("tbxStringPrivacyPolicyVersion") == "2040-01-01");  // the file
-        assert(flagString("tbxStringTermsOfUseVersion") == "2031-01-01");     // the server
+        assert(flagString("SFStringPrivacyPolicyVersion") == "2040-01-01");  // the file
+        assert(flagString("SFStringTermsOfUseVersion") == "2031-01-01");     // the server
     }
 
     // And flags.json MAY set a local-only flag -- that is the whole point of it.
     {
         resetFlags();
-        initFlags(rootWith("tuxblox_test_flags_localfile", R"({"tbxFlagDisableUpdater":true})"),
+        initFlags(rootWith("tuxblox_test_flags_localfile", R"({"FFlagDisableUpdater":true})"),
                   "stable", true, 5, [](const std::string&, int) { return std::string("{}"); });
-        assert(flagBool("tbxFlagDisableUpdater") == true);
+        assert(flagBool("FFlagDisableUpdater") == true);
     }
 
     // Read before anything has loaded the flags, which is where the requirements check asks: the
@@ -162,30 +142,30 @@ int main() {
     {
         resetFlags();
         const std::string root =
-            rootWith("tuxblox_test_flags_offline", R"({"tbxFlagBypassSystemRequirements":true})");
-        assert(flagBoolOffline(root, "tbxFlagBypassSystemRequirements") == true);
+            rootWith("tuxblox_test_flags_offline", R"({"FFlagBypassSystemRequirements":true})");
+        assert(flagBoolOffline(root, "FFlagBypassSystemRequirements") == true);
         assert(flagBoolOffline(rootWith("tuxblox_test_flags_offline_plain", nullptr),
-                               "tbxFlagBypassSystemRequirements") == false);
+                               "FFlagBypassSystemRequirements") == false);
         // No install directory at all, which is a launcher that cannot work out where it lives.
-        assert(flagBoolOffline("", "tbxFlagBypassSystemRequirements") == false);
-        assert(flagBoolOffline(root, "tbxFlagNobodyDefines") == false);
+        assert(flagBoolOffline("", "FFlagBypassSystemRequirements") == false);
+        assert(flagBoolOffline(root, "SFFlagNobodyDefines") == false);
 
         initFlags(root, "stable", true, 5, [](const std::string&, int) {
-            return std::string(R"({"tbxStringPrivacyPolicyVersion":"2033-01-01"})");
+            return std::string(R"({"SFStringPrivacyPolicyVersion":"2033-01-01"})");
         });
-        assert(flagString("tbxStringPrivacyPolicyVersion") == "2033-01-01");
+        assert(flagString("SFStringPrivacyPolicyVersion") == "2033-01-01");
     }
 
     // A malformed flags.json is ignored WHOLE, not half-applied.
     {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_badfile",
-                           R"({"tbxStringPrivacyPolicyVersion":"2040-01-01",)"),
+                           R"({"SFStringPrivacyPolicyVersion":"2040-01-01",)"),
                   "stable", true, 5,
                   [](const std::string&, int) {
-                      return std::string(R"({"tbxStringPrivacyPolicyVersion":"2030-01-01"})");
+                      return std::string(R"({"SFStringPrivacyPolicyVersion":"2030-01-01"})");
                   });
-        assert(flagString("tbxStringPrivacyPolicyVersion") == "2030-01-01");
+        assert(flagString("SFStringPrivacyPolicyVersion") == "2030-01-01");
     }
 
     // A flags.json that is not an object changes nothing.
@@ -193,7 +173,7 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_arrayfile", "[1,2,3]"), "stable", true, 5,
                   [](const std::string&, int) { return std::string("{}"); });
-        assert(!flagString("tbxStringPrivacyPolicyVersion").empty());
+        assert(!flagString("SFStringPrivacyPolicyVersion").empty());
     }
 
     // A fetch that fails leaves the lower sources answering, and does not throw.
@@ -203,7 +183,7 @@ int main() {
                   [](const std::string&, int) -> std::string {
                       throw std::runtime_error("no route to host");
                   });
-        assert(!flagString("tbxStringPrivacyPolicyVersion").empty());
+        assert(!flagString("SFStringPrivacyPolicyVersion").empty());
     }
 
     // A value does not change between two reads in one run.
@@ -213,10 +193,10 @@ int main() {
         initFlags(rootWith("tuxblox_test_flags_sealed", nullptr), "stable", true, 5,
                   [&](const std::string&, int) {
                       calls++;
-                      return std::string(R"({"tbxStringTermsOfUseVersion":"2031-01-01"})");
+                      return std::string(R"({"SFStringTermsOfUseVersion":"2031-01-01"})");
                   });
-        const std::string first = flagString("tbxStringTermsOfUseVersion");
-        const std::string second = flagString("tbxStringTermsOfUseVersion");
+        const std::string first = flagString("SFStringTermsOfUseVersion");
+        const std::string second = flagString("SFStringTermsOfUseVersion");
         assert(first == second);
         assert(calls == 1);   // sealed: the second read asks nobody
     }
@@ -227,7 +207,7 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_budget", nullptr), "stable", true, 2,
                   [&](const std::string&, int seconds) { budget = seconds; return std::string("{}"); });
-        (void)flagBool("tbxFlagDisableUpdater");
+        (void)flagBool("FFlagDisableUpdater");
         assert(budget == 2);
     }
 
@@ -295,21 +275,21 @@ int main() {
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_reinit", nullptr), "stable", true, 5,
                   [](const std::string&, int) { return std::string("{}"); });
-        const std::string before = flagString("tbxStringPrivacyPolicyVersion");
+        const std::string before = flagString("SFStringPrivacyPolicyVersion");
 
         initFlags(rootWith("tuxblox_test_flags_reinit2", nullptr), "stable", true, 5,
                   [](const std::string&, int) {
-                      return std::string(R"({"tbxStringPrivacyPolicyVersion":"2030-01-01"})");
+                      return std::string(R"({"SFStringPrivacyPolicyVersion":"2030-01-01"})");
                   });
-        assert(flagString("tbxStringPrivacyPolicyVersion") == before);
+        assert(flagString("SFStringPrivacyPolicyVersion") == before);
 
         // Asking explicitly is still allowed -- that is a decision, not an accident.
         resetFlags();
         initFlags(rootWith("tuxblox_test_flags_reinit3", nullptr), "stable", true, 5,
                   [](const std::string&, int) {
-                      return std::string(R"({"tbxStringPrivacyPolicyVersion":"2030-01-01"})");
+                      return std::string(R"({"SFStringPrivacyPolicyVersion":"2030-01-01"})");
                   });
-        assert(flagString("tbxStringPrivacyPolicyVersion") == "2030-01-01");
+        assert(flagString("SFStringPrivacyPolicyVersion") == "2030-01-01");
         resetFlags();
     }
 

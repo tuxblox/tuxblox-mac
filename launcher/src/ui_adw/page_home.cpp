@@ -382,10 +382,6 @@ void HomePage::setUpdateState(const std::string &text, const std::string &styleC
 }
 
 void HomePage::update(const AppSnapshot &snap) {
-    // The macOS backend has no Windows version hash: when it is enabled the
-    // Player card is ready even though the Windows version list is empty, and
-    // the flag that gates the unfinished Windows Player must not hold it back.
-    const bool macBackend = launcherFlags().macClient;
     const bool playerPending =
         snap.launchPending && snap.launchTarget == LaunchTarget::Player;
     const bool studioPending =
@@ -395,13 +391,13 @@ void HomePage::update(const AppSnapshot &snap) {
     const std::string macVersion = snap.macClientVersion.empty()
                                        ? std::string()
                                        : snap.macClientVersion + " \xC2\xB7 live";
-    setCard(player_, macBackend ? snap.macClientInstalled
-                                : !snap.versions.player.activeHash.empty(),
-            macBackend ? macVersion : versionLabel(snap.versions.player),
-            snap.sessions.player, snap.stoppingPlayer, playerPending,
-            macBackend || launcherFlags().playerButton);
-    setCard(studio_, !snap.versions.studio.activeHash.empty(), versionLabel(snap.versions.studio),
-            snap.sessions.studio, snap.stoppingStudio, studioPending, launcherFlags().playerButton);
+    setCard(player_, snap.macClientInstalled, macVersion,
+            snap.sessions.player, snap.stoppingPlayer, playerPending, true);
+    const std::string studioVersion = snap.macStudioVersion.empty()
+                                          ? std::string()
+                                          : snap.macStudioVersion + " \xC2\xB7 live";
+    setCard(studio_, snap.macStudioInstalled, studioVersion,
+            snap.sessions.studio, snap.stoppingStudio, studioPending, true);
 
     // A Flatpak fetches its own compatibility layer, and one that does not match this release is
     // no use: after a flatpak update the layer on disk belongs to the release before it. So the
@@ -458,8 +454,9 @@ void HomePage::update(const AppSnapshot &snap) {
     if (checking) {
         setUpdateState(i18n::tr("Checking…"), "dim-label");
     } else if (snap.updateAvailableVersion) {
-        // Nothing: the button is the message, and the release it offers is named in the dialog.
-        setUpdateState("", "warning");
+        // Nothing: the button is the message, and the release it offers is named in the dialog. A
+        // Flatpak has no button, so the strip has to say it rather than going blank.
+        setUpdateState(kFlatpakBuild ? i18n::tr("Update available") : "", "warning");
     } else {
         setUpdateState(i18n::tr("Up to date"), "success");
     }

@@ -52,13 +52,13 @@ int main() {
     }
 
     {
-        const auto args = playerLaunchArgs("/opt/game/RobloxPlayer", "roblox-player://join?ticket=x");
+        const auto args = clientLaunchArgs("/opt/game/RobloxPlayer", "roblox-player://join?ticket=x");
         assert(args.size() == 4);
         assert(args[0] == "run");
         assert(args[1] == "/opt/game/RobloxPlayer");
         assert(args[2] == "-protocolString");
         assert(args[3] == "roblox-player://join?ticket=x");
-        assert(playerLaunchArgs("/opt/game/RobloxPlayer", "").size() == 2);
+        assert(clientLaunchArgs("/opt/game/RobloxPlayer", "").size() == 2);
     }
 
     // An install with no marker has nothing to reuse and no integrity.
@@ -69,7 +69,10 @@ int main() {
         Build out;
         assert(!installedBuild(root.string(), out));
         assert(!integrityIntact(root.string()));
-        assert(playerRoot(root.string()) == (root / "mac-client" / "player").string());
+        assert(clientRoot(root.string(), tuxblox::LaunchTarget::Player) ==
+               (root / "runtime" / "player").string());
+        assert(clientRoot(root.string(), tuxblox::LaunchTarget::Studio) ==
+               (root / "runtime" / "studio").string());
         fs::remove_all(root);
     }
 
@@ -100,16 +103,16 @@ int main() {
         std::ofstream(proc / "4242" / "stat") << statLine;
         std::ofstream(proc / "4242" / "environ", std::ios::binary)
             << std::string("TUXBLOX_MAC_CLIENT=1", 20) << '\0'
-            << "ROSEMARY_PREFIX=/tmp/tuxblox_test_mac_install/mac-client/prefix" << '\0';
+            << "ROSEMARY_PREFIX=/tmp/tuxblox_test_mac_install/runtime/prefix" << '\0';
         const std::string cmdline =
             std::string("rosemary", 8) + '\0' + "run" + '\0' +
-            "/tmp/tuxblox_test_mac_install/mac-client/player/version-abc/"
+            "/tmp/tuxblox_test_mac_install/runtime/player/version-abc/"
             "RobloxPlayer.app/Contents/MacOS/RobloxPlayer" + '\0';
         std::ofstream(proc / "4242" / "cmdline", std::ios::binary)
             .write(cmdline.data(), static_cast<std::streamsize>(cmdline.size()));
         std::ofstream(proc / "4243" / "environ", std::ios::binary)
             << std::string("TUXBLOX_MAC_CLIENT=1", 20) << '\0'
-            << "ROSEMARY_PREFIX=/tmp/another-install/mac-client/prefix" << '\0';
+            << "ROSEMARY_PREFIX=/tmp/another-install/runtime/prefix" << '\0';
 
         const auto sessions = tuxblox::macSessionsIn(proc.string(), install.string());
         assert(sessions.size() == 1);

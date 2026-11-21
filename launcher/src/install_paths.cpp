@@ -45,15 +45,9 @@ std::string installDir() {
         fprintf(stderr, "TuxBlox: ignoring TUXBLOX_ROOT, it is not an absolute path: %s\n", root);
     }
 
-    const std::string self = selfExePath();
-    const std::size_t slash = self.rfind('/');
-    if (slash != std::string::npos && slash > 0) {
-        return self.substr(0, slash);
-    }
-
     const char* home = std::getenv("HOME");
     if (!home || home[0] == '\0') {
-        throw std::runtime_error("installDir: /proc/self/exe is unreadable and HOME is not set");
+        throw std::runtime_error("installDir: HOME is not set");
     }
     return std::string(home) + "/.tuxblox";
 }

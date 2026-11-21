@@ -111,9 +111,9 @@ bool bypassSystemRequirements() {
     } catch (...) {
         // No install directory is no flags.json, which is not a reason to start on a system that cannot run.
     }
-    if (!tuxblox::flagBoolOffline(dir, "tbxFlagBypassSystemRequirements")) return false;
+    if (!tuxblox::flagBoolOffline(dir, "FFlagBypassSystemRequirements")) return false;
     // Said out loud, because a report from a machine that does not meet a requirement has to say so.
-    fprintf(stderr, "TuxBlox: tbxFlagBypassSystemRequirements is set, starting on a system that "
+    fprintf(stderr, "TuxBlox: FFlagBypassSystemRequirements is set, starting on a system that "
                     "does not meet every requirement\n");
     return true;
 }

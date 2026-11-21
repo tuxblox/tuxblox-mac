@@ -32,7 +32,7 @@ The release is Player-only. Studio still needs the TuxBlox compatibility layer; 
 
 - Downloads the official macOS Player from Roblox's setup CDN.
 - Verifies the Apple code signature against the pinned Apple Root CA before installing anything.
-- Installs the unmodified bundle under `<install>/mac-client` with a local integrity manifest.
+- Installs the unmodified bundle under `<install>/runtime` with a local integrity manifest.
 - Starts it through Rosemary, with the same launcher, Sessions, settings, Discord Rich Presence and server-region features as TuxBlox.
 - Keeps Studio on the Windows compatibility layer, with no changes to its code path.
 
@@ -57,7 +57,7 @@ The existing `~/.tuxblox/compat` and `~/.tuxblox/libtuxblox` are left untouched 
 ## Requirements
 
 - Linux x86_64.
-- For the Player: Rosemary at `TUXBLOX_ROSEMARY`, `<install>/rosemary/rosemary`, or `rosemary` on `PATH`.
+- For the Player: Rosemary at `TUXBLOX_ROSEMARY`, `<install>/compat/rosemary`, or `rosemary` on `PATH`.
 - For Studio: an existing TuxBlox install (`~/.tuxblox` by default) with `compat/` and `libtuxblox/`.
 - For the build: `git`, `make`, rootless `podman`, `rsvg-convert` (librsvg) and network access. The build container provides GTK4, libadwaita, libcurl, libarchive, OpenSSL, zlib, CMake and Ninja.
 
@@ -99,7 +99,7 @@ To assemble the release artifacts:
 APPIMAGETOOL=/path/to/appimagetool make mac-appimage
 ```
 
-Without `APPIMAGETOOL`, the target still writes the portable `.tar.zst`. Rosemary is downloaded from the pinned release if it is not already under `build/rosemary`.
+Without `APPIMAGETOOL`, the target still writes the portable `.tar.zst`. Rosemary is downloaded from the pinned release if it is not already under `build/native/compat`.
 
 ## Installing the Player only
 
@@ -108,15 +108,14 @@ DIR="$HOME/.local/share/tuxblox-mac"
 mkdir -p "$DIR"
 install -m 755 build/native/TuxBloxLauncher "$DIR/TuxBloxLauncher"
 cp -a build/native/libtuxblox "$DIR/libtuxblox"
-./shared/tools/fetch-rosemary.sh "$DIR/rosemary"
+./shared/tools/fetch-rosemary.sh "$DIR/compat"
 ```
 
-Create `"$DIR/flags.json"` with the local flag before the first start:
+Create `"$DIR/flags.json"` before the first start:
 
 ```json
 {
-  "tbxFlagEnableExperimentalMacClient": true,
-  "tbxFlagDisableUpdater": true
+  "FFlagDisableUpdater": true
 }
 ```
 
@@ -136,22 +135,21 @@ Install the official TuxBlox normally, then put this launcher in its directory:
 install -m 755 build/native/TuxBloxLauncher ~/.tuxblox/TuxBloxLauncher
 ```
 
-Keep the existing `compat/`, `libtuxblox/` and `runtime/` directories. Add the flag to `~/.tuxblox/flags.json`, keeping any entries already there:
+Keep the existing `libtuxblox/` and `runtime/` directories. Add the flag to `~/.tuxblox/flags.json`, keeping any entries already there:
 
 ```json
 {
-  "tbxFlagEnableExperimentalMacClient": true,
-  "tbxFlagDisableUpdater": true
+  "FFlagDisableUpdater": true
 }
 ```
 
-Restart the launcher. Without the first flag the Player card follows TuxBlox's normal state; Studio is unaffected.
+Restart the launcher.
 
-`tbxFlagDisableUpdater` is recommended while this is a separate build: the official updater or installer can replace this launcher with the upstream one. Do not run the official installer over this launcher.
+`FFlagDisableUpdater` is recommended while this is a separate build: the official updater or installer can replace this launcher with the upstream one. Do not run the official installer over this launcher.
 
 ## Updates
 
-The launcher carries TuxBlox's updater. Until it has its own release channel, keep `tbxFlagDisableUpdater` set in `flags.json` while testing.
+The launcher carries TuxBlox's updater. Until it has its own release channel, keep `FFlagDisableUpdater` set in `flags.json` while testing.
 
 Discord Rich Presence and server-region settings are read when a Player session starts. Restart the Player after changing them.
 
@@ -159,7 +157,7 @@ Discord Rich Presence and server-region settings are read when a Player session 
 
 - **Studio says the compatibility layer is missing.** This is the Player-only layout. Install TuxBlox and use its directory if you want Studio.
 - **The Player closes right after opening.** Check that `lms.roblox.com` resolves normally. Some DNS filters return `0.0.0.0` for it; the macOS client cannot finish its login flow without that endpoint. `www.roblox.com` and `clientsettings.roblox.com` being reachable is not enough.
-- **The Player does not start.** Confirm that `<install>/rosemary/rosemary` exists and is executable, or set `TUXBLOX_ROSEMARY` to the binary.
+- **The Player does not start.** Confirm that `<install>/compat/rosemary` exists and is executable, or set `TUXBLOX_ROSEMARY` to the binary.
 
 ## Licensing
 

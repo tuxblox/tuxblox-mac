@@ -42,9 +42,9 @@ if [ "$installed_version" != "$APP_VERSION" ]; then
     mv "$DATA_DIR/TuxBloxLauncher.new" "$DATA_DIR/TuxBloxLauncher"
     rm -rf "$DATA_DIR/libtuxblox.old"
 
-    mkdir -p "$DATA_DIR/rosemary"
-    install -m 755 "$APPDIR/usr/bin/rosemary/rosemary" "$DATA_DIR/rosemary/rosemary.new"
-    mv "$DATA_DIR/rosemary/rosemary.new" "$DATA_DIR/rosemary/rosemary"
+    mkdir -p "$DATA_DIR/compat"
+    install -m 755 "$APPDIR/usr/bin/compat/rosemary" "$DATA_DIR/compat/rosemary.new"
+    mv "$DATA_DIR/compat/rosemary.new" "$DATA_DIR/compat/rosemary"
 
     printf '%s\n' "$APP_VERSION" > "$DATA_DIR/.appimage-version"
 fi
@@ -52,12 +52,11 @@ fi
 if [ ! -e "$DATA_DIR/flags.json" ]; then
     cat > "$DATA_DIR/flags.json" <<'JSON'
 {
-  "tbxFlagEnableExperimentalMacClient": true,
-  "tbxFlagDisableUpdater": true
+  "FFlagDisableUpdater": true
 }
 JSON
 fi
 
 export TUXBLOX_ROOT="$DATA_DIR"
-export TUXBLOX_ROSEMARY="$DATA_DIR/rosemary/rosemary"
+export TUXBLOX_ROSEMARY="$DATA_DIR/compat/rosemary"
 exec "$DATA_DIR/TuxBloxLauncher" "$@"

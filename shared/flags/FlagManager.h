@@ -120,17 +120,17 @@ struct FlagValue {
 
 using FlagTable = std::map<std::string, FlagValue>;
 
-// The type a name declares: tbxFlag is a boolean, tbxString a string, tbxInt an integer.
+// The type a name declares, from a prefix that also says how the flag behaves:
+// an optional S (synchronized, the server may set it), an optional D (dynamic), then F
+// (fast), then Flag for a boolean, String or Int. S before D before F, F always last.
 // Nothing for a name that declares none, which is how an unknown name is refused rather
 // than guessed at.
 std::optional<FlagType> flagTypeForName(const std::string& name);
 
-// True for a flag the server may not set. tbxFlagDisableUpdater is the one that matters:
-// served wrongly it stops every install updating, and updating is how that would be
-// corrected. The client-runtime switch is local-only for the same reason: a server that
-// could flip it would move every install without their say. The list is compiled in and
-// the client filters the server's answer against it, because the server is not trusted
-// to respect its own rule.
+// True for a flag the server may not set, which is every name without an S. The client
+// filters the server's answer itself, because the server is not trusted to respect its
+// own rule. FFlagDisableUpdater is the one that matters: served wrongly it stops every
+// install updating, and updating is how that would be corrected.
 bool isLocalOnlyFlag(const std::string& name);
 
 // The flags in a JSON object, dropping any whose value contradicts its name, any name

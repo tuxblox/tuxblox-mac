@@ -68,7 +68,7 @@ std::vector<Session> liveSessionsIn(const std::string& procRoot, const std::stri
 std::vector<Session> macSessionsIn(const std::string& procRoot, const std::string& installDir) {
     std::vector<Session> sessions;
     const std::string wantedPrefix =
-        (std::filesystem::path(installDir) / "mac-client" / "prefix").string();
+        (std::filesystem::path(installDir) / "runtime" / "prefix").string();
     const pid_t self = ::getpid();
     std::error_code ec;
     std::filesystem::directory_iterator it(procRoot, ec), end;
@@ -94,14 +94,22 @@ std::vector<Session> macSessionsIn(const std::string& procRoot, const std::strin
         std::ifstream cmdlineFile(it->path() / "cmdline", std::ios::binary);
         std::istreambuf_iterator<char> cmdFirst(cmdlineFile), cmdLast;
         const std::string cmdline(cmdFirst, cmdLast);
-        const std::string clientRoot =
-            (std::filesystem::path(installDir) / "mac-client" / "player").string();
-        if (cmdline.find(clientRoot) == std::string::npos ||
-            cmdline.find("RobloxPlayer.app/Contents/MacOS/RobloxPlayer") == std::string::npos)
+        const std::filesystem::path runtime = std::filesystem::path(installDir) / "runtime";
+        LaunchTarget target;
+        if (cmdline.find((runtime / "player").string()) != std::string::npos &&
+            cmdline.find("RobloxPlayer.app/Contents/MacOS/RobloxPlayer") != std::string::npos) {
+            target = LaunchTarget::Player;
+        } else if (cmdline.find((runtime / "studio").string()) != std::string::npos &&
+                   cmdline.find("RobloxStudio.app/Contents/MacOS/RobloxStudio") != std::string::npos &&
+                   // Studio carries a protocol handler of the same name inside itself.
+                   cmdline.find("MacOS/RobloxStudio.app/") == std::string::npos) {
+            target = LaunchTarget::Studio;
+        } else {
             continue;
+        }
 
         Session session;
-        session.target = LaunchTarget::Player;
+        session.target = target;
         session.pid = pid;
         session.startedAt = processStartTime(procRoot, pid);
         session.residentBytes = processResidentBytes(procRoot, pid);

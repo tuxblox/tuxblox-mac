@@ -669,9 +669,8 @@ int main() {
     // This file can be edited by hand, so a typo in it must not throw the whole thing away.
     // A number where welcome_seen wants a boolean is the obvious slip.
     //
-    // enable_player_button was a setting here once, and the Player button is a flag now --
-    // tbxFlagDisablePlayerButton -- so a file that still names it is one more key that is
-    // simply not read. It is left in this fixture on purpose: ignoring it must stay free.
+    // enable_player_button was a setting here once. It is left in this fixture on purpose:
+    // ignoring a key nothing reads must stay free.
     {
         fs::create_directories(dir);
         {

@@ -481,11 +481,7 @@ void ensureDesktopIntegration(const std::string& launcherExePath, const std::str
         if (!std::getenv("TUXBLOX_SKIP_XDG_MIME")) { // escape hatch for sandboxed test/CI runs
             // Read off the virtual drive rather than versions.json, so a stale file cannot make an installed Roblox look missing.
             const VersionsManifest versions = loadInstalledVersions(installDir);
-            // The macOS backend keeps the Player outside the Windows version
-            // tree. While it is on, that build is what --launch-player starts,
-            // so it has to count as installed for the roblox: handlers too.
-            const bool macPlayer = launcherFlags().macClient &&
-                                   macclient::hasInstalledClient(installDir);
+            const bool macPlayer = macclient::hasInstalledClient(installDir);
             const std::vector<std::string> wanted =
                 schemesToClaim(!versions.player.installed.empty() || macPlayer,
                                !versions.studio.installed.empty());

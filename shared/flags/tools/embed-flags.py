@@ -34,12 +34,7 @@ one means setting it on the server and watching nothing happen.
 import json
 import sys
 
-PREFIXES = (("tbxFlag", bool), ("tbxString", str), ("tbxInt", int))
-# Mirrors kLocalOnly in shared/flags/FlagManager.cpp. The client drops these from a
-# server answer anyway; dropping them here as well means the server is never told a value
-# it would be ignored for, and the published set says only what it can decide.
-LOCAL_ONLY = ("tbxFlagDisableUpdater", "tbxFlagBypassSystemRequirements",
-              "tbxFlagEnableExperimentalMacClient")
+TYPE_WORDS = (("Flag", bool), ("String", str), ("Int", int))
 # A delimiter that cannot occur inside JSON, so the literal cannot be closed early.
 DELIM = "TBXFLAGS"
 
@@ -49,20 +44,39 @@ def fail(message):
     raise SystemExit(1)
 
 
-def declared_type(name):
-    for prefix, kind in PREFIXES:
-        if len(name) > len(prefix) and name.startswith(prefix):
-            return kind
+def parse_name(name):
+    at = 0
+    synchronized = False
+    if at < len(name) and name[at] == "S":
+        synchronized = True
+        at += 1
+    if at < len(name) and name[at] == "D":
+        at += 1
+    if at >= len(name) or name[at] != "F":
+        return None
+    at += 1
+    for word, kind in TYPE_WORDS:
+        if len(name) > at + len(word) and name[at:at + len(word)] == word:
+            return synchronized, kind
     return None
+
+
+def declared_type(name):
+    parsed = parse_name(name)
+    return None if parsed is None else parsed[1]
+
+
+def is_local_only(name):
+    parsed = parse_name(name)
+    return parsed is None or not parsed[0]
 
 
 def check(flags):
     for name, value in flags.items():
         kind = declared_type(name)
         if kind is None:
-            fail(f"{name} does not start with tbxFlag, tbxString or tbxInt")
-        # bool is a subclass of int in Python, so an int flag must not accept True and a
-        # bool flag must not accept 1 -- the C++ side refuses both for the same reason.
+            fail(f"{name} is not a valid flag name")
+        # bool is a subclass of int in Python.
         if kind is bool and not isinstance(value, bool):
             fail(f"{name} is not a boolean")
         if kind is str and not isinstance(value, str):
@@ -101,7 +115,7 @@ def main(argv):
         # should see that the set on the server is not the whole file.
         kept = {}
         for name, value in flags.items():
-            if name in LOCAL_ONLY:
+            if is_local_only(name):
                 sys.stderr.write(f"embed-flags: not publishing {name}; it is only honoured "
                                  f"on a user's own machine\n")
                 continue

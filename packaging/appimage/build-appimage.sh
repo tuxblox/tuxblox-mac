@@ -40,18 +40,18 @@ APPIMAGE="$OUT/TuxBloxMac-$VERSION-x86_64.AppImage"
 TARBALL="$OUT/TuxBloxMac-$VERSION-x86_64.tar.zst"
 
 if [ -z "$ROSEMARY" ]; then
-    if [ -x "$ROOT/build/rosemary/rosemary" ]; then
-        ROSEMARY="$ROOT/build/rosemary/rosemary"
+    if [ -x "$NATIVE/compat/rosemary" ]; then
+        ROSEMARY="$NATIVE/compat/rosemary"
     else
-        "$ROOT/shared/tools/fetch-rosemary.sh" "$OUT/rosemary"
-        ROSEMARY="$OUT/rosemary/rosemary"
+        "$ROOT/shared/tools/fetch-rosemary.sh" "$OUT/compat"
+        ROSEMARY="$OUT/compat/rosemary"
     fi
 fi
 [ -x "$ROSEMARY" ] || fail "Rosemary is not executable: $ROSEMARY"
 
 rm -rf "$APPDIR" "$APPIMAGE" "$TARBALL"
 mkdir -p \
-    "$APPDIR/usr/bin/rosemary" \
+    "$APPDIR/usr/bin/compat" \
     "$APPDIR/usr/share/tuxblox-mac" \
     "$APPDIR/usr/share/licenses" \
     "$APPDIR/usr/share/applications" \
@@ -59,7 +59,7 @@ mkdir -p \
 
 install -m 755 "$NATIVE/TuxBloxLauncher" "$APPDIR/usr/bin/TuxBloxLauncher"
 cp -a "$NATIVE/libtuxblox" "$APPDIR/usr/bin/libtuxblox"
-install -m 755 "$ROSEMARY" "$APPDIR/usr/bin/rosemary/rosemary"
+install -m 755 "$ROSEMARY" "$APPDIR/usr/bin/compat/rosemary"
 install -m 755 "$ROOT/packaging/appimage/AppRun" "$APPDIR/AppRun"
 install -m 644 "$ROOT/packaging/appimage/tuxblox-mac.desktop" "$APPDIR/tuxblox-mac.desktop"
 install -m 644 "$ROOT/packaging/appimage/tuxblox-mac.desktop" \

@@ -70,7 +70,7 @@ install -o tester -m 0755 /TuxBloxLauncher "$root/TuxBloxLauncher"
 install -d -o tester "$root/libtuxblox"
 tar --zstd -xf /ui-stack.tar.zst -C "$root/libtuxblox"
 chown -R tester "$root/libtuxblox"
-run() { runuser -u tester -- env HOME="$home" "$@"; }
+run() { runuser -u tester -- env HOME="$home" TUXBLOX_ROOT="$root" "$@"; }
 
 # Case A: without its libraries the launcher must fail to load, and say why.
 mv "$root/libtuxblox" "$root/libtuxblox.gone"
