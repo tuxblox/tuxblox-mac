@@ -150,6 +150,18 @@ mod style {
     /// `NSWindowStyleMaskFullScreen`, which AppKit sets and clears itself;
     /// see `style_mask`.
     pub const FULL_SCREEN: usize = 1 << 14;
+    /// `NSWindowStyleMaskUtilityWindow`: a tool palette, which belongs to its
+    /// application rather than standing beside it in a task bar.
+    pub const UTILITY: usize = 1 << 4;
+    /// `NSWindowStyleMaskFullSizeContentView`: the content view covers the
+    /// titlebar area, because the guest draws a titlebar of its own there.
+    pub const FULL_SIZE_CONTENT_VIEW: usize = 1 << 15;
+}
+
+/// Whether a titlebar belongs above a window's content. A full-size content
+/// view already covers that area with the guest's own.
+fn wants_titlebar(style_mask: usize) -> bool {
+    style_mask & style::TITLED != 0 && style_mask & style::FULL_SIZE_CONTENT_VIEW == 0
 }
 
 /// The `NSWindowLevel`s that say what a window is *for*.
@@ -985,7 +997,7 @@ pub(crate) fn content_inset(object: Id) -> CGFloat {
 fn inset_of(object: Id, style_mask: usize, fullscreen: bool) -> CGFloat {
     crate::decor::inset_for(
         crate::decor::config(),
-        style_mask & style::TITLED != 0,
+        wants_titlebar(style_mask),
         is_panel(object),
         fullscreen,
     )
@@ -1371,7 +1383,7 @@ pub(crate) fn facts(object: Id) -> Option<crate::decor::Facts> {
     let mask = window.style_mask;
     Some(crate::decor::Facts {
         sdl: sdl as usize,
-        titled: mask & style::TITLED != 0,
+        titled: wants_titlebar(mask),
         closable: mask & style::CLOSABLE != 0,
         miniaturizable: mask & style::MINIATURIZABLE != 0,
         resizable: mask & style::RESIZABLE != 0,
@@ -1642,15 +1654,18 @@ fn creation_flags(style_mask: usize, api: Api) -> u64 {
     if style_mask & style::RESIZABLE != 0 {
         flags |= sdl3::video::flags::RESIZABLE;
     }
-    if style_mask & style::TITLED == 0 || draws_own_titlebar() {
+    if !wants_titlebar(style_mask) || draws_own_titlebar() {
         flags |= sdl3::video::flags::BORDERLESS;
+    }
+    if style_mask & style::UTILITY != 0 {
+        flags |= sdl3::video::flags::UTILITY;
     }
     // Room for the chrome's rounded corners. Only on Wayland: an X11 window
     // with alpha needs a compositing manager to be anything but black there,
     // and its GL and Vulkan visuals would pass the guest's alpha through.
     // The virtual desktop composites with alpha itself, whatever shows it.
     let alpha = sdl3::video::is_wayland() || sdl3::desktop::active();
-    if style_mask & style::TITLED != 0 && draws_own_titlebar() && alpha {
+    if wants_titlebar(style_mask) && draws_own_titlebar() && alpha {
         flags |= sdl3::video::flags::TRANSPARENT;
     }
     flags
@@ -3048,7 +3063,7 @@ fn apply_style(receiver: Id) {
     if sdl.is_null() || presentation_of_sdl(sdl) != Presentation::Toplevel {
         return;
     }
-    let titled = window.style_mask & style::TITLED != 0;
+    let titled = wants_titlebar(window.style_mask);
     sdl3::video::set_window_bordered(sdl, titled && !draws_own_titlebar());
     sdl3::video::set_window_always_on_top(sdl, window.level >= window_level::FLOATING);
     refit_inset(receiver);
