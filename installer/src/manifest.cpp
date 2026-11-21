@@ -1,0 +1,249 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "manifest.h"
+#include "FlagManager.h"
+#include "user_agent.h"
+#include "release_file.h"
+#include <cstdio>
+#include "downloader.h"
+#include "json.hpp"
+#include "ca_bundle.h"
+#include <curl/curl.h>
+#include <stdexcept>
+#include <string>
+
+namespace tuxblox {
+
+namespace {
+
+size_t curlWriteToString(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+// Mirrors downloader.cpp's progress callback: returning nonzero aborts the
+// transfer, which is what actually unblocks curl_easy_perform() promptly when
+// the user hits Cancel (otherwise the thread sits here until CURLOPT_TIMEOUT).
+int curlCancelCallback(void* clientp, curl_off_t /*dltotal*/, curl_off_t /*dlnow*/,
+                        curl_off_t /*ultotal*/, curl_off_t /*ulnow*/) {
+    const auto* cancel = static_cast<const std::atomic<bool>*>(clientp);
+    return shouldAbortTransfer(cancel) ? 1 : 0;
+}
+
+// A manifest artifact's "url" is always a path relative to the setup
+// origin ("/v1/canary/0.2.0/launcher"), never a full URL -- resolving it
+// here (once, at parse time) means every other artifact.url use site just
+// gets something curl can fetch directly, same as before this schema
+// change.
+std::string resolveUrl(const std::string& baseUrl, const std::string& maybeRelative) {
+    if (maybeRelative.rfind("http://", 0) == 0 || maybeRelative.rfind("https://", 0) == 0 ||
+        maybeRelative.rfind("file://", 0) == 0) {
+        return maybeRelative; // already absolute -- defensive, the server never emits this today
+    }
+    return baseUrl + maybeRelative;
+}
+
+// A v1 manifest carries the names TuxBlox used when it was published -- "Updater" for the
+// installer, "Proton" for the runtime -- and published bytes are never rewritten, so what a person
+// is shown is mapped from the artifact's key here instead. An array rather than a map: four entries
+// scanned a handful of times per install.
+const std::pair<const char*, const char*> kV1Components[] = {
+    {"launcher", "launcher"},
+    {"installer", "installer"},
+    {"mcp", "studio-mcp"},
+    {"proton", "compat"},
+};
+
+// Whatever the server sent, for a key this build does not recognise.
+std::string displayNameFor(const std::string& key, std::string published) {
+    for (const auto& [v1, component] : kV1Components) {
+        if (key != v1) continue;
+        if (const auto layout = componentLayout(component)) return layout->displayName;
+        break;
+    }
+    return published;
+}
+
+Artifact parseArtifact(const nlohmann::json& a, const std::string& name, const std::string& baseUrl) {
+    try {
+        Artifact artifact;
+        artifact.url = resolveUrl(baseUrl, a.at("url").get<std::string>());
+        artifact.sha256 = a.at("sha256").get<std::string>();
+        artifact.sizeBytes = a.at("size").get<uint64_t>();
+        artifact.displayname = displayNameFor(name, a.at("displayname").get<std::string>());
+        artifact.filename = a.at("filename").get<std::string>();
+        artifact.path = a.at("path").get<std::string>();
+        return artifact;
+    } catch (const nlohmann::json::exception& e) {
+        throw std::runtime_error(std::string("manifest artifact '") + name + "' field error: " + e.what());
+    }
+}
+
+// The manifest.json schema version this installer understands. Bump this
+// (and re-verify every field access below still matches) when the schema
+// changes -- kept as a single named constant rather than a bare literal so
+// it's the one obvious place to change, not a magic number buried in a
+// comparison.
+constexpr int kSupportedManifestVersion = 2;
+
+} // namespace
+
+Manifest parseManifest(const std::string& jsonText, const std::string& baseUrl) {
+    nlohmann::json j;
+    try {
+        j = nlohmann::json::parse(jsonText);
+    } catch (const nlohmann::json::parse_error& e) {
+        throw std::runtime_error(std::string("manifest is not valid JSON: ") + e.what());
+    }
+
+    try {
+        if (!j.contains("artifacts")) {
+            throw std::runtime_error("manifest missing 'artifacts' object");
+        }
+
+        Manifest m;
+        m.manifestVersion = j.at("manifest_version").get<int>();
+        // Fail loudly on a future schema bump rather than silently misparsing it.
+        if (m.manifestVersion != kSupportedManifestVersion) {
+            throw std::runtime_error("unsupported manifest_version: " +
+                                     std::to_string(m.manifestVersion) +
+                                     " (this installer supports version " +
+                                     std::to_string(kSupportedManifestVersion) + ")");
+        }
+        m.channel = j.at("channel").get<std::string>();
+        for (const auto& [name, value] : j.at("artifacts").items()) {
+            m.artifacts[name] = parseArtifact(value, name, baseUrl);
+        }
+        if (m.artifacts.empty()) {
+            throw std::runtime_error("manifest 'artifacts' object is empty");
+        }
+        return m;
+    } catch (const std::runtime_error&) {
+        throw;  // re-throw runtime_error as-is
+    } catch (const nlohmann::json::exception& e) {
+        throw std::runtime_error(std::string("manifest field error: ") + e.what());
+    }
+}
+
+std::string fetchManifestJson(const std::string& url, const std::atomic<bool>* cancel,
+                               long* httpStatus) {
+    CURL* curl = curl_easy_init();
+    if (!curl) {
+        throw std::runtime_error("could not start the download");
+    }
+    tuxblox::applyCaBundle(curl);
+
+    std::string body;
+    char errBuf[CURL_ERROR_SIZE] = {0};
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    applyFlaggedHttpVersion(curl, url);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, userAgent().c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteToString);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errBuf);
+    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    // Enable the progress callback purely so Cancel can abort the transfer
+    // immediately instead of waiting out CURLOPT_TIMEOUT.
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curlCancelCallback);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, const_cast<std::atomic<bool>*>(cancel));
+
+    CURLcode res = curl_easy_perform(curl);
+    long httpCode = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    curl_easy_cleanup(curl);
+
+    if (httpStatus != nullptr) *httpStatus = httpCode;
+
+    if (res == CURLE_ABORTED_BY_CALLBACK) {
+        throw std::runtime_error("the download was cancelled");
+    }
+    if (res != CURLE_OK) {
+        throw std::runtime_error(std::string("could not reach tuxblox.net: ") +
+                                  (errBuf[0] ? errBuf : curl_easy_strerror(res)));
+    }
+    // For file:// URLs, httpCode is 0 (not an HTTP request), so skip the check.
+    if (httpCode != 0 && (httpCode < 200 || httpCode >= 300)) {
+        throw std::runtime_error("tuxblox.net answered " + std::to_string(httpCode));
+    }
+    return body;
+}
+
+std::optional<std::string> fetchLatestRelease(const std::string& baseUrl, const std::string& channel,
+                                               const std::atomic<bool>* cancel) {
+    // A channel that has never been published has no pointer at all. In the old layout that was
+    // an empty string in latest.json and read as "nothing to update to"; here the file simply is
+    // not there, and a 404 means exactly the same thing. Treating it as a failure turned a normal
+    // state into a red error on the Home screen.
+    std::string body;
+    long httpStatus = 0;
+    // Only the default edge has somewhere to fall back to; see releasesEdgeUrl().
+    const bool mayFallBack = baseUrl == releasesEdgeUrl();
+    try {
+        body = fetchManifestJson(latestPointerUrl(baseUrl, channel), cancel, &httpStatus);
+    } catch (const std::exception&) {
+        // A 404 means "this channel has nothing published" only when the ORIGIN says it. From the
+        // edge it is indistinguishable from a misrouted pull zone, and taking it at face value
+        // would report "no updates" forever while the origin had them all along.
+        if (httpStatus == 404 && !mayFallBack) return std::nullopt;
+        // The edge could not answer. The origin is behind it and still can, so an edge that is
+        // down delays an update rather than making one impossible -- and this is the request that
+        // decides whether there IS an update, so failing it quietly stops them altogether.
+        if (!mayFallBack) throw;
+        fprintf(stderr, "TuxBlox: %s did not serve the release pointer; asking %s instead\n",
+                baseUrl.c_str(), releasesOriginUrl().c_str());
+        httpStatus = 0;
+        try {
+            body = fetchManifestJson(latestPointerUrl(releasesOriginUrl(), channel), cancel, &httpStatus);
+        } catch (const std::exception&) {
+            // Its own try, because fetchManifestJson THROWS on a 404 -- a bare check after the call
+            // never runs, and a channel with genuinely nothing published reported a raw HTTP error
+            // instead of saying so. Now the origin has spoken, so a 404 means what it says.
+            if (httpStatus == 404) return std::nullopt;
+            throw;
+        }
+    }
+
+    const size_t first = body.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return std::nullopt;
+    const std::string release = body.substr(first, body.find_last_not_of(" \t\r\n") - first + 1);
+
+    // Four dot-separated numbers and nothing else. The pointer is a few bytes of plain text from
+    // the network, and anything that is not a release version is "nothing to install" rather than
+    // something to go and ask for.
+    int fields = 1;
+    size_t digits = 0;
+    for (char c : release) {
+        if (c == '.') {
+            if (digits == 0) return std::nullopt;
+            digits = 0;
+            fields++;
+        } else if (c >= '0' && c <= '9') {
+            digits++;
+        } else {
+            return std::nullopt;
+        }
+    }
+    if (digits == 0 || fields != 4) return std::nullopt;
+    return release;
+}
+
+} // namespace tuxblox

@@ -1,0 +1,118 @@
+# TuxBlox - Linux Compatibility Layer for the Roblox Engine
+# Copyright (C) 2026 TuxBlox Developers
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+add_compile_options(-UNDEBUG)
+
+add_executable(test_release_file ${TUXBLOX_SHARED_RELEASE}/../tests/test_release_file.cpp)
+target_link_libraries(test_release_file PRIVATE installer_core)
+add_test(NAME release_file COMMAND test_release_file)
+
+add_executable(test_release_source test_release_source.cpp)
+target_link_libraries(test_release_source PRIVATE installer_core)
+add_test(NAME release_source COMMAND test_release_source)
+
+add_executable(test_flags test_flags.cpp)
+target_link_libraries(test_flags PRIVATE installer_core)
+add_test(NAME installer_flags COMMAND test_flags)
+
+add_executable(test_cli test_cli.cpp)
+target_link_libraries(test_cli PRIVATE installer_core)
+add_test(NAME cli COMMAND test_cli)
+
+add_executable(test_install_paths test_install_paths.cpp)
+target_link_libraries(test_install_paths PRIVATE installer_core)
+add_test(NAME install_paths COMMAND test_install_paths)
+
+add_executable(test_progress test_progress.cpp)
+target_link_libraries(test_progress PRIVATE installer_core)
+add_test(NAME progress COMMAND test_progress)
+
+add_executable(test_checksum test_checksum.cpp)
+target_link_libraries(test_checksum PRIVATE installer_core)
+add_test(NAME checksum COMMAND test_checksum)
+
+add_executable(test_manifest test_manifest.cpp)
+target_link_libraries(test_manifest PRIVATE installer_core)
+add_test(NAME manifest COMMAND test_manifest)
+
+add_executable(test_downloader test_downloader.cpp)
+target_link_libraries(test_downloader PRIVATE installer_core)
+add_test(NAME downloader COMMAND test_downloader)
+
+add_executable(test_tar_extract test_tar_extract.cpp)
+target_link_libraries(test_tar_extract PRIVATE installer_core)
+add_test(NAME tar_extract COMMAND test_tar_extract)
+
+add_library(test_stack_version MODULE
+    ${TUXBLOX_SHARED_RELEASE}/stack_version.cpp
+    ${TUXBLOX_SHARED_RELEASE}/release_stamp.cpp)
+target_include_directories(test_stack_version PRIVATE ${TUXBLOX_SHARED_RELEASE})
+target_compile_definitions(test_stack_version PRIVATE
+    TUXBLOX_COMPONENT_VERSION="3.1.0" TUXBLOX_RELEASE="3.6.0.0")
+set_target_properties(test_stack_version PROPERTIES PREFIX "" OUTPUT_NAME "version")
+
+add_executable(test_installer_steps test_installer_steps.cpp)
+target_link_libraries(test_installer_steps PRIVATE installer_core)
+add_dependencies(test_installer_steps test_stack_version)
+target_compile_definitions(test_installer_steps PRIVATE
+    TUXBLOX_TEST_STACK_LIBRARY="$<TARGET_FILE:test_stack_version>")
+add_test(NAME installer_steps COMMAND test_installer_steps)
+
+add_executable(test_container_env test_container_env.cpp)
+target_link_libraries(test_container_env PRIVATE installer_core)
+add_test(NAME container_env COMMAND test_container_env)
+
+add_executable(test_desktop_shortcut test_desktop_shortcut.cpp ../src/desktop_shortcut.cpp)
+target_include_directories(test_desktop_shortcut PRIVATE ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(test_desktop_shortcut PRIVATE installer_core)
+add_dependencies(test_desktop_shortcut generate_logo_header)
+add_test(NAME desktop_shortcut COMMAND test_desktop_shortcut)
+
+add_executable(test_uninstall test_uninstall.cpp)
+target_link_libraries(test_uninstall PRIVATE installer_core)
+add_test(NAME uninstall COMMAND test_uninstall)
+
+add_executable(test_uninstall_guard test_uninstall_guard.cpp)
+target_link_libraries(test_uninstall_guard PRIVATE installer_core)
+add_test(NAME uninstall_guard COMMAND test_uninstall_guard)
+
+add_executable(test_ui_payload test_ui_payload.cpp)
+target_link_libraries(test_ui_payload PRIVATE installer_core)
+add_test(NAME ui_payload COMMAND test_ui_payload)
+
+add_executable(test_ui_cache test_ui_cache.cpp)
+target_link_libraries(test_ui_cache PRIVATE installer_core)
+add_test(NAME ui_cache COMMAND test_ui_cache)
+
+add_executable(test_ui_extract test_ui_extract.cpp)
+target_link_libraries(test_ui_extract PRIVATE installer_core)
+add_test(NAME ui_extract COMMAND test_ui_extract)
+
+add_executable(test_ca_bundle ${TUXBLOX_SHARED_CRYPTO}/../tests/test_ca_bundle.cpp)
+target_link_libraries(test_ca_bundle PRIVATE installer_core)
+add_test(NAME ca_bundle COMMAND test_ca_bundle)
+
+add_executable(test_i18n ${TUXBLOX_I18N_DIR}/tests/test_i18n.cpp)
+target_link_libraries(test_i18n PRIVATE installer_core)
+add_test(NAME i18n COMMAND test_i18n)
+
+add_test(NAME translations
+    COMMAND ${PYTHON3_EXECUTABLE} "${TUXBLOX_I18N_DIR}/tools/check-translations.py"
+            --check --translations ${TUXBLOX_TRANSLATIONS_DIR})
+
+add_executable(test_bridge test_bridge.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../bridge/bridge.cpp)
+target_link_libraries(test_bridge PRIVATE installer_core)
+add_test(NAME bridge COMMAND test_bridge)

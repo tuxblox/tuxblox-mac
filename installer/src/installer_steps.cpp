@@ -1,0 +1,504 @@
+// TuxBlox - Linux Compatibility Layer for the Roblox Engine
+// Copyright (C) 2026 TuxBlox Developers
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+#include "installer_steps.h"
+#include "i18n.h"
+#include "release_file.h"
+#include <cstdio>
+#include <algorithm>
+#include "install_paths.h"
+#include "downloader.h"
+#include "checksum.h"
+#include "tar_extract.h"
+#include <filesystem>
+#include <sys/stat.h>
+#include <vector>
+
+namespace fs = std::filesystem;
+
+namespace tuxblox {
+
+namespace {
+
+std::string resolveInstallDir(const std::string& override) {
+    return override.empty() ? installDir() : override;
+}
+
+// The launcher executable's filename *inside* an archive-shaped "launcher"
+// artifact, i.e. the name to append when that artifact's own "filename" names
+// the directory an archive extracts into rather than the executable itself. A
+// flat-file launcher artifact IS the executable and never touches this.
+//
+// As shipped today the launcher is a flat file, and the libraries its window
+// needs travel as the separate "libtuxblox" archive artifact, extracted to
+// installDir/libtuxblox/ and found through the launcher's own $ORIGIN/libtuxblox/lib RPATH,
+// which needs no support here -- it is installed by the generic archive path
+// below like any other artifact.
+// This constant stays because the archive shape is still fully supported and
+// chosen per-artifact from the URL, not from the component name.
+constexpr const char* kLauncherExeName = "TuxBloxLauncher";
+
+bool endsWith(const std::string& s, const std::string& suffix) {
+    return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+// Whether this artifact needs to be extracted rather than just moved into
+// place -- inferred from its own download URL rather than which component
+// key it happens to be under, so any future archive-shaped artifact is
+// handled the same way without a code change here.
+//
+// PACKING CONVENTION for any archive artifact: it must be packed WITHOUT a
+// top-level directory matching its own filename -- entries should extract
+// directly to e.g. main, files/, etc. (`tar --zstd -cf
+// whatever.tar.zst -C <build-output-dir> .`, not one level above it). A
+// tarball packed the wrong way silently produces
+// <filename>/<filename>/... and breaks anything that expects the
+// extracted contents directly under the target directory (e.g. Proton's
+// proton/main).
+bool isArchiveUrl(const std::string& url) {
+    static const std::vector<std::string> kArchiveExtensions = {".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2"};
+    for (const auto& ext : kArchiveExtensions) {
+        if (endsWith(url, ext)) return true;
+    }
+    return false;
+}
+
+// installDir + artifact.path + "/" + artifact.filename -- artifact.path is
+// "/" (installDir itself) or "/somefolder" (installDir/somefolder), per
+// the manifest schema.
+std::string resolveTargetPath(const std::string& installDir, const Artifact& art) {
+    std::string p = art.path;
+    if (!p.empty() && p.front() != '/') p = "/" + p;
+    while (p.size() > 1 && p.back() == '/') p.pop_back();
+    if (p.empty() || p == "/") return installDir + "/" + art.filename;
+    return installDir + p + "/" + art.filename;
+}
+
+struct ArtifactPlan {
+    std::string name; // manifest component key, e.g. "proton"
+    Artifact artifact;
+    // Everywhere else this component can be fetched from, in the order they are tried: the origin
+    // behind the edge, and the address the release before this layout published at.
+    std::vector<std::string> alternatives;
+    bool isArchive = false;
+    std::string tmpPath;
+    std::string targetPath; // final file path, or extraction directory if isArchive
+};
+
+} // namespace
+
+double downloadProgressFraction(uint64_t now, uint64_t total, uint64_t manifestSize) {
+    uint64_t effectiveTotal = total > 0 ? total : manifestSize;
+    return effectiveTotal > 0 ? static_cast<double>(now) / static_cast<double>(effectiveTotal) : 0.0;
+}
+
+std::vector<std::string> componentsToInstall(const ReleaseFile& release,
+                                              const std::string& installDir) {
+    std::vector<std::string> needed;
+    for (const std::string& name : componentNames()) {
+        const auto entry = release.components.find(name);
+        if (entry == release.components.end()) continue;
+        // Every component of a release carries that release, so one already at it is one already
+        // installed, whatever its own version happens to be.
+        const std::optional<std::string> have = readComponentIdentity(installDir, name);
+        if (!have.has_value() || *have != release.release) needed.push_back(name);
+    }
+    return needed;
+}
+
+InstallOutcome runInstall(const ReleaseFile& release,
+                           const std::string& baseUrl,
+                           const StepProgressFn& onProgress,
+                           const std::atomic<bool>* cancel,
+                           bool isUpgrade,
+                           const std::string& installDirOverride,
+                           const std::string& robloxPlayerInstallerUrl,
+                           const std::string& robloxStudioInstallerUrl) {
+    const std::string dir = resolveInstallDir(installDirOverride);
+
+    // A plan per artifact, built up front -- lets total download bytes (and
+    // therefore each phase's progress weight) be known before any network
+    // activity starts, and lets a missing "launcher" artifact fail fast
+    // instead of only after downloading everything else.
+    // A plan per component the release names, in the layout's own order. Where it goes and what
+    // it is called while it lands come from the layout table, not from the release -- the release
+    // file describes what a release IS, not what an install looks like.
+    // Only what this install does not already hold at the release's version. A hybrid release
+    // ships what changed; downloading a component the install already has, byte for byte, is the
+    // cost the whole layout exists to remove.
+    const std::vector<std::string> needed = componentsToInstall(release, dir);
+
+    std::vector<ArtifactPlan> plans;
+    uint64_t totalArtifactBytes = 0;
+    for (const std::string& name : needed) {
+        const auto entry = release.components.find(name);
+        if (entry == release.components.end()) continue;
+        const std::optional<ComponentBytes>& bytes =
+            std::string(hostArch()) == "arm64" ? entry->second.arm64 : entry->second.x86_64;
+        const ComponentLayout layout = *componentLayout(name);
+        if (!bytes.has_value()) {
+            return {false, false, i18n::trf("Release {0} has no {1} for this computer's processor",
+                                            {release.release, layout.displayName}), ""};
+        }
+
+        ArtifactPlan p;
+        p.name = name;
+        // Where the release says the bytes are, then the address this build would construct, then
+        // where one copy served every release that named it. The edge is an optimisation and the
+        // origin behind it is the truth, so the origin is asked for each of those in turn.
+        const std::vector<std::string> urls =
+            componentUrls(componentBaseUrls(baseUrl), release, name, hostArch());
+        // Checked rather than assumed: the bytes above say this component is published here, and
+        // taking the first of an empty list on the day those two disagree is a crash.
+        if (urls.empty()) {
+            return {false, false, i18n::trf("Release {0} does not say where to download {1}",
+                                            {release.release, layout.displayName}), ""};
+        }
+        p.artifact.url = urls.front();
+        p.alternatives.assign(urls.begin() + 1, urls.end());
+        p.artifact.sha256 = bytes->sha256;
+        p.artifact.sizeBytes = bytes->size;
+        p.artifact.displayname = layout.displayName;
+        p.artifact.filename = layout.filename;
+        p.artifact.path = layout.path;
+        // From the layout rather than the URL's extension: what a component IS does not depend on
+        // how its published file happens to be named.
+        p.isArchive = layout.isArchive;
+        p.targetPath = resolveTargetPath(dir, p.artifact);
+        p.tmpPath = dir + "/." + name + (p.isArchive ? ".tar.part" : ".part");
+        totalArtifactBytes += p.artifact.sizeBytes;
+        plans.push_back(std::move(p));
+    }
+    // Everything else first, then the libraries, then the launcher: a download that fails part-way leaves the old launcher beside the libraries it needs, and the two only differ for the length of one small download
+    auto installRank = [](const ArtifactPlan& plan) { return plan.name == "launcher" ? 2 : plan.name == "libtuxblox" ? 1 : 0; };
+    std::stable_sort(plans.begin(), plans.end(), [&](const ArtifactPlan& a, const ArtifactPlan& b) { return installRank(a) < installRank(b); });
+    // Measured against the RELEASE, not against what is being installed: a release with no
+    // launcher names nothing to hand off to, while a release whose launcher the install already
+    // holds -- a repair, now that every release publishes its own copy of one -- hands off to the
+    // one already there.
+    if (release.components.find("launcher") == release.components.end()) {
+        return {false, false, i18n::tr("this release names no launcher -- nothing to hand off to"), ""};
+    }
+
+    // Phase budget: a small fixed slice for creating the directory and each
+    // Roblox pre-warm step, the rest split across artifacts proportional to
+    // their declared size (falls back to an even split if sizes are all
+    // zero, e.g. a minimal test fixture).
+    constexpr double kCreateDirWeight = 2.0;
+    constexpr double kRobloxWeight = 5.0;
+    const double artifactBudget = 100.0 - kCreateDirWeight - 2 * kRobloxWeight;
+
+    std::vector<ProgressPhase> phases;
+    phases.push_back({isUpgrade ? i18n::tr("Preparing") : i18n::tr("Creating TuxBlox directory"), kCreateDirWeight});
+    for (const auto& plan : plans) {
+        double weight = totalArtifactBytes > 0
+            ? artifactBudget * (static_cast<double>(plan.artifact.sizeBytes) / static_cast<double>(totalArtifactBytes))
+            : artifactBudget / static_cast<double>(plans.size());
+        std::string label = isUpgrade ? i18n::trf("Upgrading {0}", {plan.artifact.displayname})
+                                      : i18n::trf("Downloading {0}", {plan.artifact.displayname});
+        phases.push_back({label, weight});
+    }
+    const size_t robloxPlayerPhase = phases.size();
+    phases.push_back({i18n::tr("Downloading Roblox Player"), kRobloxWeight});
+    const size_t robloxStudioPhase = phases.size();
+    phases.push_back({i18n::tr("Downloading Roblox Studio"), kRobloxWeight});
+
+    Progress progress(phases);
+    auto report = [&](size_t phaseIndex, double fraction) {
+        progress.beginPhase(phaseIndex);
+        progress.setPhaseFraction(fraction);
+        if (onProgress) onProgress(progress.currentLabel(), progress.overallPercent());
+    };
+    auto isCancelled = [&]() { return cancel && cancel->load(); };
+
+    std::vector<std::string> tmpPathsInFlight;
+    auto cleanupTmpPaths = [&]() {
+        // fs::remove() is safe on a nonexistent path -- returns false
+        // rather than throwing -- so unconditionally sweeping every temp
+        // path seen so far is safe regardless of which one is actually
+        // still there.
+        for (const auto& p : tmpPathsInFlight) fs::remove(p);
+        // An extraction that threw leaves its staging directory behind, and for the layer that is
+        // around 350MB of nothing.
+        for (const auto& plan : plans) {
+            if (plan.isArchive) fs::remove_all(plan.targetPath + ".incoming");
+        }
+    };
+
+    try {
+        report(0, 0.0);
+        if (isCancelled()) return {false, true, "", ""};
+        fs::create_directories(dir + "/runtime");
+
+        // Left over from an install made before 3.4.0, when a separate TuxBloxBootstrapper downloaded Roblox; the launcher does that itself now, so nothing runs this file any more.
+        // Outside the artifact loop on purpose: no manifest lists a bootstrapper to hang it off, and best-effort because failing to delete a file nobody runs must not fail an upgrade.
+        {
+            std::error_code leftoverEc;
+            const std::string leftoverBootstrapper = dir + "/TuxBloxBootstrapper";
+            if (fs::is_regular_file(leftoverBootstrapper, leftoverEc)) {
+                fs::remove(leftoverBootstrapper, leftoverEc);
+            }
+        }
+
+        report(0, 1.0);
+
+        // Where the launcher is, whether or not this run installs one. A release that does not
+        // change the launcher skips it, and the install still has to say what to exec.
+        std::string launcherFinalPath = dir + "/" + componentLayout("launcher")->filename;
+
+        for (size_t i = 0; i < plans.size(); ++i) {
+            const auto& plan = plans[i];
+            const size_t phaseIndex = i + 1;
+
+            report(phaseIndex, 0.0);
+            tmpPathsInFlight.push_back(plan.tmpPath);
+            auto attempt = [&](const std::string& from) {
+                return downloadFile(from, plan.tmpPath,
+                    [&](uint64_t now, uint64_t total) {
+                        // Some CDN configurations (chunked responses) don't
+                        // report a Content-Length, leaving curl's `total` at 0
+                        // for the whole transfer -- fall back to the
+                        // manifest's declared size so the bar still advances
+                        // instead of sitting at 0% until it jumps to 100%.
+                        report(phaseIndex, downloadProgressFraction(now, total, plan.artifact.sizeBytes) * 0.9);
+                    }, cancel);
+            };
+            auto dlOutcome = attempt(plan.artifact.url);
+            // Without these an update is detected and then cannot be installed, which is a worse
+            // place to stop than never having noticed it.
+            for (const std::string& from : plan.alternatives) {
+                if (dlOutcome.result != DownloadResult::Failed) break;
+                fprintf(stderr, "TuxBlox: %s did not serve %s; asking %s instead\n",
+                        plan.artifact.url.c_str(), plan.name.c_str(), from.c_str());
+                dlOutcome = attempt(from);
+            }
+            if (dlOutcome.result == DownloadResult::Cancelled) { cleanupTmpPaths(); return {false, true, "", ""}; }
+            if (dlOutcome.result == DownloadResult::Failed) {
+                cleanupTmpPaths();
+                return {false, false, i18n::trf("Downloading {0} failed: {1}",
+                                                {plan.artifact.displayname, dlOutcome.errorMessage}), ""};
+            }
+
+            std::string actualSha = sha256File(plan.tmpPath);
+            if (actualSha != plan.artifact.sha256) {
+                cleanupTmpPaths();
+                return {false, false,
+                        i18n::trf("{0} download checksum mismatch (expected {1}, got {2})",
+                                  {plan.artifact.displayname, plan.artifact.sha256, actualSha}), ""};
+            }
+            report(phaseIndex, 0.95);
+            if (isCancelled()) { cleanupTmpPaths(); return {false, true, "", ""}; }
+
+            if (plan.isArchive) {
+                // Extracted BESIDE the target and renamed into place, never over it.
+                //
+                // An extraction that dies partway -- power loss, a full disk, an OOM kill -- used
+                // to leave a half-extracted component behind. If the program inside it had already
+                // landed, it would answer --version with the version that failed to install, while
+                // the install still recorded the old release. The launcher reads that as
+                // incoherent and forces a repair; the repair asks what is installed, sees the new
+                // version, and skips the one component that is broken. It then writes the record,
+                // and every launch afterwards reads the install as healthy. Roblox never starts
+                // and nothing ever fixes it.
+                //
+                // Renaming makes it all-or-nothing: what is at targetPath is the old component or
+                // the new one, and a crash at worst leaves it absent, which repairs itself.
+                const std::string staging = plan.targetPath + ".incoming";
+                fs::remove_all(staging);
+                extractTarZst(plan.tmpPath, staging,
+                    [&](uint64_t now, uint64_t total) {
+                        double frac = total > 0 ? static_cast<double>(now) / static_cast<double>(total) : 0.0;
+                        report(phaseIndex, 0.95 + 0.05 * frac);
+                    });
+                // Only now is the previous copy touched, and only this component's own directory --
+                // never anything else under installDir (runtime/, the other components).
+                fs::remove_all(plan.targetPath);
+                std::error_code renameEc;
+                fs::rename(staging, plan.targetPath, renameEc);
+                if (renameEc) {
+                    fs::remove_all(staging);
+                    cleanupTmpPaths();
+                    return {false, false, i18n::trf("Failed to install {0}: {1}",
+                                                    {plan.artifact.displayname, renameEc.message()}), ""};
+                }
+                fs::remove(plan.tmpPath);
+
+                // The packing convention, enforced for every archive rather than only the one that
+                // used to be one. An archive packed WITH a top-level wrapper directory extracts to
+                // <target>/<name>/..., so nothing lands where the install expects it and every
+                // downstream consumer silently points at a path that does not exist. The signature
+                // is unmistakable: a directory inside the target with the target's own name.
+                if (fs::is_directory(fs::path(plan.targetPath) / plan.artifact.filename)) {
+                    cleanupTmpPaths();
+                    return {false, false,
+                            i18n::trf("{0} was packed with a wrapper directory, which breaks the install layout",
+                                      {plan.artifact.displayname}), ""};
+                }
+            } else {
+                fs::create_directories(fs::path(plan.targetPath).parent_path());
+                std::error_code renameEc;
+                fs::rename(plan.tmpPath, plan.targetPath, renameEc);
+                if (renameEc) {
+                    cleanupTmpPaths();
+                    return {false, false, i18n::trf("Failed to install {0}: {1}",
+                                                    {plan.artifact.displayname, renameEc.message()}), ""};
+                }
+                chmod(plan.targetPath.c_str(), 0755);
+            }
+            report(phaseIndex, 1.0);
+            if (isCancelled()) return {false, true, "", ""};
+
+            if (plan.name == "mcp") {
+                // The Studio MCP gateway was a shell script named mcp.sh
+                // through 2.6.0 and is a binary named studio-mcp from 2.7.0.
+                // Different name, so installing the binary leaves the script
+                // untouched -- and an unmaintained script sitting at exactly
+                // the path MCP client configs still name would keep working
+                // while quietly diverging from the binary that replaced it.
+                // Best-effort and narrowly scoped: a regular file at that one
+                // path, nothing else.
+                std::error_code staleEc;
+                const std::string staleScript = dir + "/mcp.sh";
+                if (fs::is_regular_file(staleScript, staleEc)) {
+                    fs::remove(staleScript, staleEc);
+                }
+            }
+
+            if (plan.name == "launcher") {
+                // InstallOutcome::launcherPath is contractually the thing the
+                // caller execs (and the thing the .desktop entries' Exec= line
+                // names), so it has to be the executable itself either way.
+                // For a flat-file artifact the resolved target path already is
+                // that executable; for an archive it is the directory the
+                // bundle extracted into, and the executable sits one level
+                // inside it. Resolved here rather than at each consumer so the
+                // launcher/proton-style archive shape stays invisible to
+                // app.cpp, main.cpp and desktop_shortcut.cpp alike.
+                launcherFinalPath = plan.isArchive
+                    ? plan.targetPath + "/" + kLauncherExeName
+                    : plan.targetPath;
+                if (plan.isArchive) {
+                    // The one place the packing convention documented above
+                    // is actually enforced. A launcher bundle packed WITH a
+                    // top-level wrapper directory extracts to
+                    // <dir>/<wrapper>/TuxBloxLauncher, so nothing lands at
+                    // the path just computed -- and every downstream
+                    // consumer (execl, both .desktop Exec= lines) would then
+                    // silently point at a file that does not exist, leaving
+                    // an install that reports success and launches nothing.
+                    // Fail here instead, while there is still a message to
+                    // show. Deliberately scoped to the archive case: a
+                    // flat-file artifact was renamed into place above and
+                    // already errored out if that failed.
+                    if (!fs::is_regular_file(launcherFinalPath)) {
+                        cleanupTmpPaths();
+                        return {false, false,
+                                i18n::trf("{0} archive does not contain {1} at its root -- it was packed "
+                                          "with a wrapper directory, which breaks the install layout",
+                                          {plan.artifact.displayname, kLauncherExeName}), ""};
+                    }
+                    // The tarball carries 0755 and extractTarZst honours it
+                    // (ARCHIVE_EXTRACT_PERM), but the non-archive branch above
+                    // chmods unconditionally rather than trusting the source --
+                    // keep the same guarantee here, so a bundle packed by a
+                    // tool that dropped the mode bit still yields an
+                    // executable launcher instead of a silent EACCES at exec.
+                    chmod(launcherFinalPath.c_str(), 0755);
+
+                    // Migration from the pre-bundle flat-file launcher: an
+                    // install made before this artifact became an archive
+                    // left a plain executable directly at dir/TuxBloxLauncher
+                    // (this same name, one level up from where the archive
+                    // branch now extracts to). That file is never touched by
+                    // fs::remove_all(plan.targetPath) above, since
+                    // plan.targetPath is now the "launcher" *directory*, not
+                    // that path -- so without this, every upgrading install
+                    // is left with a stale, un-bundled binary sitting at
+                    // exactly the path old pinned taskbar entries / shell
+                    // aliases still point at. That binary is the one thing
+                    // an archive-shaped launcher exists to stop shipping (it
+                    // dies with "cannot open shared object file" on a host
+                    // without the libraries it was built against) -- so
+                    // leaving it in place silently recreates the exact
+                    // failure mode being fixed.
+                    // Best-effort and narrowly scoped: only ever removes a
+                    // REGULAR FILE (never a directory -- e.g. this same
+                    // logic running twice, or a future artifact reusing this
+                    // name for something else) whose path is not the
+                    // directory we just extracted into.
+                    std::error_code staleEc;
+                    const std::string staleFlatLauncher = dir + "/" + kLauncherExeName;
+                    if (staleFlatLauncher != plan.targetPath &&
+                        fs::is_regular_file(staleFlatLauncher, staleEc)) {
+                        fs::remove(staleFlatLauncher, staleEc);
+                    }
+                }
+            }
+        }
+
+        // Roblox Player/Studio pre-warm -- unrelated to manifest artifacts,
+        // unchanged from before this became generic.
+        report(robloxPlayerPhase, 0.0);
+        if (isCancelled()) return {false, true, "", ""};
+        {
+            const std::string playerDir = dir + "/RobloxPlayer";
+            const std::string playerInstallerPath = playerDir + "/RobloxPlayerInstaller.exe";
+            if (!fs::exists(playerInstallerPath)) {
+                fs::create_directories(playerDir);
+                // No manifest-declared size for these (fetched from Roblox's own CDN, outside the Manifest) -- no fallback available.
+                auto robloxOutcome = downloadFile(robloxPlayerInstallerUrl, playerInstallerPath,
+                    [&](uint64_t now, uint64_t total) {
+                        double frac = total > 0 ? static_cast<double>(now) / static_cast<double>(total) : 0.0;
+                        report(robloxPlayerPhase, frac);
+                    }, cancel);
+                if (robloxOutcome.result == DownloadResult::Cancelled) return {false, true, "", ""};
+                // DownloadResult::Failed is intentionally ignored -- the
+                // launcher's own lazy-download fallback
+                // (resolveOrBootstrapExePath) covers a missing cache entry
+                // when the user actually clicks Launch.
+            }
+        }
+        report(robloxPlayerPhase, 1.0);
+
+        report(robloxStudioPhase, 0.0);
+        if (isCancelled()) return {false, true, "", ""};
+        {
+            const std::string studioDir = dir + "/RobloxStudio";
+            const std::string studioInstallerPath = studioDir + "/RobloxStudioInstaller.exe";
+            if (!fs::exists(studioInstallerPath)) {
+                fs::create_directories(studioDir);
+                auto robloxOutcome = downloadFile(robloxStudioInstallerUrl, studioInstallerPath,
+                    [&](uint64_t now, uint64_t total) {
+                        double frac = total > 0 ? static_cast<double>(now) / static_cast<double>(total) : 0.0;
+                        report(robloxStudioPhase, frac);
+                    }, cancel);
+                if (robloxOutcome.result == DownloadResult::Cancelled) return {false, true, "", ""};
+            }
+        }
+        report(robloxStudioPhase, 1.0);
+
+        // Nothing is written to say which release this install is: every component carries that
+        // inside it. A failure anywhere above leaves the components that did land naming the new
+        // release and the rest naming the old one, which is exactly what the launcher reads as a
+        // half-applied update and repairs without asking.
+        return {true, false, "", launcherFinalPath};
+    } catch (const std::exception& e) {
+        cleanupTmpPaths();
+        return {false, false, e.what(), ""};
+    }
+}
+
+} // namespace tuxblox

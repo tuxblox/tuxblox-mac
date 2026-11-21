@@ -1,0 +1,244 @@
+# TuxBlox - Linux Compatibility Layer for the Roblox Engine
+# Copyright (C) 2026 TuxBlox Developers
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+cmake_minimum_required(VERSION 3.16)
+project(TuxBloxInstaller CXX)
+
+# Lets the end-to-end test point the binaries at a local server. Never set for a shipped build:
+# see setupBaseUrl() for why an environment variable that redirects downloads must not exist there.
+option(TUXBLOX_TEST_SETUP_URL "Honour $TUXBLOX_SETUP_URL (testing only)" OFF)
+
+# Builds the AppImage variant, which takes its interface stack from the mounted AppDir instead of unpacking its own.
+option(TUXBLOX_APPIMAGE "Build the AppImage variant" OFF)
+
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# The interface sources shared with the other programs live outside this directory. The build container mounts them and passes the path; a bare host cmake run finds them beside it.
+if(NOT TUXBLOX_UI_SRC)
+    set(TUXBLOX_UI_SRC "${CMAKE_SOURCE_DIR}/../shared/ui/src")
+endif()
+
+if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/json.hpp")
+    message(FATAL_ERROR "third_party/json.hpp is missing from the repository.")
+endif()
+
+# Still needed by the interface stack's UiStack.cmake, which finds GTK and libadwaita through pkg-config.
+find_package(PkgConfig REQUIRED)
+
+# TuxBlox's own code that uses those libraries, mounted read-only into the build container.
+if(NOT TUXBLOX_SHARED_CRYPTO)
+    set(TUXBLOX_SHARED_CRYPTO "${CMAKE_SOURCE_DIR}/../shared/crypto/src")
+endif()
+
+# What a release consists of, parsed the same way by the launcher and the installer -- they have to
+# agree on it exactly, because the launcher resolves a release and hands it to the installer.
+if(NOT TUXBLOX_SHARED_FLAGS)
+    set(TUXBLOX_SHARED_FLAGS "${CMAKE_SOURCE_DIR}/../shared/flags")
+endif()
+
+if(NOT TUXBLOX_SHARED_RELEASE)
+    set(TUXBLOX_SHARED_RELEASE "${CMAKE_SOURCE_DIR}/../shared/release/src")
+endif()
+
+# The libraries TuxBlox ships rather than taking from the machine, built by the Makefile's $(LIBS) rule and mounted read-only into the build container.
+if(NOT TUXBLOX_SHARED_DIR)
+    set(TUXBLOX_SHARED_DIR "${CMAKE_SOURCE_DIR}/../build/.artifacts/shared")
+endif()
+if(NOT EXISTS "${TUXBLOX_SHARED_DIR}/lib/libcurl.a")
+    message(FATAL_ERROR "${TUXBLOX_SHARED_DIR}/lib/libcurl.a is missing. Run `make installer` from the repository root.")
+endif()
+set(TUXBLOX_SHARED_INCLUDE "${TUXBLOX_SHARED_DIR}/include")
+# Static archives are order sensitive: each must come before whatever it calls into.
+set(TUXBLOX_SHARED_LIBS
+    "${TUXBLOX_SHARED_DIR}/lib/libcurl.a"
+    "${TUXBLOX_SHARED_DIR}/lib/libnghttp2.a"
+    "${TUXBLOX_SHARED_DIR}/lib/libarchive.a"
+    "${TUXBLOX_SHARED_DIR}/lib/libzstd.a"
+    "${TUXBLOX_SHARED_DIR}/lib/libz.a"
+    "${TUXBLOX_SHARED_DIR}/lib/libssl.a"
+    "${TUXBLOX_SHARED_DIR}/lib/libcrypto.a")
+# glibc >= 2.34 merged libpthread/libdl's symbols into libc.so itself, so std::thread
+# links "for free" on a newer-glibc host -- but the old-glibc-baseline container this
+# project builds inside (see build-container/Containerfile) still needs them explicit.
+# Threads::Threads is load-bearing (std::thread is used); ${CMAKE_DL_LIBS} is
+# defensive (nothing in this target calls dlopen/dlsym directly, but old-glibc-baseline
+# safety makes it cheap insurance).
+find_package(Threads REQUIRED)
+
+# Translation catalogs shared with the launcher. The generated header is a
+# plain C++ table, so the single-file installer needs no locale files beside it.
+if(NOT TUXBLOX_I18N_DIR)
+    set(TUXBLOX_I18N_DIR "${CMAKE_SOURCE_DIR}/../shared/i18n")
+endif()
+if(NOT TUXBLOX_TRANSLATIONS_DIR)
+    set(TUXBLOX_TRANSLATIONS_DIR "${CMAKE_SOURCE_DIR}/../shared/translations")
+endif()
+include(${TUXBLOX_I18N_DIR}/src/EmbedTranslations.cmake)
+include(${TUXBLOX_SHARED_FLAGS}/EmbedFlags.cmake)
+
+# The release and the channel the root VERSION file declares, forwarded by the Makefile the way the
+# component version is. Both are baked into the stamp field so a binary that was never staged still
+# reports them; staging overwrites the field regardless.
+if(NOT "$ENV{TUXBLOX_RELEASE}" STREQUAL "")
+    set(TUXBLOX_STAMP_DEFINES "TUXBLOX_RELEASE=\"$ENV{TUXBLOX_RELEASE}\"")
+    if(NOT "$ENV{TUXBLOX_CHANNEL}" STREQUAL "")
+        list(APPEND TUXBLOX_STAMP_DEFINES "TUXBLOX_CHANNEL=\"$ENV{TUXBLOX_CHANNEL}\"")
+    endif()
+    set_source_files_properties(${TUXBLOX_SHARED_RELEASE}/release_stamp.cpp PROPERTIES
+        COMPILE_DEFINITIONS "${TUXBLOX_STAMP_DEFINES}")
+endif()
+
+add_library(installer_core STATIC
+    ${TUXBLOX_SHARED_CRYPTO}/ca_bundle.cpp
+    ${TUXBLOX_SHARED_FLAGS}/FlagManager.cpp
+    src/flag_startup.cpp
+    ${TUXBLOX_SHARED_RELEASE}/release_file.cpp
+    ${TUXBLOX_SHARED_RELEASE}/release_stamp.cpp
+    ${TUXBLOX_SHARED_RELEASE}/user_agent.cpp
+    ${TUXBLOX_I18N_DIR}/src/i18n.cpp
+    src/cli.cpp
+    src/manifest.cpp
+    src/downloader.cpp
+    src/tar_extract.cpp
+    src/checksum.cpp
+    src/ui_payload.cpp
+    src/ui_cache.cpp
+    src/ui_extract.cpp
+    src/install_paths.cpp
+    src/progress.cpp
+    src/installer_steps.cpp
+    src/container_env.cpp
+    src/uninstall.cpp
+)
+include(${TUXBLOX_SHARED_CRYPTO}/EmbedCaBundle.cmake)
+
+target_include_directories(installer_core PUBLIC
+    src third_party ${TUXBLOX_I18N_DIR}/src ${TUXBLOX_SHARED_INCLUDE} ${TUXBLOX_SHARED_CRYPTO} ${TUXBLOX_SHARED_RELEASE} ${TUXBLOX_SHARED_FLAGS} ${CMAKE_BINARY_DIR}/generated)
+if(TUXBLOX_TEST_SETUP_URL)
+    target_compile_definitions(installer_core PUBLIC TUXBLOX_TEST_SETUP_URL)
+endif()
+target_link_libraries(installer_core PUBLIC
+    ${TUXBLOX_SHARED_LIBS} ${CMAKE_DL_LIBS} Threads::Threads)
+# --exclude-libs keeps these archives' symbols out of the binary's dynamic symbol table. They are
+# still linked in and callable from our own code; this only controls whether they are exported.
+# It is load-bearing for zlib, which the interface binary holds twice on purpose: a static copy
+# inside libarchive.a here, and the stack's own libz.so.1, which its libtiff and libfreetype both
+# load. Exported, our static inflate and crc32 would be handed to them instead of the stack's.
+target_link_options(installer_core PUBLIC
+    -Wl,--exclude-libs=libcurl.a -Wl,--exclude-libs=libnghttp2.a
+    -Wl,--exclude-libs=libarchive.a -Wl,--exclude-libs=libzstd.a
+    -Wl,--exclude-libs=libz.a
+    -Wl,--exclude-libs=libssl.a -Wl,--exclude-libs=libcrypto.a)
+# These would otherwise make every machine need a C++ runtime at least as new as this builder's, for no gain. The interface stack TuxBlox loads is all C, so nothing throws across a library boundary.
+target_link_options(installer_core PUBLIC -static-libstdc++ -static-libgcc)
+add_dependencies(installer_core generate_ca_bundle_header generate_i18n_header generate_default_flags_header)
+
+# Same version resolution as launcher/CMakeLists.txt: TUXBLOX_BUILD_VERSION wins, and
+# The Makefile sets it from installer/VERSION on the host, because cmake runs inside a
+# container where only this directory is mounted. This is the INSTALLER's own version now, not a
+# number shared with the launcher and the layer. installer/VERSION is the fallback for a bare host
+# cmake run, which is the one case that reaches it.
+# ${CMAKE_BINARY_DIR}/generated is already on TuxBloxInstaller's include path
+# below, alongside the logo/font/license headers.
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+if(NOT "$ENV{TUXBLOX_BUILD_VERSION}" STREQUAL "")
+    set(TUXBLOX_INSTALLER_VERSION "$ENV{TUXBLOX_BUILD_VERSION}")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/VERSION")
+    file(STRINGS "${CMAKE_SOURCE_DIR}/VERSION" TUXBLOX_INSTALLER_VERSION LIMIT_COUNT 1)
+else()
+    set(TUXBLOX_INSTALLER_VERSION "0.0.0-dev")
+endif()
+# The channel is still a property of the release rather than of this component, so it comes from
+# line 2 of the repo-root VERSION. It decides which channel a bare installer run installs from.
+# TODO: the installer still defaults to installing its own component version as though it were a
+# release, which it is not -- the client plan makes "latest" the default.
+message(STATUS "TuxBlox installer version: ${TUXBLOX_INSTALLER_VERSION}")
+if(TUXBLOX_APPIMAGE)
+    set(TUXBLOX_APPIMAGE_BOOL "true")
+    message(STATUS "TuxBlox AppImage variant")
+else()
+    set(TUXBLOX_APPIMAGE_BOOL "false")
+endif()
+configure_file(${CMAKE_SOURCE_DIR}/cmake/version.h.in ${CMAKE_BINARY_DIR}/generated/version.h @ONLY)
+# installer_core compiles cli.cpp, which needs the generated version/channel.
+# PUBLIC so TuxBloxInstaller inherits it, and placed after configure_file so the
+# header exists by the time anything is told to look for it.
+target_include_directories(installer_core PUBLIC ${CMAKE_BINARY_DIR}/generated)
+
+include(cmake/FetchLogo.cmake)
+include(cmake/FetchFont.cmake)
+include(cmake/EmbedThirdPartyLicenses.cmake)
+
+add_executable(TuxBloxInstaller
+    src/main.cpp
+    src/app.cpp
+    src/console_ui.cpp
+    src/desktop_shortcut.cpp
+    src/copyright_file.cpp
+)
+target_include_directories(TuxBloxInstaller PRIVATE ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(TuxBloxInstaller PRIVATE installer_core ${CMAKE_DL_LIBS} Threads::Threads)
+add_dependencies(TuxBloxInstaller generate_logo_header generate_font_header generate_thirdparty_license_headers)
+if(TUXBLOX_LIBADWAITA_COMMIT)
+    target_compile_definitions(TuxBloxInstaller PRIVATE TUXBLOX_LIBADWAITA_COMMIT="${TUXBLOX_LIBADWAITA_COMMIT}")
+endif()
+
+# The interface binary, which lives inside the appended payload rather than
+# beside the installer, so its libraries are found relative to itself.
+if(TUXBLOX_UI_STACK_DEV)
+    include(${TUXBLOX_UI_SRC}/UiStack.cmake)
+
+    add_executable(TuxBloxInstaller-ui
+        src/ui_main.cpp
+        src/app.cpp
+        src/ui_adw.cpp
+        src/console_ui.cpp
+        src/desktop_shortcut.cpp
+        src/copyright_file.cpp
+        ${TUXBLOX_UI_SRC}/adw_env.cpp
+        ${TUXBLOX_UI_SRC}/adw_look.cpp
+        ${TUXBLOX_UI_SRC}/host_icons.cpp
+        ${TUXBLOX_UI_SRC}/svg_raster.cpp
+        ${TUXBLOX_UI_SRC}/palette.cpp
+        ${TUXBLOX_UI_SRC}/seasonal.cpp
+    )
+    target_include_directories(TuxBloxInstaller-ui PRIVATE
+        ${CMAKE_BINARY_DIR}/generated ${TUXBLOX_UI_SRC} ${ADWAITA_INCLUDE_DIRS})
+    target_compile_options(TuxBloxInstaller-ui PRIVATE ${ADWAITA_CFLAGS_OTHER})
+    target_link_libraries(TuxBloxInstaller-ui PRIVATE
+        installer_core ${ADWAITA_LINK_LIBRARIES} ${CMAKE_DL_LIBS} Threads::Threads)
+    set_target_properties(TuxBloxInstaller-ui PROPERTIES
+        BUILD_WITH_INSTALL_RPATH TRUE
+        INSTALL_RPATH "$ORIGIN/lib/x86_64-linux-gnu:$ORIGIN/lib")
+    add_dependencies(TuxBloxInstaller-ui generate_logo_header generate_font_header generate_thirdparty_license_headers)
+    if(TUXBLOX_LIBADWAITA_COMMIT)
+        target_compile_definitions(TuxBloxInstaller-ui PRIVATE TUXBLOX_LIBADWAITA_COMMIT="${TUXBLOX_LIBADWAITA_COMMIT}")
+    endif()
+endif()
+
+enable_testing()
+add_subdirectory(tests)
+
+# The stand-in published at the address a pre-layout client asks for. It carries that client to an
+# installer that understands the current layout, so it must stay free of anything release-specific.
+add_executable(TuxBloxInstallerBridge
+    bridge/main.cpp
+    bridge/bridge.cpp
+)
+target_include_directories(TuxBloxInstallerBridge PRIVATE src)
+target_link_libraries(TuxBloxInstallerBridge PRIVATE installer_core ${CMAKE_DL_LIBS} Threads::Threads)
