@@ -2743,8 +2743,9 @@ unsafe extern "C" fn is_movable(receiver: Id, _sel: Sel) -> u8 {
 /// position moves with the window it is measured against, which would feed each
 /// move back into the next one.
 unsafe extern "C" fn perform_window_drag_with_event(receiver: Id, _sel: Sel, _event: Id) {
+    // `-setMovable:NO` stops AppKit's own drag, not this one.
     let window = window_of(receiver);
-    if window.immovable != 0 || window.sdl.is_null() {
+    if window.sdl.is_null() {
         return;
     }
     let (Some((pointer_x, pointer_y, _)), Some((origin_x, origin_y))) = (
@@ -4561,24 +4562,20 @@ mod tests {
         objc::arc::release(window);
     }
 
-    /// An immovable window refuses the drag, and a window with no SDL window
-    /// behind it starts none - neither may leave a session the pump would then
-    /// carry on against nothing.
+    /// A window with no SDL window behind it starts no drag - a session the
+    /// pump would then carry on against nothing.
     #[test]
-    fn a_drag_needs_a_movable_window() {
+    fn a_drag_needs_a_window_behind_it() {
         crate::bootstrap();
         let window =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
         let sel = objc::sel::get("performWindowDragWithEvent:");
         // SAFETY: `-performWindowDragWithEvent:` is `void (id, SEL, NSEvent *)`.
         unsafe {
+            // Immovable is no refusal: it stops AppKit's own drag, not this.
             set_movable(window, objc::sel::get("setMovable:"), 0);
             perform_window_drag_with_event(window, sel, std::ptr::null_mut());
-            assert!(
-                drag().lock().unwrap_or_else(|e| e.into_inner()).is_none(),
-                "an immovable window does not drag"
-            );
-            // Movable, but with no SDL window: there is nothing to position.
+            assert!(drag().lock().unwrap_or_else(|e| e.into_inner()).is_none());
             set_movable(window, objc::sel::get("setMovable:"), 1);
             perform_window_drag_with_event(window, sel, std::ptr::null_mut());
             assert!(drag().lock().unwrap_or_else(|e| e.into_inner()).is_none());
