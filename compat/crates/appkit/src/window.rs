@@ -2178,6 +2178,26 @@ unsafe extern "C" fn set_frame_origin(
     sdl3::video::set_window_position(sdl, local_x, local_y);
 }
 
+/// Record where the window manager put a window as the guest's own origin,
+/// which the next frame this runtime applies is measured from.
+pub(crate) fn note_moved(sdl: sdl3::Window) {
+    let object = window_for(sdl);
+    if object.is_null() {
+        return;
+    }
+    let window = window_of(object);
+    if window.size_pending != 0 || is_fullscreen(sdl) {
+        return;
+    }
+    let (Some((x, y)), Some((w, h))) = (
+        sdl3::video::window_position(sdl),
+        sdl3::video::window_size(sdl),
+    ) else {
+        return;
+    };
+    window.requested = crate::geometry::rect_from_sdl(x, y, w, h);
+}
+
 unsafe extern "C" fn set_content_size(receiver: Id, _sel: Sel, size: NSSize) {
     let inset = content_inset(receiver);
     if is_fullscreen(window_of(receiver).sdl) {

@@ -363,6 +363,7 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
         // program that only listens for the moves it makes itself would keep
         // mapping the pointer against the origin it asked for.
         Event::WindowMoved { window } => {
+            crate::window::note_moved(sdl3::video::window_from_id(window));
             crate::screen::refresh_relative_pointer(window);
             sdl3::video::invalidate_presentation_window(window, &window::sdl_windows());
             let object = object_for(window);
