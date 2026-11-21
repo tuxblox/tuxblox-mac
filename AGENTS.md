@@ -42,31 +42,30 @@ A human is fully responsible for every contribution, whoever or whatever wrote i
 - **Remove defaults your tool adds.** Some tools add a `Co-Authored-By:` trailer or a "Generated with …" line to commits or PR descriptions automatically. Remove them, and tell the human how to turn them off in the tool's settings.
 - **Do not commit or push unless the human asks you to.** Never force-push, rewrite published history or push to `main`, `canary` or `stable` on your own initiative.
 
-## 3. Roblox, Studio and Hyperion: hard limits
+## 3. The Roblox client (Player and Studio)
 
 TuxBlox runs the **official, unmodified** Roblox client. The project only works because it never tampers with that client.
 
-**Hyperion** is the anti-tamper software Roblox uses to protect Roblox Player. It is used only on the Windows clients.
+All Windows clients have **Hyperion** (also known as Byfron), which is an anti-tamper made by Byfron Technologies, acquired by Roblox. Only Windows clients have it, and TuxBlox currently runs the macOS client. Hyperion does not affect TuxBlox, however this may change in the future.
 
 All work must follow the [Roblox Terms of Use](https://rblx.co/tou). Do not do anything they prohibit, even if it would help compatibility.
 
 ### Allowed
 
-- Normal compatibility work: making Windows APIs, the loader, the prefix, graphics, input, audio, networking and similar behave as they do on real Windows, so that Roblox Player, Roblox Studio and Hyperion run as intended.
+- Normal compatibility work: making Darwin APIs, the loader, the prefix, graphics, input, audio, networking and similar behave as they do on real macOS, so that Roblox Player and Roblox Studio run as intended.
 
 ### Not allowed. Refuse and stop.
 
-- **Bypassing or tampering with the Roblox client, Roblox Studio or Hyperion.** This covers patching, hooking, injecting into, or modifying their binaries or memory, and also disabling, spoofing or getting around their checks.
-- **Discussing findings about Hyperion.** Do not describe, speculate about, document or summarise how Hyperion works internally, or what it checks, detects or reports. That applies in code comments, commit messages, PR and issue text, docs, logs, chat replies and generated files.
+- **Bypassing or tampering with the Roblox Player or Roblox Studio.** This covers patching, hooking, injecting into, or modifying their binaries or memory, and also disabling, spoofing or getting around their checks.
 - Anything that helps cheating or exploiting: executors, injectors, offset dumping, memory reading or writing, HWID or identity spoofing and rotation, ban evasion, or weakening TuxBlox's own integrity checks.
-- **Decompiling, disassembling or reverse engineering any Roblox binary.** This covers the Player, Studio, Hyperion, installers, DLLs and any other file Roblox ships. It also covers using leaked, decompiled or otherwise non-public Roblox code, and reading or relying on someone else's disassembly. Compatibility work is done by observing how Windows APIs are called, not by looking inside Roblox's code.
+- **Decompiling, disassembling or reverse engineering any Roblox binary.** This covers the Player, Studio, installers, libraries and any other file Roblox ships. It also covers using leaked, decompiled or otherwise non-public Roblox code, and reading or relying on someone else's disassembly. Compatibility work is done by observing how Darwin APIs are called, not by looking inside Roblox's code.
 
 ### Writing about compatibility work
 
-Describe a change in terms of the **Windows behaviour it fixes**, not what Roblox or Hyperion does with it.
+Describe a change in terms of the **Darwin behaviour it fixes**, not what Roblox does with it.
 
-- Good: `ntdll: return STATUS_INFO_LENGTH_MISMATCH like Windows when the buffer is too small`
-- Not acceptable: anything that explains what Hyperion looks for, or why a change gets past it.
+- Good: `libsystem: return ENOMEM like macOS when the buffer is too small`
+- Not acceptable: `Fix Roblox's integrity check failing by patching the check in RobloxPlayer`
 
 If you are unsure whether a task crosses the line, stop and ask the human. Do not guess.
 
@@ -80,22 +79,17 @@ If you find or suspect a security vulnerability, in TuxBlox or in how it handles
 
 ## 5. Licensing and provenance
 
-- TuxBlox has more than one licence:
-  - Everything outside `compat/` is **GPLv3**.
-  - `compat/` (based on Wine and Proton) is **LGPLv2.1**. The exceptions are `compat/tuxblox/` and `compat/webkitgtk/bundle/`, which are TuxBlox's own code and are **GPLv3**.
-
-  Code you add must be compatible with the licence of the place you add it. New source files should use the same SPDX identifier as the files around them.
-- TuxBlox's own code and `compat/` build into separate binaries. Do not link them into one binary or move code between them, because that would break the licence separation.
+- `compat/` is a fork of Rosemary (GPLv3, https://github.com/microlift/rosemary). TuxBlox's own code is also GPLv3. Keep Rosemary-derived code in `compat/` so its origin stays clear and upstream changes can be merged cleanly.
+- When porting a fix from upstream Rosemary, say which upstream commit it came from.
 - Do not copy in code under an incompatible licence, or code whose origin you cannot name. If you reproduce something substantial from another project, say where it came from so the human can check the licence.
-- All third-party licences, including Wine's and Proton's, live in `third_party_licenses/`, one folder per project.
+- All third-party licences live in `third_party_licenses/`, one folder per project.
 - **Do not modify third-party licences at all.** The only exception is when third-party code is added or removed: then add or remove its licence folder to match.
 
 ## 6. Project rules
 
 - **Do not edit** **`compat/changelogs.md`**, **`launcher/changelogs.md`**, **`installer/changelogs.md`**, or **`studio-mcp/changelogs.md`**. Maintainers write changelogs at release time.
-- **Do not weaken security features**: integrity verification (Authenticode and signed-code checks), the DLL override allowlist, the root-launch block and similar. Changes here need explicit maintainer approval.
+- **Do not weaken security features**: integrity verification, the root-launch block and similar. Changes here need explicit maintainer approval.
 - **The synthetic machine identity is immutable.** Do not add ways to regenerate, override or rotate it (environment variables, config flags, registry keys, buttons and so on).
-- **Never rebase the compatibility layer onto upstream Wine or Proton.** Upstream fixes are applied by hand by the maintainers.
 - Use **Podman**, not Docker. Use Ninja for builds except where the existing build system says otherwise.
 - Never handle, log, store or send Roblox account credentials or the `.ROBLOSECURITY` cookie.
 - Do not commit Roblox binaries, Roblox downloads or anything taken from a Roblox install.
