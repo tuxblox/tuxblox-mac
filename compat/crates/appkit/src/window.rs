@@ -2554,8 +2554,13 @@ unsafe extern "C" fn set_is_visible(receiver: Id, _sel: Sel, visible: u8) {
     }
 }
 
-unsafe extern "C" fn order_out(receiver: Id, _sel: Sel, _sender: Id) {
+unsafe extern "C" fn order_out(receiver: Id, sel: Sel, sender: Id) {
     trace!("{receiver:p} ordered out");
+    // AppKit takes a window's children out with it.
+    for child in children_of(receiver) {
+        // SAFETY: `-orderOut:` is `void (id, SEL, id)` on a window this made.
+        unsafe { order_out(child, sel, sender) };
+    }
     let sdl = window_of(receiver).sdl;
     let is_popup = !sdl.is_null() && presentation_of_sdl(sdl) != Presentation::Toplevel;
     if !sdl.is_null() {
@@ -3783,6 +3788,17 @@ unsafe extern "C" fn add_child_window(receiver: Id, _sel: Sel, child: Id, _order
     let mut table = children().lock().unwrap_or_else(|e| e.into_inner());
     table.retain(|(_, c)| *c != child as usize);
     table.push((receiver as usize, child as usize));
+}
+
+/// The windows `receiver` is the parent of.
+fn children_of(receiver: Id) -> Vec<Id> {
+    children()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(parent, _)| *parent == receiver as usize)
+        .map(|(_, child)| *child as Id)
+        .collect()
 }
 
 unsafe extern "C" fn remove_child_window(receiver: Id, _sel: Sel, child: Id) {
