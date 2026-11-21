@@ -8,6 +8,8 @@ pub struct Theme {
     pub dark: bool,
 
     pub titlebar_height: f32,
+    /// A utility panel's titlebar, which AppKit draws shorter.
+    pub panel_titlebar_height: f32,
     pub strip_height: f32,
     /// The radius of a titled window's corners.
     pub window_corner_radius: f32,
@@ -89,7 +91,8 @@ impl Theme {
     pub fn light() -> Theme {
         Theme {
             dark: false,
-            titlebar_height: 28.0,
+            titlebar_height: 32.0,
+            panel_titlebar_height: 24.0,
             strip_height: 24.0,
             window_corner_radius: 10.0,
             titlebar_top: Color::rgb(0xEE, 0xEE, 0xEE),

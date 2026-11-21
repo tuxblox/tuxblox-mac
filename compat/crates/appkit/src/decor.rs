@@ -153,13 +153,21 @@ pub(crate) struct Facts {
 }
 
 /// The height of chrome above a window's content, in points.
+/// AppKit draws a utility panel's titlebar shorter than a window's.
+fn titlebar_height(theme: &chrome::theme::Theme, panel: bool) -> f32 {
+    match panel {
+        true => theme.panel_titlebar_height,
+        false => theme.titlebar_height,
+    }
+}
+
 pub(crate) fn inset_for(config: Config, titled: bool, panel: bool, fullscreen: bool) -> f64 {
     if !titled || fullscreen {
         return 0.0;
     }
     let theme = theme();
     let titlebar = match config.decorations {
-        Decorations::Client => theme.titlebar_height,
+        Decorations::Client => titlebar_height(&theme, panel),
         Decorations::Server => 0.0,
     };
     let strip = match config.menu == MenuPlacement::Strip && !panel {
@@ -173,7 +181,7 @@ fn rows(config: Config, facts: &Facts) -> (f32, f32) {
     let theme = theme();
     let inset = inset_for(config, facts.titled, facts.panel, facts.fullscreen) as f32;
     let titlebar = match config.decorations == Decorations::Client && inset > 0.0 {
-        true => theme.titlebar_height,
+        true => titlebar_height(&theme, facts.panel),
         false => 0.0,
     };
     (titlebar, inset - titlebar)
@@ -1809,6 +1817,7 @@ mod tests {
         let theme = theme();
         let client = Config::parse(None, None);
         let titlebar = f64::from(theme.titlebar_height);
+        let panel_titlebar = f64::from(theme.panel_titlebar_height);
         let strip = f64::from(theme.strip_height);
         assert_eq!(inset_for(client, true, false, false), titlebar);
         assert_eq!(inset_for(client, false, false, false), 0.0);
@@ -1819,8 +1828,8 @@ mod tests {
             inset_for(client_strip, true, false, false),
             titlebar + strip
         );
-        // A panel has no menu bar of its own.
-        assert_eq!(inset_for(client_strip, true, true, false), titlebar);
+        // A panel has no menu bar of its own, and a shorter titlebar.
+        assert_eq!(inset_for(client_strip, true, true, false), panel_titlebar);
 
         let server = Config::parse(Some("server"), None);
         assert_eq!(inset_for(server, true, false, false), strip);
