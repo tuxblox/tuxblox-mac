@@ -108,7 +108,7 @@ DIR="$HOME/.local/share/tuxblox-mac"
 mkdir -p "$DIR"
 install -m 755 build/native/TuxBloxLauncher "$DIR/TuxBloxLauncher"
 cp -a build/native/libtuxblox "$DIR/libtuxblox"
-./shared/tools/fetch-rosemary.sh "$DIR/compat"
+install -m 755 build/native/compat/rosemary "$DIR/compat/rosemary"
 ```
 
 Create `"$DIR/flags.json"` before the first start:

@@ -65,8 +65,6 @@ ifdef TUXBLOX_HEADLESS_ONLY
 UI_MOUNTS :=
 UI_ARGS :=
 endif
-WEBKITGTK_VERSION := $(shell sed -n 's/^WEBKITGTK_VERSION=//p' compat/webkitgtk/bundle/versions.env 2>/dev/null)
-WEBVIEW := $(ROOT)/compat/webkitgtk/prebuilt/webkitgtk-$(WEBKITGTK_VERSION)-x86_64.tar.xz
 
 FIND := find -L
 SHARED_SRC := $(shell $(FIND) shared -type f \
@@ -1011,33 +1009,6 @@ $(ROSEMARY): $(COMPAT_SRC) | $(PODMAN)
 	    tuxblox-builder cargo build --release --locked --bin rosemary
 	install -m 755 compat/target/release/rosemary $@
 
-# The pinned upstream executable, for when building it from source is not wanted.
-.PHONY: rosemary
-rosemary:
-	@mkdir -p "$$(dirname "$(ROSEMARY)")"
-	bash "$(ROOT)/shared/tools/fetch-rosemary.sh" "$$(dirname "$(ROSEMARY)")"
-
-.PHONY: webkitgtk
-define build_webview
-	$(ROOT)/compat/webkitgtk/bundle/fetch-sources.sh
-	cd compat/webkitgtk/bundle && ./build.sh
-	@mkdir -p $(dir $(WEBVIEW))
-	mv compat/webkitgtk/bundle/out/webkitgtk-$(WEBKITGTK_VERSION)-x86_64.tar.xz $(WEBVIEW)
-endef
-
-$(WEBVIEW): | $(PODMAN)
-	$(build_webview)
-
-webkitgtk: | $(PODMAN)
-	$(build_webview)
-
-.PHONY: webkitgtk-host
-webkitgtk-host:
-	@if [ ! -d $(NATIVE)/compat/files ]; then \
-	    echo "No layer in build/compat. Run: make compat" >&2; exit 1; \
-	fi
-	cd compat/webkitgtk/bundle && ./build-host.sh
-
 define CHECK_HOST_DEPS
 set -euo pipefail
 
@@ -1206,8 +1177,6 @@ help:
 	@echo "make flatpak         the whole of TuxBlox as a Flatpak"
 	@echo "make assets          render assets/tuxblox.svg into build/assets/ (needs librsvg)"
 	@echo "make compat          the compatibility layer only"
-	@echo "make webkitgtk       build the webview bundle (hours on a first run)"
-	@echo "make webkitgtk-host  just the webview host helper, into an existing layer"
 	@echo "make clean           remove build/"
 	@echo "make distclean       also remove the interface stack and source caches"
 	@echo

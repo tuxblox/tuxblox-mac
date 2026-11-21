@@ -40,14 +40,9 @@ APPIMAGE="$OUT/TuxBloxMac-$VERSION-x86_64.AppImage"
 TARBALL="$OUT/TuxBloxMac-$VERSION-x86_64.tar.zst"
 
 if [ -z "$ROSEMARY" ]; then
-    if [ -x "$NATIVE/compat/rosemary" ]; then
-        ROSEMARY="$NATIVE/compat/rosemary"
-    else
-        "$ROOT/shared/tools/fetch-rosemary.sh" "$OUT/compat"
-        ROSEMARY="$OUT/compat/rosemary"
-    fi
+    ROSEMARY="$NATIVE/compat/rosemary"
 fi
-[ -x "$ROSEMARY" ] || fail "Rosemary is not executable: $ROSEMARY"
+[ -x "$ROSEMARY" ] || fail "no compatibility layer at $ROSEMARY; run make compat first"
 
 rm -rf "$APPDIR" "$APPIMAGE" "$TARBALL"
 mkdir -p \
