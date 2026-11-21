@@ -3654,6 +3654,38 @@ unsafe extern "C" fn min_size(receiver: Id, _sel: Sel) -> NSSize {
 
 unsafe extern "C" fn set_min_size(receiver: Id, _sel: Sel, size: NSSize) {
     window_of(receiver).minimum = size;
+    apply_size_limits(receiver);
+}
+
+/// `-setContentMinSize:`, which is the content's, not the frame's.
+unsafe extern "C" fn set_content_min_size(receiver: Id, _sel: Sel, size: NSSize) {
+    let inset = content_inset(receiver);
+    let window = window_of(receiver);
+    window.minimum = NSSize {
+        width: size.width,
+        height: size.height + inset,
+    };
+    apply_size_limits(receiver);
+}
+
+/// A limit SDL takes, where 0 is none: AppKit's own is `CGFLOAT_MAX`.
+fn limit(value: CGFloat) -> i32 {
+    match value.is_finite() && value > 0.0 && value < CGFloat::from(i32::MAX) {
+        true => value as i32,
+        false => 0,
+    }
+}
+
+/// Give SDL the limits the guest set, so the window manager honours them.
+fn apply_size_limits(receiver: Id) {
+    let window = window_of(receiver);
+    let sdl = window.sdl;
+    if sdl.is_null() {
+        return;
+    }
+    let (minimum, maximum) = (window.minimum, window.maximum);
+    sdl3::video::set_window_minimum_size(sdl, limit(minimum.width), limit(minimum.height));
+    sdl3::video::set_window_maximum_size(sdl, limit(maximum.width), limit(maximum.height));
 }
 
 unsafe extern "C" fn max_size(receiver: Id, _sel: Sel) -> NSSize {
@@ -3662,6 +3694,18 @@ unsafe extern "C" fn max_size(receiver: Id, _sel: Sel) -> NSSize {
 
 unsafe extern "C" fn set_max_size(receiver: Id, _sel: Sel, size: NSSize) {
     window_of(receiver).maximum = size;
+    apply_size_limits(receiver);
+}
+
+/// `-setContentMaxSize:`, which is the content's, not the frame's.
+unsafe extern "C" fn set_content_max_size(receiver: Id, _sel: Sel, size: NSSize) {
+    let inset = content_inset(receiver);
+    let window = window_of(receiver);
+    window.maximum = NSSize {
+        width: size.width,
+        height: size.height + inset,
+    };
+    apply_size_limits(receiver);
 }
 
 /// `-standardWindowButton:`: the close, minimise and zoom buttons.
@@ -4166,9 +4210,9 @@ pub(crate) fn install() {
         "maxSize" => max_size, c"{CGSize=dd}16@0:8";
         "setMaxSize:" => set_max_size, c"v32@0:8{CGSize=dd}16";
         "contentMinSize" => min_size, c"{CGSize=dd}16@0:8";
-        "setContentMinSize:" => set_min_size, c"v32@0:8{CGSize=dd}16";
+        "setContentMinSize:" => set_content_min_size, c"v32@0:8{CGSize=dd}16";
         "contentMaxSize" => max_size, c"{CGSize=dd}16@0:8";
-        "setContentMaxSize:" => set_max_size, c"v32@0:8{CGSize=dd}16";
+        "setContentMaxSize:" => set_content_max_size, c"v32@0:8{CGSize=dd}16";
         "setContentAspectRatio:" => ignored_size, c"v32@0:8{CGSize=dd}16";
         "setAspectRatio:" => ignored_size, c"v32@0:8{CGSize=dd}16";
         "setContentResizeIncrements:" => ignored_size, c"v32@0:8{CGSize=dd}16";

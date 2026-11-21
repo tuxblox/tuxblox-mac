@@ -275,6 +275,7 @@ struct Api {
     SDL_MaximizeWindow: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_RestoreWindow: Option<unsafe extern "C" fn(Window) -> bool>,
     SDL_SetWindowMinimumSize: Option<unsafe extern "C" fn(Window, c_int, c_int) -> bool>,
+    SDL_SetWindowMaximumSize: Option<unsafe extern "C" fn(Window, c_int, c_int) -> bool>,
     SDL_ShowWindowSystemMenu: Option<unsafe extern "C" fn(Window, c_int, c_int) -> bool>,
     SDL_SetWindowHitTest:
         Option<unsafe extern "C" fn(Window, Option<video::HitTest>, *mut c_void) -> bool>,
@@ -531,6 +532,7 @@ fn api() -> Option<&'static Api> {
             SDL_MaximizeWindow,
             SDL_RestoreWindow,
             SDL_SetWindowMinimumSize,
+            SDL_SetWindowMaximumSize,
             SDL_ShowWindowSystemMenu,
             SDL_SetWindowHitTest,
             SDL_SetWindowAlwaysOnTop,
@@ -3957,6 +3959,15 @@ pub mod video {
             return done;
         }
         let Some(f) = api().and_then(|a| a.SDL_SetWindowMinimumSize) else {
+            return false;
+        };
+        // SAFETY: a window this crate created.
+        unsafe { f(window, width, height) }
+    }
+
+    /// `SDL_SetWindowMaximumSize`, in window coordinates.
+    pub fn set_window_maximum_size(window: Window, width: i32, height: i32) -> bool {
+        let Some(f) = api().and_then(|a| a.SDL_SetWindowMaximumSize) else {
             return false;
         };
         // SAFETY: a window this crate created.
