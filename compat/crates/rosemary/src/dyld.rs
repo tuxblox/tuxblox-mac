@@ -1,0 +1,4077 @@
+use std::collections::BTreeMap;
+use std::ffi::CString;
+use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use crate::cxxlib::Flavor;
+use machish::exports::{ExportTable, ExportValue};
+use machish::image::DependencyKind;
+use machish::image::MachObject;
+use machish::install_name::PathContext;
+use machish::loader::Loader;
+use machish::memory::{MmapSpace, Regions};
+use machish::report::{ImageReport, LinkReport};
+use machish::resolve::SyntheticDylib;
+use machish::spec::MachSpec;
+use machish::spec::arch::X86_64;
+
+use crate::program::{AddrMap, HostProviders, ImportSite};
+
+/// An image this runtime loaded on the guest's behalf.
+pub struct Image {
+    /// The path actually opened, after `@`-prefix expansion.
+    pub path: String,
+    /// What `dlopen` returned. The image's base address, which is unique in this
+    /// process by construction and is the one value a crash dump can be read against.
+    pub handle: u64,
+    pub report: LinkReport,
+    /// The mapping, which [`unload`] drops - and so unmaps.
+    memory: Mutex<Option<SharedSpace>>,
+    /// The mapped extents as `(base, len)`, for [`contains`] and [`lift_region`].
+    regions: Vec<(u64, usize)>,
+    /// Every address a call site in this image might name - both `slot_va` and
+    /// `stub_va` - exactly as [`crate::Program`] keys its own.
+    imports: BTreeMap<u64, ImportSite>,
+    /// The same sites by the address they resolved to; see
+    /// [`Program::import_by_target`](crate::Program::import_by_target), which also
+    /// explains why this one is hashed and [`imports`](Image::imports) is not.
+    imports_by_target: AddrMap<ImportSite>,
+    /// Slid extents from `LC_FUNCTION_STARTS`, the hint [`lift_region`] uses.
+    functions: Vec<Range<u64>>,
+    exports: ExportTable,
+    slide: u64,
+    /// One per `dlopen` not yet matched by a `dlclose`, and one per loaded image
+    /// bound against this one. Changed only under the [`IMAGES`] lock.
+    refs: AtomicUsize,
+    /// Never unloaded: `RTLD_NODELETE`, or content dyld never unloads either. See
+    /// [`never_unloadable`].
+    pinned: AtomicBool,
+    /// Set when the last reference goes, so a `dlopen` racing the unload maps a
+    /// fresh copy rather than reviving this one.
+    unloading: AtomicBool,
+    /// The loaded images this one bound against, each holding a reference for it.
+    dependencies: Vec<&'static Image>,
+    /// The dylibs mapped with it, which a later `dlopen` shares.
+    linked: Vec<LinkedImage>,
+    /// Install names from its load commands, in ordinal order.
+    dylibs: Vec<String>,
+    /// The `LC_REEXPORT_DYLIB` subset of `dylibs`.
+    reexported_dylibs: Vec<String>,
+}
+
+impl Image {
+    /// Every mapped segment of the image and the dependencies linked with it.
+    fn ranges(&self) -> Vec<Range<u64>> {
+        self.report
+            .images
+            .iter()
+            .flat_map(|i| &i.segments)
+            .filter(|s| s.vmsize != 0)
+            .map(|s| s.vmaddr..s.vmaddr.wrapping_add(s.vmsize))
+            .collect()
+    }
+}
+
+/// An [`MmapSpace`] shared across the threads running the guest. Its `Drop` is the
+/// unmap; otherwise it is only read, by [`Image::with_memory`].
+struct SharedSpace(MmapSpace);
+
+// SAFETY: see the type note.
+unsafe impl Sync for SharedSpace {}
+unsafe impl Send for SharedSpace {}
+
+/// Every image `dlopen` has produced and `dlclose` has not unloaded, in load order.
+static IMAGES: Mutex<Vec<&'static Image>> = Mutex::new(Vec::new());
+
+/// The published, immutable view of [`IMAGES`]: a leaked slice, swapped whole.
+static VIEW: AtomicPtr<&'static [&'static Image]> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The guest executable's path and slide.
+static EXECUTABLE: Mutex<Option<(String, u64)>> = Mutex::new(None);
+
+/// One image this runtime mapped, as much of it as [`guest_image_at`] needs.
+struct MappedImage {
+    /// The install name or path the link knew it by, as [`LinkedImage::name`].
+    name: String,
+    /// Where the image was read from, as [`ImageReport::path`].
+    path: String,
+    /// The mapped `mach_header`, which is what dyld calls an image's base.
+    header: u64,
+    slide: u64,
+    /// Slid `[lo, hi)` of each segment.
+    segments: Vec<(u64, u64)>,
+}
+
+/// The images the program's launch mapped, the executable first, under either
+/// backend.
+///
+/// Nothing else answers for them under `native`: dyld never saw these mappings, so its `_dyld_find_unwind_sections` reports no
+/// unwind info for a guest frame and a throw terminates instead of unwinding.
+/// Written once, before the program runs, and read once per frame of every
+/// unwind - so a lock rather than a `OnceLock` would put the unwinder's frame
+/// walk behind a mutex.
+static MAPPED: OnceLock<Vec<MappedImage>> = OnceLock::new();
+
+/// One image a link mapped beside its root - the program's dependencies, or a
+/// `dlopen`ed image's - as something a later `dlopen` can bind against.
+struct LinkedImage {
+    /// The install name or path the loader knew it by - `@rpath/QtCore.framework/
+    /// Versions/5/QtCore` for a framework inside a bundle.
+    name: String,
+    /// The file it was read from, which is what is re-read: an install name
+    /// can be a path on the machine that built it.
+    path: String,
+    slide: u64,
+    /// Parsed from the file on first use, and `None` if it cannot be: the image
+    /// is already mapped, so re-reading it is pure cost and only a `dlopen` ever
+    /// pays it.
+    parsed: OnceLock<Option<LinkedExports>>,
+}
+
+/// What a [`LinkedImage`] offers a binder: its own trie and the edges it
+/// forwards through.
+struct LinkedExports {
+    exports: ExportTable,
+    /// Install names in ordinal order, which a trie re-export's ordinal indexes.
+    dependencies: Vec<String>,
+    /// The `LC_REEXPORT_DYLIB` subset of `dependencies`, whose tries this image
+    /// publishes without copying a single entry into its own.
+    reexports: Vec<String>,
+}
+
+impl LinkedExports {
+    fn parse<S: MachSpec>(bytes: &[u8], spec: S) -> Option<Self> {
+        let obj = MachObject::parse_any(bytes, spec).ok()?;
+        let names = |reexport_only: bool| {
+            obj.dependencies()
+                .iter()
+                .filter(|d| !reexport_only || d.kind == DependencyKind::Reexport)
+                .map(|d| d.install_name.to_string())
+                .collect()
+        };
+        Some(LinkedExports {
+            exports: ExportTable::parse(&obj).ok()?,
+            dependencies: names(false),
+            reexports: names(true),
+        })
+    }
+
+    /// As [`LinkedExports::parse`], for the backend now running.
+    fn parse_for_engine(bytes: &[u8]) -> Option<Self> {
+        match crate::exec::active()?.engine() {
+            crate::exec::Engine::Native => Self::parse(bytes, crate::exec::native::HOST_SPEC),
+            crate::exec::Engine::Emulated => Self::parse(bytes, X86_64),
+        }
+    }
+}
+
+/// Deepest chain of re-exports followed before giving up, which only a cycle
+/// reaches; machish's own namespace uses the same bound.
+const MAX_REEXPORT_DEPTH: usize = 16;
+
+impl LinkedImage {
+    /// Every image of `report` but its root.
+    fn of(report: &LinkReport) -> Vec<LinkedImage> {
+        let root = report.root().map(|r| r.name.as_str());
+        report
+            .images
+            .iter()
+            .filter(|i| Some(i.name.as_str()) != root)
+            .map(|i| LinkedImage {
+                name: i.name.clone(),
+                path: i.path.clone(),
+                slide: i.slide,
+                parsed: OnceLock::new(),
+            })
+            .collect()
+    }
+
+    /// Matched by leaf name like [`LoadedImages`], and for the same reason: one
+    /// side spells it `@rpath/QtCore.framework/Versions/5/QtCore` and the other
+    /// holds whatever path the file was opened from.
+    fn answers_to(&self, wanted: &str) -> bool {
+        leaf(&self.name) == wanted || leaf(&self.path) == wanted
+    }
+
+    fn parsed(&self) -> Option<&LinkedExports> {
+        self.parsed
+            .get_or_init(|| {
+                let bytes = std::fs::read(&self.path)
+                    .ok()
+                    .or_else(|| std::fs::read(resolve_path(&self.name)?).ok())?;
+                LinkedExports::parse_for_engine(&bytes)
+            })
+            .as_ref()
+    }
+
+    fn exports(&self) -> Option<&ExportTable> {
+        self.parsed().map(|p| &p.exports)
+    }
+
+    /// Look `name` up here, following re-exports into the images of `peers`,
+    /// the set this image was linked with.
+    ///
+    /// Following them is what keeps a plugin's C++ ABI imports in the guest:
+    /// `libc++` re-exports all of `libc++abi` by load command, so `___dynamic_cast`
+    /// is in no trie a plugin's two-level reference names, and an unfollowed
+    /// edge falls through to the host's `libstdc++` - whose `type_info` vtable
+    /// layout is not `libc++abi`'s.
+    fn resolve(
+        &self,
+        peers: &[LinkedImage],
+        name: &str,
+        depth: usize,
+    ) -> Option<machish::resolve::Resolved> {
+        if depth > MAX_REEXPORT_DEPTH {
+            return None;
+        }
+        let parsed = self.parsed()?;
+        let peer = |target: &str| peers.iter().find(|p| p.answers_to(leaf(target)));
+        let Some(export) = parsed.exports.get(name) else {
+            return parsed
+                .reexports
+                .iter()
+                .filter_map(|target| peer(target))
+                .find_map(|next| next.resolve(peers, name, depth + 1));
+        };
+        if let ExportValue::Reexport {
+            ordinal,
+            imported_name,
+        } = &export.value
+        {
+            let target = parsed
+                .dependencies
+                .get(usize::from(*ordinal).checked_sub(1)?)?;
+            let name = imported_name.as_deref().unwrap_or(name);
+            return peer(target)?.resolve(peers, name, depth + 1);
+        }
+        let addr = export.address(self.slide)?;
+        Some(machish::resolve::Resolved {
+            addr,
+            kind: match export.kind {
+                machish::exports::ExportKind::ThreadLocal => {
+                    machish::resolve::SymbolKind::ThreadLocal
+                }
+                _ => machish::resolve::SymbolKind::Function,
+            },
+            tag: 0,
+        })
+    }
+}
+
+/// The images the program's own link loaded, as recorded by
+/// [`register_mapped_images`]: every image of that link but the executable, which
+/// [`MainExports`] answers for.
+///
+/// Set once, before the program runs. See [`ProgramImages`].
+static PROGRAM_IMAGES: OnceLock<Vec<LinkedImage>> = OnceLock::new();
+
+/// Everything the *executable* was linked against, as a symbol provider.
+///
+/// The gap this closes: [`MainExports`] answers for the executable and
+/// [`LoadedImages`] for images the guest `dlopen`ed, and **neither** answers for
+/// the dylibs the executable itself pulled in. So a plugin loaded at runtime
+/// could not bind to the framework it is a plugin *for* - Qt's Cocoa plugin had
+/// fourteen hundred unresolved imports, every one of them a symbol QtCore and
+/// QtGui were already exporting from memory a few pages away.
+struct ProgramImages;
+
+impl ProgramImages {
+    /// The recorded images whose leaf name matches a two-level reference, or all
+    /// of them for a flat one.
+    fn matching<'a>(named: Option<&'a str>) -> impl Iterator<Item = &'static LinkedImage> + 'a {
+        PROGRAM_IMAGES
+            .get()
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter(move |image| named.is_none_or(|n| image.answers_to(n)))
+    }
+}
+
+impl machish::resolve::SymbolProvider for ProgramImages {
+    fn provides(&self, install_name: &str) -> bool {
+        Self::matching(Some(leaf(install_name))).next().is_some()
+    }
+
+    /// Already mapped, so a plugin's dependency on it is met by this copy and
+    /// not a second one with globals of its own - but only if it can be bound
+    /// to at all.
+    fn stands_for(&self, install_name: &str) -> bool {
+        Self::matching(Some(leaf(install_name))).any(|image| image.exports().is_some())
+    }
+
+    fn resolve(&self, sym: &machish::fixups::SymbolRef<'_>) -> Option<machish::resolve::Resolved> {
+        let named = sym.library.install_name().map(leaf);
+        let all = PROGRAM_IMAGES
+            .get()
+            .map(|v| v.as_slice())
+            .unwrap_or_default();
+        Self::matching(named).find_map(|image| image.resolve(all, sym.name, 0))
+    }
+}
+
+/// Publish `report`'s images for the questions dyld cannot answer about them.
+pub fn register_mapped_images(report: &LinkReport) {
+    let images: Vec<MappedImage> = report
+        .images
+        .iter()
+        .map(|i| MappedImage {
+            name: i.name.clone(),
+            path: i.path.clone(),
+            header: i.base,
+            slide: i.slide,
+            segments: i
+                .segments
+                .iter()
+                .map(|s| (s.vmaddr, s.vmaddr.wrapping_add(s.vmsize)))
+                .collect(),
+        })
+        .collect();
+    let _ = MAPPED.set(images);
+    // The same images as something a later `dlopen` can bind against. The root
+    // is left out: it is [`MainExports`]' job, which knows the path it was
+    // launched from and answers `@executable_path` as well.
+    let _ = PROGRAM_IMAGES.set(LinkedImage::of(report));
+}
+
+/// The slide of the first image the executable was linked against whose
+/// install name satisfies `is_image`.
+///
+/// A `dlopen`ed image binds to the program's copy of a runtime library rather
+/// than mapping its own, so that library is in no report but the program's.
+pub fn program_image_slide(is_image: &dyn Fn(&str) -> bool) -> Option<u64> {
+    PROGRAM_IMAGES
+        .get()?
+        .iter()
+        .find(|image| is_image(&image.name))
+        .map(|image| image.slide)
+}
+
+/// The main executable's export table, parsed once, on first use.
+static MAIN_EXPORTS: Mutex<Option<&'static MainExports>> = Mutex::new(None);
+
+/// The main executable, as something a `dlopen`ed image can bind against.
+struct MainExports {
+    /// Its trie and the install names it links against.
+    linked: LinkedExports,
+    slide: u64,
+    /// The path the executable was loaded from, and its last component, which
+    /// are the two spellings a two-level reference could use.
+    path: String,
+}
+
+impl machish::resolve::SymbolProvider for MainExports {
+    fn provides(&self, install_name: &str) -> bool {
+        install_name == self.path
+            || Some(install_name) == self.path.rsplit('/').next()
+            || install_name == "@executable_path"
+    }
+
+    fn resolve(&self, sym: &machish::fixups::SymbolRef<'_>) -> Option<machish::resolve::Resolved> {
+        let export = self.linked.exports.get(sym.name)?;
+        // A re-export forwards into another library and has no address of its
+        // own; answering zero would bind the caller to nothing and report
+        // success.
+        let addr = export.address(self.slide)?;
+        Some(machish::resolve::Resolved {
+            addr,
+            kind: match export.kind {
+                machish::exports::ExportKind::ThreadLocal => {
+                    machish::resolve::SymbolKind::ThreadLocal
+                }
+                _ => machish::resolve::SymbolKind::Function,
+            },
+            tag: 0,
+        })
+    }
+}
+
+/// Every image the guest has already loaded, as something a newly loaded one can bind
+/// against.
+///
+/// **Loading it again would be the wrong repair**, and is what a `DylibSource` that
+/// guessed harder would do:
+///
+/// ## Matching
+///
+/// By **leaf name**, in both directions.
+#[derive(Default)]
+struct LoadedImages {
+    /// Every image an answer came from, which the new image then holds a
+    /// reference to: unloading one would leave the other's bindings dangling.
+    bound: Mutex<Vec<&'static Image>>,
+}
+
+/// The file name of an install name or path, which is what both sides agree on.
+fn leaf(name: &str) -> &str {
+    name.rsplit('/').next().unwrap_or(name)
+}
+
+impl LoadedImages {
+    /// The live image that is, or carried in, a library of leaf name `wanted`.
+    fn holding(wanted: &str) -> Option<&'static Image> {
+        find(|i| {
+            let held = leaf(&i.path) == wanted || i.linked.iter().any(|l| l.answers_to(wanted));
+            (held && !i.unloading.load(Ordering::Acquire)).then_some(i)
+        })
+    }
+}
+
+impl machish::resolve::SymbolProvider for LoadedImages {
+    fn provides(&self, install_name: &str) -> bool {
+        Self::holding(leaf(install_name)).is_some()
+    }
+
+    /// A library an earlier `dlopen` mapped - itself or as a dependency - is
+    /// shared by the next image that needs it, as dyld shares it: a second copy
+    /// would have globals of its own, and SDL initialised in one would be
+    /// uninitialised in the other.
+    fn stands_for(&self, install_name: &str) -> bool {
+        let wanted = leaf(install_name);
+        Self::holding(wanted).is_some_and(|image| {
+            leaf(&image.path) == wanted
+                || image
+                    .linked
+                    .iter()
+                    .any(|l| l.answers_to(wanted) && l.exports().is_some())
+        })
+    }
+
+    fn resolve(&self, sym: &machish::fixups::SymbolRef<'_>) -> Option<machish::resolve::Resolved> {
+        // A two-level reference is a claim about *which* image defines the
+        // symbol, and honouring it is the whole reason `machish` carries the
+        // library through to here.
+        let named = sym.library.install_name().map(leaf);
+        find(|image| {
+            if image.unloading.load(Ordering::Acquire) {
+                return None;
+            }
+            let own = named
+                .is_none_or(|n| n == leaf(&image.path))
+                .then(|| image.exports.get(sym.name))
+                .flatten()
+                // A re-export has no address of its own; see [`MainExports`].
+                .and_then(|export| Some((export.address(image.slide)?, export.kind)))
+                .map(|(addr, kind)| machish::resolve::Resolved {
+                    addr,
+                    kind: match kind {
+                        machish::exports::ExportKind::ThreadLocal => {
+                            machish::resolve::SymbolKind::ThreadLocal
+                        }
+                        _ => machish::resolve::SymbolKind::Function,
+                    },
+                    tag: 0,
+                });
+            // Then what it carried, which unloads with it and so is bound
+            // through it.
+            let found = own.or_else(|| {
+                image
+                    .linked
+                    .iter()
+                    .filter(|l| named.is_none_or(|n| l.answers_to(n)))
+                    .find_map(|l| l.resolve(&image.linked, sym.name, 0))
+            })?;
+            let mut bound = self.bound.lock().unwrap_or_else(|e| e.into_inner());
+            if !bound.iter().any(|b| std::ptr::eq(*b, image)) {
+                bound.push(image);
+            }
+            Some(found)
+        })
+    }
+}
+
+/// The main executable's exports, parsed on first `dlopen` and kept.
+///
+/// Lazy rather than built at startup because a program that never calls
+/// `dlopen` should not pay to re-read and parse its own executable.
+fn main_exports() -> Option<&'static MainExports> {
+    let mut slot = MAIN_EXPORTS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(existing) = *slot {
+        return Some(existing);
+    }
+    let (path, slide) = EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let linked = LinkedExports::parse_for_engine(&bytes)?;
+    let leaked: &'static MainExports = Box::leak(Box::new(MainExports {
+        linked,
+        slide,
+        path,
+    }));
+    *slot = Some(leaked);
+    Some(leaked)
+}
+
+/// The message `dlerror` will report, and the buffer it last handed out.
+static ERROR: Mutex<Option<CString>> = Mutex::new(None);
+static REPORTED: Mutex<Option<CString>> = Mutex::new(None);
+
+/// A token for "the main executable and everything already loaded".
+static GLOBAL_TOKEN: u8 = 0;
+
+fn global_handle() -> u64 {
+    &GLOBAL_TOKEN as *const u8 as usize as u64
+}
+
+/// Libraries this runtime *is*, which a guest may `dlopen` by name.
+///
+/// A framework reimplemented in this tree has no file on disk, so
+/// [`resolve_path`] - which ends in `fs::canonicalize` - can never find it, and
+/// `dlopen("/System/Library/Frameworks/AppKit.framework/AppKit")` would fall
+/// through to the host's loader and come back null. The *link* half of this
+/// already works: a flat `SyntheticDylib` ahead of the native provider in
+/// `HostProviders::chain` shadows every two-level binding. This is the other
+/// half.
+///
+/// Registered by install name and by the framework paths that name it, because a
+/// guest asks with whichever spelling it was given.
+mod synthetic {
+    use std::sync::Mutex;
+
+    /// One virtual library: what it answers to, and what it answers with.
+    pub struct Library {
+        pub names: Vec<String>,
+        /// This library's own exports, and nothing it links against.
+        pub symbol: Box<dyn Fn(&str) -> Option<u64> + Send + Sync>,
+        pub links: Links,
+        /// The address a guest is handed, which is this entry's own.
+        pub handle: u64,
+    }
+
+    /// The install names a library's load commands would name.
+    #[derive(Clone, Copy, Default)]
+    pub struct Links {
+        /// Re-exported: searched as part of the library itself.
+        pub reexports: &'static [&'static str],
+        /// Every other library it links against, which a `dlsym` on a handle
+        /// without `RTLD_FIRST` searches after it.
+        pub dependencies: &'static [&'static str],
+    }
+
+    static LIBRARIES: Mutex<Vec<&'static Library>> = Mutex::new(Vec::new());
+
+    /// Publish a library under `names`, answering through `symbol`.
+    ///
+    /// The handle is the leaked entry's own address, which is distinct from
+    /// every image base and from [`super::global_handle`] by construction: it is
+    /// this process's heap, and a guest image is mapped elsewhere. It is also
+    /// aligned, which leaves bit 0 free for `RTLD_FIRST`.
+    pub fn register(
+        names: &[&str],
+        symbol: impl Fn(&str) -> Option<u64> + Send + Sync + 'static,
+        links: Links,
+    ) {
+        let mut libraries = LIBRARIES.lock().unwrap_or_else(|e| e.into_inner());
+        if libraries
+            .iter()
+            .any(|l| l.names.iter().any(|n| n == names[0]))
+        {
+            return;
+        }
+        let leaked: &'static Library = Box::leak(Box::new(Library {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            symbol: Box::new(symbol),
+            links,
+            handle: 0,
+        }));
+        // The handle is the entry's address, filled in now that it has one.
+        let handle = leaked as *const Library as usize as u64;
+        // SAFETY: the entry was just leaked and nothing else has seen it, so
+        // this is the only write and it happens before publication.
+        unsafe { (*(leaked as *const Library as *mut Library)).handle = handle };
+        libraries.push(leaked);
+    }
+
+    /// The library `path` names, by install name or by any spelling of it.
+    ///
+    /// Matched on the *leaf* as well as the whole path, because a guest asks for
+    /// `AppKit.framework/Versions/C/AppKit` and for `AppKit` and means the same
+    /// library.
+    pub fn find(path: &str) -> Option<&'static Library> {
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        LIBRARIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|l| {
+                l.names.iter().any(|n| {
+                    n == path
+                        || n == leaf
+                        // dyld falls back to `/usr/lib/<name>` for a bare
+                        // name, which is how Mono's `DllImport("libc")`
+                        // reaches `libc.dylib`.
+                        || (leaf == path && n.rsplit('/').next() == Some(leaf))
+                })
+            })
+            .copied()
+    }
+
+    /// The library a handle names, or `None` for a handle that is not one.
+    pub fn by_handle(handle: u64) -> Option<&'static Library> {
+        LIBRARIES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|l| l.handle == handle)
+            .copied()
+    }
+}
+
+pub use synthetic::Links;
+pub use synthetic::register as register_synthetic;
+
+/// Return the guest image at a dyld image-list index.
+fn indexed_image(index: u32) -> Option<(u64, u64, String)> {
+    if index == 0 {
+        let (path, slide) = EXECUTABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let header = MAIN_HEADER.load(Ordering::Acquire);
+        return (header != 0).then_some((header, slide, path));
+    }
+    // The executable's own link comes next, as dyld lists everything it mapped
+    // at launch before anything `dlopen` adds. Its first image is the executable.
+    let linked = launch_dependencies();
+    let index = index as usize - 1;
+    if let Some(image) = linked.get(index) {
+        return Some((image.header, image.slide, image.path.clone()));
+    }
+    snapshot()
+        .get(index - linked.len())
+        .map(|image| (image.handle, image.slide, image.path.clone()))
+}
+
+/// The images the executable was linked against at launch, the executable left
+/// out.
+fn launch_dependencies() -> &'static [MappedImage] {
+    MAPPED
+        .get()
+        .map_or(&[], |images| images.get(1..).unwrap_or_default())
+}
+
+/// The header of the launch-time dependency read from `path`, by whatever
+/// spelling. It is that image's `dlopen` handle: dyld never maps a file twice,
+/// and a second copy would have statics of its own.
+fn launch_dependency_named(path: &str) -> Option<u64> {
+    static CANONICAL: OnceLock<Vec<Option<std::path::PathBuf>>> = OnceLock::new();
+    let images = launch_dependencies();
+    if let Some(image) = images.iter().find(|i| i.path == path) {
+        return Some(image.header);
+    }
+    let wanted = std::fs::canonicalize(path).ok()?;
+    let canonical = CANONICAL.get_or_init(|| {
+        images
+            .iter()
+            .map(|i| std::fs::canonicalize(&i.path).ok())
+            .collect()
+    });
+    let index = canonical.iter().position(|c| c.as_ref() == Some(&wanted))?;
+    images.get(index).map(|i| i.header)
+}
+
+/// Whether `handle` is a launch-time dependency's, which is never unloaded.
+fn is_launch_dependency(handle: u64) -> bool {
+    handle != 0 && launch_dependencies().iter().any(|i| i.header == handle)
+}
+
+fn image_count() -> u32 {
+    u32::from(MAIN_HEADER.load(Ordering::Acquire) != 0)
+        .saturating_add(launch_dependencies().len() as u32)
+        .saturating_add(IMAGE_COUNT.load(Ordering::Acquire) as u32)
+}
+
+/// The main executable's `mach_header` as the guest can address it.
+static MAIN_HEADER: AtomicU64 = AtomicU64::new(0);
+
+/// Record the main executable's mach header address.
+pub fn set_executable_header(va: u64) {
+    MAIN_HEADER.store(va, Ordering::Release);
+    // SAFETY: the header and its load commands are mapped readable at `va`,
+    // which the host addresses as the guest does.
+    let header = unsafe {
+        let sizeofcmds = std::ptr::read_unaligned((va as usize + 20) as *const u32);
+        std::slice::from_raw_parts(va as usize as *const u8, 32 + sizeofcmds as usize)
+    };
+    if let Some(version) = machish::image::sdk_version(header) {
+        darwin::images::set_program_sdk(version);
+    }
+}
+
+/// Record where the guest executable came from, and where it landed.
+pub fn set_executable_path(path: &str, slide: u64) {
+    // Symlinks kept, as `Layout::enclosing` keeps them.
+    let absolute = std::path::absolute(path)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    *EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()) = Some((absolute, slide));
+}
+
+/// Whether `path` is the main executable's file, by whatever spelling.
+fn names_main_executable(path: &str) -> bool {
+    let Some(executable) = executable_host_path() else {
+        return false;
+    };
+    let canonical = |path: &str| std::fs::canonicalize(path).ok();
+    resolve_path(path)
+        .and_then(|resolved| canonical(&resolved))
+        .is_some_and(|resolved| canonical(&executable) == Some(resolved))
+}
+
+/// The path presented to guest process-introspection calls.
+pub fn executable_path() -> Option<String> {
+    EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(path, _)| guest_spelling(path))
+}
+
+/// The executable's host path, which [`executable_path`] spells as the guest sees it.
+pub fn executable_host_path() -> Option<String> {
+    EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(path, _)| path.clone())
+}
+
+/// How many images are loaded, and the address range they span.
+///
+/// A program that never calls `dlopen` now pays one relaxed atomic load, and a program
+/// that has pays that plus a range check before any lock is taken.
+static IMAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static REGION_LO: AtomicU64 = AtomicU64::new(u64::MAX);
+static REGION_HI: AtomicU64 = AtomicU64::new(0);
+
+static IMPORT_FILTER: AtomicPtr<&'static [u64]> = AtomicPtr::new(core::ptr::null_mut());
+
+/// The same, over [`Image::imports_by_target`]'s keys.
+static TARGET_FILTER: AtomicPtr<&'static [u64]> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Whether `filter` has heard of `va`. A yes may be a collision; a no is final.
+/// Null - nothing published yet - answers yes, which costs a probe, not an answer.
+fn heard_of(filter: &AtomicPtr<&'static [u64]>, va: u64) -> bool {
+    let published = filter.load(Ordering::Acquire);
+    if published.is_null() {
+        return true;
+    }
+    // SAFETY: as `find` - leaked by `publish_filters`, never freed, never mutated.
+    crate::program::filter_has(unsafe { *published }, va)
+}
+
+/// Rebuild both filters from `images`. Called under the [`IMAGES`] lock.
+fn publish_filters(images: &[&'static Image]) {
+    let publish = |filter: &AtomicPtr<&'static [u64]>, built: Box<[u64]>| {
+        let leaked: &'static [u64] = Box::leak(built);
+        filter.store(Box::leak(Box::new(leaked)) as *mut _, Ordering::Release);
+    };
+    let imports = images.iter().map(|i| i.imports.len()).sum();
+    publish(
+        &IMPORT_FILTER,
+        crate::program::build_import_filter(
+            images.iter().flat_map(|i| i.imports.keys().copied()),
+            imports,
+        ),
+    );
+    let targets = images.iter().map(|i| i.imports_by_target.len()).sum();
+    publish(
+        &TARGET_FILTER,
+        crate::program::build_import_filter(
+            images
+                .iter()
+                .flat_map(|i| i.imports_by_target.keys().copied()),
+            targets,
+        ),
+    );
+}
+
+/// Search the loaded images without copying the list.
+///
+/// Every `Image` is `&'static` - leaked at load, never freed - so a reference found
+/// inside the lock outlives it, and the guard is dropped before the caller does
+/// anything with the answer.
+fn snapshot() -> Vec<&'static Image> {
+    let view = VIEW.load(Ordering::Acquire);
+    if view.is_null() {
+        return Vec::new();
+    }
+    // SAFETY: as in `find`.
+    unsafe { *view }.to_vec()
+}
+
+fn find<R>(mut f: impl FnMut(&'static Image) -> Option<R>) -> Option<R> {
+    let view = VIEW.load(Ordering::Acquire);
+    if view.is_null() {
+        return None;
+    }
+    // SAFETY: non-null only after a `dlopen` stored a leaked slice, which is
+    // never freed and never mutated. See the note on `VIEW`.
+    let images: &'static [&'static Image] = unsafe { *view };
+    images.iter().copied().find_map(&mut f)
+}
+
+/// The import registered at `va` in any dynamically loaded image.
+pub fn import_at(va: u64) -> Option<&'static ImportSite> {
+    // A slot or stub of a loaded image is *inside* that image, so an address
+    // outside every dlopened mapping cannot be one.
+    if va < REGION_LO.load(Ordering::Relaxed) || va >= REGION_HI.load(Ordering::Relaxed) {
+        return None;
+    }
+    if !heard_of(&IMPORT_FILTER, va) {
+        return None;
+    }
+    find(|i| i.imports.get(&va))
+}
+
+/// The import of any dynamically loaded image that *resolved to* `host`.
+pub fn import_by_target(host: u64) -> Option<&'static ImportSite> {
+    // The same two-compare rejection [`import_at`] makes, for a colder version
+    // of the same problem.
+    if IMAGE_COUNT.load(Ordering::Relaxed) == 0 || !heard_of(&TARGET_FILTER, host) {
+        return native_symbol_at(host);
+    }
+    find(|i| i.imports_by_target.get(&host)).or_else(|| native_symbol_at(host))
+}
+
+/// What `symbol` resolved to in any dynamically loaded image.
+pub fn resolved_symbol(symbol: &str) -> Option<u64> {
+    find(|i| {
+        i.imports
+            .values()
+            .find(|s| !s.is_stub && s.symbol == symbol && s.resolved != 0)
+            .map(|s| s.resolved)
+    })
+}
+
+/// Whether `va` lies inside a dynamically loaded image.
+pub fn contains(va: u64) -> bool {
+    // A host address is nowhere near a guest mapping, and this is the question
+    // asked most often and answered "no" almost every time.
+    if va < REGION_LO.load(Ordering::Relaxed) || va >= REGION_HI.load(Ordering::Relaxed) {
+        return false;
+    }
+    find(|i| region_of(i, va).map(|_| ())).is_some()
+}
+
+/// The mapped region holding `va`, for an image the *guest* loaded.
+///
+/// The loader of the *executable* owns only the executable's regions, so a pass
+/// that walks a `dlopen`ed image's metadata - selector uniquing and reference
+/// rewriting both - cannot find its addresses there. This is where they are.
+pub fn region_containing(va: u64) -> Option<(u64, &'static [u8])> {
+    if va < REGION_LO.load(Ordering::Relaxed) || va >= REGION_HI.load(Ordering::Relaxed) {
+        return None;
+    }
+    find(|image| region_of(image, va))
+}
+
+/// The recorded function starts inside `range`, for an image the *guest* loaded.
+pub fn function_starts_in(range: std::ops::Range<u64>) -> Vec<u64> {
+    // An address is in one image, so the first image with anything in `range` is
+    // the answer - and `starts_within` finds it by binary search rather than by
+    // scanning that image's function table. See
+    // [`crate::program::Program::function_starts_in`].
+    find(|image| {
+        let starts: Vec<u64> = crate::program::starts_within(&image.functions, &range).collect();
+        (!starts.is_empty()).then_some(starts)
+    })
+    .unwrap_or_default()
+}
+
+/// The region to lift in order to execute `va`, if it is in a loaded image.
+pub fn lift_region(va: u64) -> Option<(crate::region::Region, Vec<u8>)> {
+    find(|image| {
+        let (base, bytes) = region_of(image, va)?;
+        // A loaded image, so not memory the guest writes; see [`crate::region`].
+        let region = crate::region::region_for(bytes, base, va, false)?;
+        let start = usize::try_from(region.range.start - base).ok()?;
+        let end = usize::try_from(region.range.end - base)
+            .ok()?
+            .min(bytes.len());
+        Some((region, bytes.get(start..end)?.to_vec()))
+    })
+}
+
+fn region_of(image: &'static Image, va: u64) -> Option<(u64, &'static [u8])> {
+    let &(base, len) = image
+        .regions
+        .iter()
+        .find(|(base, len)| va >= *base && va < base + *len as u64)?;
+    // SAFETY: mapped until `unload`, which first takes the image out of the
+    // published view. A reader holding an older view that asks about an address
+    // inside an unloaded image is following the guest's own use-after-free.
+    Some((base, unsafe {
+        std::slice::from_raw_parts(base as usize as *const u8, len)
+    }))
+}
+
+/// `va` as `image+offset`, for an image the guest loaded. See
+/// [`Program::locate`](crate::Program::locate).
+pub fn locate(va: u64) -> Option<String> {
+    find(|image| {
+        for report in &image.report.images {
+            for seg in &report.segments {
+                if va >= seg.vmaddr && va < seg.vmaddr.wrapping_add(seg.vmsize) {
+                    let name = report.name.rsplit('/').next().unwrap_or(&report.name);
+                    return Some(format!("{name}+{:#x}", va.wrapping_sub(report.slide)));
+                }
+            }
+        }
+        None
+    })
+}
+
+/// The file and slide of the loaded image whose code holds `va`.
+pub fn code_image(va: u64) -> Option<(String, u64)> {
+    find(|image| {
+        image
+            .report
+            .images
+            .iter()
+            .find_map(|report| crate::program::code_image_in(report, va))
+    })
+}
+
+/// The loaded image whose mapping holds `va`.
+pub fn image_holding(va: u64) -> Option<&'static Image> {
+    find(|image| region_of(image, va).map(|_| image))
+}
+
+impl Image {
+    /// Runs `f` on the image's mapping, or returns `None` once it is unloaded.
+    pub fn with_memory<R>(&self, f: impl FnOnce(&MmapSpace) -> R) -> Option<R> {
+        let memory = self.memory.lock().unwrap_or_else(|e| e.into_inner());
+        memory.as_ref().map(|shared| f(&shared.0))
+    }
+}
+
+/// How many images the guest has loaded.
+pub fn loaded() -> usize {
+    IMAGE_COUNT.load(Ordering::Acquire)
+}
+
+/// Load `path` as a guest image, or return the handle it already has.
+pub fn open(path: &str) -> std::result::Result<u64, String> {
+    // A library this runtime *is* has no file, so this has to come before
+    // anything that looks for one. See [`synthetic`].
+    if let Some(library) = synthetic::find(path) {
+        open_reexports(library);
+        return Ok(library.handle);
+    }
+    let resolved = resolve_path(path).ok_or_else(|| format!("no such file: {path}"))?;
+
+    if let Some(image) =
+        find(|i| (i.path == resolved && !i.unloading.load(Ordering::Acquire)).then_some(i))
+        && retain(image)
+    {
+        return Ok(image.handle);
+    }
+    if let Some(header) = launch_dependency_named(&resolved) {
+        return Ok(header);
+    }
+
+    let bytes = std::fs::read(&resolved).map_err(|e| format!("{resolved}: {e}"))?;
+    match crate::exec::active().map(|exec| exec.engine()) {
+        Some(crate::exec::Engine::Native) => open_with(
+            &resolved,
+            &bytes,
+            crate::exec::native::HOST_SPEC,
+            crate::cxxlib::HOST,
+        ),
+        Some(crate::exec::Engine::Emulated) => {
+            let handle = open_with(&resolved, &bytes, X86_64, Flavor::Intel)?;
+            crate::aot::profile::note_dlopen(&resolved);
+            Ok(handle)
+        }
+        None => Err("no execution backend is active".to_string()),
+    }
+}
+
+/// Load the real images `library` re-exports that nothing has loaded yet, as
+/// dyld loads an umbrella's re-exports with it. A library this runtime is is
+/// never unloaded, so neither are they.
+///
+/// A base without one is not an error, as it is not for the loader: its
+/// symbols stay unbound.
+fn open_reexports(library: &synthetic::Library) {
+    for &image in library.links.reexports {
+        if Scope::named(image).is_none()
+            && let Err(why) = open(image)
+            && crate::shims::vmmap::tracing()
+        {
+            eprintln!(
+                "rosemary: dlopen: {image}, re-exported by {}: {why}",
+                library.names[0]
+            );
+        }
+    }
+}
+
+/// Link `path` as the emulated backend's `dlopen` would, running none of its code:
+/// no Objective-C realization, `+load`, add-image callback or initializer.
+///
+/// For `rosemary aot`, which compiles the images a run `dlopen`ed and must see them
+/// placed and bound as a run would.
+pub fn link_without_running(path: &str) -> std::result::Result<&'static Image, String> {
+    let resolved = resolve_path(path).ok_or_else(|| format!("no such file: {path}"))?;
+    if let Some(image) = find(|i| (i.path == resolved).then_some(i)) {
+        return Ok(image);
+    }
+    let bytes = std::fs::read(&resolved).map_err(|e| format!("{resolved}: {e}"))?;
+    link(&resolved, &bytes, X86_64, Flavor::Intel)
+}
+
+/// Give `darwin::images` this loader's answers, which is how `CFBundle` and the
+/// File Manager reach it from beneath this crate.
+pub fn install_image_hooks() {
+    darwin::images::install(darwin::images::Loader {
+        virtual_directory,
+        open: |path| match path {
+            None => Some(global_handle()),
+            // `dlopen`'s order: this loader, then the host's.
+            Some(path) => open(path).ok().or_else(|| open_native(path)),
+        },
+        symbol: lookup,
+        image_path,
+    });
+}
+
+/// The host path of the guest image `addr` is in, the main executable included.
+fn image_path(addr: u64) -> Option<String> {
+    if addr == 0 {
+        return None;
+    }
+    if let Some(path) = find(|i| region_of(i, addr).map(|_| i.path.clone())) {
+        return Some(path);
+    }
+    let vm = crate::thunk::current()?;
+    if !vm.program.is_guest_address(addr) {
+        return None;
+    }
+    EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|(path, _)| path.clone())
+}
+
+/// The directory a guest reaches a provided framework through:
+/// `/System/Library/Frameworks` itself, and `X.framework` in it for every `X`
+/// registered by its framework path. Neither is on disk, since the framework is
+/// this runtime rather than a file.
+fn virtual_directory(path: &str) -> bool {
+    const FRAMEWORKS: &str = "/System/Library/Frameworks";
+    let path = path.trim_end_matches('/');
+    if path == FRAMEWORKS {
+        return true;
+    }
+    let Some(bundle) = path
+        .strip_prefix(FRAMEWORKS)
+        .and_then(|rest| rest.strip_prefix('/'))
+    else {
+        return false;
+    };
+    let Some(leaf) = bundle.strip_suffix(".framework") else {
+        return false;
+    };
+    !leaf.is_empty()
+        && !leaf.contains('/')
+        && synthetic::find(&format!("{FRAMEWORKS}/{bundle}/{leaf}")).is_some()
+}
+
+/// Load one image using the architecture and executable-memory policy of the
+/// backend that will call it.
+fn open_with<S: MachSpec + 'static>(
+    resolved: &str,
+    bytes: &[u8],
+    spec: S,
+    flavor: Flavor,
+) -> std::result::Result<u64, String> {
+    let leaked = link(resolved, bytes, spec, flavor)?;
+
+    // A loaded image's thread-locals are its own, and nothing else registers
+    // them.
+    let engine = crate::exec::active().map_or(crate::exec::Engine::Emulated, |e| e.engine());
+    crate::tls::register(&leaked.report, engine);
+
+    // Before any of this image's code runs, and after it is findable. Asked of
+    // the *backend* rather than of a `Vm`, because a native guest has no `Vm` and
+    // would otherwise get an image whose selector references were never uniqued.
+    let exec = crate::exec::active();
+    if let Some(exec) = exec {
+        exec.realize_loaded_objc(&leaked.report)
+            .map_err(|e| format!("{resolved}: objc: {e}"))?;
+    }
+
+    // Every `_dyld_register_func_for_add_image` callback, before this image's
+    // own code runs. See [`announce`].
+    announce(leaked.handle, leaked.slide);
+    // And every `objc_addLoadImageFunc` one, which libobjc calls as it maps an
+    // image - before `+load`.
+    for image in &leaked.report.images {
+        announce_objc(image.base);
+    }
+
+    // Now the image's own code, in dyld's order.
+    if let Some(exec) = exec {
+        exec.run_loaded_load_methods(&leaked.report)
+            .map_err(|e| format!("{resolved}: objc +load: {e}"))?;
+    }
+
+    run_initializers(leaked)?;
+    Ok(leaked.handle)
+}
+
+/// Map, bind and publish one image, running none of its code.
+fn link<S: MachSpec + 'static>(
+    resolved: &str,
+    bytes: &[u8],
+    spec: S,
+    flavor: Flavor,
+) -> std::result::Result<&'static Image, String> {
+    let object = MachObject::parse_any(bytes, spec)
+        .map_err(|e| format!("{resolved}: not a loadable Mach-O for this backend: {e}"))?;
+
+    // The emulated backend keeps anonymous images, which it recompiles rather
+    // than runs.
+    let mut memory = MmapSpace::new().file_backed(spec.natively_executable());
+    // Vendored libc++ ahead of the filesystem; see [`crate::cxxlib`].
+    let mut source = crate::cxxlib::source(flavor);
+    let hosts = HostProviders::new();
+    // Everything already loaded, which is what dyld resolves a new image
+    // against.
+    let main = main_exports();
+    let loaded = LoadedImages::default();
+    let program = ProgramImages;
+    let mut extra: Vec<&dyn machish::resolve::SymbolProvider> = main
+        .map(|m| m as &dyn machish::resolve::SymbolProvider)
+        .into_iter()
+        .collect();
+    // The program's own dependencies before the images the guest loaded: a
+    // plugin binds to the framework it extends, and that framework came in with
+    // the executable.
+    extra.push(&program as &dyn machish::resolve::SymbolProvider);
+    extra.push(&loaded as &dyn machish::resolve::SymbolProvider);
+    let mut loader = Loader::new(spec);
+    // `@executable_path` is the program's directory, not the plugin's, and the
+    // program's rpaths are searched after the plugin's own: a Qt plugin whose
+    // one rpath names nothing finds its framework through the executable's.
+    if let Some((executable, _)) = EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        let ctx = PathContext {
+            executable: Some(&executable),
+            loader: Some(&executable),
+            rpaths: &[],
+        };
+        let inherited = rpaths_of(&executable)
+            .iter()
+            .flat_map(|entry| machish::install_name::expand_rpath(entry, &ctx))
+            .collect();
+        loader.inherit_rpaths(inherited);
+        loader.executable_path(executable);
+    }
+    let mut report = loader
+        .link_with(
+            bytes,
+            resolved,
+            &mut memory,
+            &mut source,
+            &hosts.chain(&extra),
+        )
+        .map_err(|e| format!("{resolved}: {e}"))?;
+
+    // The same repair the program's own link needs, for the same reason.
+    crate::cxxlib::bind_unwinder_to_the_runtime(&mut report, &mut memory, flavor)
+        .map_err(|e| format!("{resolved}: unwinder: {e}"))?;
+    crate::cxxlib::bind_cxxabi_to_the_runtime(&mut report, &mut memory, flavor)
+        .map_err(|e| format!("{resolved}: cxxabi: {e}"))?;
+    crate::cxxlib::bind_objc_exceptions_to_the_runtime_cxxabi(&mut report, &mut memory, flavor)
+        .map_err(|e| format!("{resolved}: objc exceptions: {e}"))?;
+    // The program's allocator replacement reaches a plugin as it reaches every
+    // image the program was linked with.
+    crate::interpose::apply_to_loaded(&mut report, &mut memory)
+        .map_err(|e| format!("{resolved}: interpose: {e}"))?;
+
+    // Say what did not resolve, here, rather than letting the guest find out by
+    // calling it. The program's own link says it the same way, and this is the
+    // same announcement - see [`crate::program::announce_unbound_imports`].
+    crate::program::announce_unbound_imports(&report, &format!("dlopen({resolved})"));
+    crate::fault::note_images(&report);
+
+    let root = report
+        .root()
+        .ok_or_else(|| format!("{resolved}: linked to no images"))?;
+    let (base, slide) = (root.base, root.slide);
+
+    let functions = match object.section("__TEXT", "__text") {
+        Some(text) => machish::image::function_ranges(&object, text.addr, text.addr + text.size)
+            .map_err(|e| format!("{resolved}: {e}"))?
+            .into_iter()
+            .map(|r| r.start.wrapping_add(slide)..r.end.wrapping_add(slide))
+            .collect(),
+        // No `__text` is not a refusal here the way it is for a program.
+        None => Vec::new(),
+    };
+
+    let exports = ExportTable::parse(&object).map_err(|e| format!("{resolved}: {e}"))?;
+    let dylibs_of = |reexport_only: bool| {
+        object
+            .dependencies()
+            .iter()
+            .filter(|d| !reexport_only || d.kind == DependencyKind::Reexport)
+            .map(|d| d.install_name.to_string())
+            .collect::<Vec<_>>()
+    };
+    let (dylibs, reexported_dylibs) = (dylibs_of(false), dylibs_of(true));
+    // Everything mapped: this image, the ones loaded before it, and the program
+    // that started it all.
+    let vm = crate::thunk::current();
+    let is_guest = |va: u64| {
+        memory.region_at(va).is_some()
+            || contains(va)
+            || vm.is_some_and(|vm| vm.program.is_guest_address(va))
+    };
+    let (mut imports, imports_by_target) = collect_imports(&report, is_guest);
+
+    // The same substitution the program's own slots get - see
+    // [`crate::trampoline`] - and a `dlopen`ed plugin is where it pays most.
+    let eligible: Vec<(u64, ImportSite)> = imports
+        .iter()
+        .filter(|(_, site)| !site.is_stub && !is_guest(site.resolved))
+        .map(|(&va, site)| (va, site.clone()))
+        .collect();
+    crate::trampoline::install(
+        eligible.iter().map(|(va, site)| (*va, site)),
+        &|_| false,
+        &mut memory,
+    );
+    crate::program::seal_import_slots(imports.values_mut(), &memory);
+
+    let regions = memory
+        .regions()
+        .into_iter()
+        .map(|(base, bytes)| (base, bytes.len()))
+        .collect();
+    let pinned = never_unloadable(&report);
+    let linked = LinkedImage::of(&report);
+    let dependencies = loaded.bound.into_inner().unwrap_or_else(|e| e.into_inner());
+    // The `Image` itself is leaked even once unloaded: readers search the
+    // published view without a lock, so one may still hold it.
+    let leaked: &'static Image = Box::leak(Box::new(Image {
+        path: resolved.to_string(),
+        handle: base,
+        report,
+        memory: Mutex::new(Some(SharedSpace(memory))),
+        regions,
+        imports,
+        imports_by_target,
+        functions,
+        exports,
+        slide,
+        refs: AtomicUsize::new(1),
+        pinned: AtomicBool::new(pinned),
+        unloading: AtomicBool::new(false),
+        dependencies,
+        linked,
+        dylibs,
+        reexported_dylibs,
+    }));
+
+    // Published *before* the initializers run: an initializer is guest code in
+    // this image, and lifting it needs the image to be findable.
+    {
+        let mut images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+        images.push(leaked);
+        for dependency in &leaked.dependencies {
+            dependency.refs.fetch_add(1, Ordering::Relaxed);
+        }
+        for &(base, len) in &leaked.regions {
+            REGION_LO.fetch_min(base, Ordering::Relaxed);
+            REGION_HI.fetch_max(base + len as u64, Ordering::Relaxed);
+        }
+        publish(&images);
+    }
+    Ok(leaked)
+}
+
+/// Publish `images` as the view readers search. Called under the [`IMAGES`] lock.
+fn publish(images: &[&'static Image]) {
+    // The extents and the filters go up before the view does, so a reader
+    // that sees the image also sees a range and a filter that contain it.
+    publish_filters(images);
+    let published: &'static [&'static Image] = images.to_vec().leak();
+    let cell: &'static mut &'static [&'static Image] = Box::leak(Box::new(published));
+    VIEW.store(cell as *mut _, Ordering::Release);
+    IMAGE_COUNT.store(images.len(), Ordering::Release);
+    // A whole image's worth of addresses that meant something else a moment
+    // ago, imports among them. See [`crate::dispatch::invalidate`].
+    crate::dispatch::invalidate();
+}
+
+/// What dyld never unloads either: an image the Objective-C runtime holds
+/// classes from, one with thread-locals - every thread's block for it is filed
+/// under a key it owns - and one whose interpositions rebound other images.
+fn never_unloadable(report: &LinkReport) -> bool {
+    report
+        .images
+        .iter()
+        .any(|i| i.objc.is_some() || !i.thread_locals.is_empty() || !i.interpositions.is_empty())
+}
+
+/// Take a reference to an already loaded image for another `dlopen`. False when
+/// it is being unloaded, which leaves the caller to map it afresh.
+fn retain(image: &'static Image) -> bool {
+    let _images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+    if image.unloading.load(Ordering::Acquire) {
+        return false;
+    }
+    image.refs.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Keep the image at `handle` for the life of the process, as `RTLD_NODELETE`
+/// asks.
+fn pin(handle: u64) {
+    if let Some(image) = find(|i| (i.handle == handle).then_some(i)) {
+        image.pinned.store(true, Ordering::Release);
+    }
+}
+
+/// Whether `dlclose` unloads anything under the active backend.
+///
+/// Not under emulation: translations are cached by guest address and nothing
+/// evicts them yet, so code at a reused address would run the unloaded image's.
+fn unloads() -> bool {
+    crate::exec::active().is_some_and(|e| e.engine() == crate::exec::Engine::Native)
+}
+
+/// `dlclose(handle)`.
+fn close(handle: u64) -> std::result::Result<(), String> {
+    if !unloads()
+        || handle == global_handle()
+        || handle == RTLD_MAIN_ONLY
+        || native_handle(handle).is_some()
+    {
+        return Ok(());
+    }
+    let handle = handle & !FIRST_ONLY;
+    if synthetic::by_handle(handle).is_some() || is_launch_dependency(handle) {
+        return Ok(());
+    }
+    let image = find(|i| (i.handle == handle).then_some(i))
+        .ok_or_else(|| format!("dlclose({handle:#x}): invalid handle"))?;
+    release(image).map_err(|reason| format!("dlclose({}): {reason}", image.path))
+}
+
+/// Drop one reference to `image`, unloading it when that was the last.
+fn release(image: &'static Image) -> std::result::Result<(), String> {
+    {
+        let _images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+        let refs = image.refs.load(Ordering::Relaxed);
+        if refs == 0 || image.unloading.load(Ordering::Acquire) {
+            return Err("closed more times than it was opened".to_string());
+        }
+        image.refs.store(refs - 1, Ordering::Relaxed);
+        if refs > 1 || image.pinned.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        image.unloading.store(true, Ordering::Release);
+    }
+    unload(image);
+    Ok(())
+}
+
+/// Unload an image nothing references any more, in dyld's order: its exit
+/// handlers, its static terminators and the remove-image callbacks, all while
+/// its code is still mapped; then unlist and unmap it; then release what it
+/// bound against.
+fn unload(image: &'static Image) {
+    if crate::shims::vmmap::tracing() {
+        eprintln!("rosemary: dlclose: unloading {}", image.path);
+    }
+    let ranges = image.ranges();
+    darwin::exit::finalize_ranges(&ranges);
+    run_terminators(image);
+    let callbacks = REMOVE_IMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    for thunk in callbacks {
+        notify(thunk, image.handle, image.slide);
+    }
+    {
+        let mut images = IMAGES.lock().unwrap_or_else(|e| e.into_inner());
+        images.retain(|i| !std::ptr::eq(*i, image));
+        publish(&images);
+    }
+    crate::fault::forget_images(&ranges);
+    // Dropping the space unmaps it.
+    drop(
+        image
+            .memory
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take(),
+    );
+    // After this image's own teardown, which may still call into them.
+    for dependency in &image.dependencies {
+        let _ = release(dependency);
+    }
+}
+
+/// Every `__mod_term_func` of the image, as dyld runs them: the image itself
+/// before the libraries linked with it, each one's in reverse.
+fn run_terminators(image: &'static Image) {
+    let Some(exec) = crate::exec::active() else {
+        return;
+    };
+    let terminators = image
+        .report
+        .images
+        .iter()
+        .flat_map(|i| i.terminators.iter().rev().copied());
+    for term in terminators {
+        if let Err(e) = exec.call(term, &[]) {
+            eprintln!("rosemary: {}: terminator at {term:#x}: {e}", image.path);
+        }
+    }
+}
+
+/// Every address a call site in `report` might name, both directions.
+fn collect_imports(
+    report: &LinkReport,
+    is_guest: impl Fn(u64) -> bool,
+) -> (BTreeMap<u64, ImportSite>, AddrMap<ImportSite>) {
+    let mut imports: BTreeMap<u64, ImportSite> = BTreeMap::new();
+    for b in report.bindings() {
+        let site = ImportSite {
+            symbol: b.symbol.clone(),
+            library: b.library.clone(),
+            resolved: b.resolved,
+            tag: b.tag,
+            is_stub: false,
+            binding: crate::program::SlotBinding::at(b.slot_va),
+            plan: Default::default(),
+        };
+        imports.insert(b.slot_va, site.clone());
+        if let Some(stub) = b.stub_va {
+            imports.insert(
+                stub,
+                ImportSite {
+                    is_stub: true,
+                    ..site
+                },
+            );
+        }
+    }
+    for image in &report.images {
+        for m in &image.missing {
+            let site = ImportSite {
+                symbol: m.symbol.clone(),
+                library: m.library.clone(),
+                resolved: 0,
+                tag: 0,
+                is_stub: false,
+                binding: crate::program::SlotBinding::at(m.slot_va),
+                plan: Default::default(),
+            };
+            imports.insert(m.slot_va, site.clone());
+            if let Some(stub) = m.stub_va {
+                imports.insert(
+                    stub,
+                    ImportSite {
+                        is_stub: true,
+                        ..site
+                    },
+                );
+            }
+        }
+    }
+
+    let mut by_symbol: Vec<&ImportSite> = imports.values().filter(|s| !s.is_stub).collect();
+    by_symbol.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    let mut by_target: AddrMap<ImportSite> = AddrMap::default();
+    for site in by_symbol {
+        // A site that resolved into the **guest** must never appear here, and
+        // the reason is a two-billion-iteration livelock rather than a nicety.
+        if site.resolved != 0 && !is_guest(site.resolved) {
+            by_target
+                .entry(site.resolved)
+                .or_insert_with(|| site.clone());
+        }
+    }
+    (imports, by_target)
+}
+
+/// Run the image's constructors, as dyld does before `dlopen` returns.
+fn run_initializers(image: &'static Image) -> std::result::Result<(), String> {
+    let Some(exec) = crate::exec::active() else {
+        return Err("no execution backend is active".to_string());
+    };
+    let (argc, argv, envp, apple) = exec.main_args();
+    let initializers: Vec<u64> = image
+        .report
+        .images
+        .iter()
+        .rev()
+        .flat_map(|i| i.initializers.iter().copied())
+        .collect();
+    exec.expect_calls(&initializers);
+    for init in initializers {
+        exec.call(init, &[argc, argv, envp, apple])
+            .map_err(|e| format!("initializer at {init:#x}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn search_path(var: &str, name: &str) -> Vec<String> {
+    let Some(value) = darwin::guest_env_var(var) else {
+        return Vec::new();
+    };
+    value
+        .split(':')
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| format!("{}/{name}", dir.trim_end_matches('/')))
+        .collect()
+}
+
+pub fn inserted_libraries<S: machish::spec::MachSpec + 'static>(
+    bytes: &[u8],
+    spec: S,
+) -> Vec<String> {
+    let host = std::env::var("ROSEMARY_DYLD_INSERT_LIBRARIES").ok();
+    let guest = darwin::guest_env_var("DYLD_INSERT_LIBRARIES");
+    let requested: Vec<String> = host
+        .iter()
+        .chain(guest.iter())
+        // dyld separates entries with colons only: a path may contain spaces.
+        .flat_map(|list| list.split(':'))
+        .filter(|lib| !lib.is_empty())
+        .map(str::to_string)
+        .collect();
+    if requested.is_empty() {
+        return requested;
+    }
+    match machish::image::MachObject::parse_any(bytes, spec) {
+        Ok(obj) if obj.restricts_dyld_environment() => {
+            eprintln!(
+                "rosemary: DYLD_INSERT_LIBRARIES ignored: the image is hardened or restricted"
+            );
+            Vec::new()
+        }
+        _ => requested,
+    }
+}
+
+/// A source that searches the guest's `DYLD_LIBRARY_PATH` before anything else
+/// and its `DYLD_FALLBACK_LIBRARY_PATH` last, for the program's own link.
+pub struct GuestSearchPaths<D>(pub D);
+
+impl<D: machish::namespace::DylibSource> machish::namespace::DylibSource for GuestSearchPaths<D> {
+    fn fetch(
+        &mut self,
+        request: &machish::namespace::DylibRequest<'_>,
+    ) -> machish::Result<Option<machish::namespace::FetchedDylib>> {
+        let name = request
+            .install_name
+            .rsplit('/')
+            .next()
+            .unwrap_or(request.install_name);
+        let mut candidates = search_path("DYLD_LIBRARY_PATH", name);
+        candidates.extend(request.candidates.iter().cloned());
+        candidates.extend(search_path("DYLD_FALLBACK_LIBRARY_PATH", name));
+        self.0.fetch(&machish::namespace::DylibRequest {
+            candidates: &candidates,
+            ..*request
+        })
+    }
+}
+
+fn resolve_path(path: &str) -> Option<String> {
+    // Ahead of everything: the Steam client a game asks for is at whatever
+    // absolute path its install would have had, and what has to open is the
+    // bridge's own. See [`crate::steam::redirect`].
+    if let Some(bridged) = crate::steam::redirect(path) {
+        return Some(bridged);
+    }
+    let executable = EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .map(|(path, _)| path);
+    let loader_dir = executable.as_deref().map(machish::loader::loader_directory);
+
+    let mut candidates: Vec<String> = Vec::new();
+    if path.starts_with('@') {
+        let rpaths = executable.as_deref().map(rpaths_of).unwrap_or_default();
+        let ctx = PathContext {
+            executable: executable.as_deref(),
+            loader: executable.as_deref(),
+            rpaths: &rpaths,
+        };
+        candidates.extend(machish::install_name::expand(path, &ctx));
+    } else {
+        // `DYLD_LIBRARY_PATH` first, and `DYLD_FALLBACK_LIBRARY_PATH` after the
+        // ordinary candidates - the order the host's own loader uses.
+        let name = path.rsplit('/').next().unwrap_or(path);
+        candidates.extend(search_path("DYLD_LIBRARY_PATH", name));
+        candidates.push(path.to_string());
+        if !path.starts_with('/')
+            && let Some(dir) = loader_dir
+        {
+            candidates.push(format!("{dir}/{name}"));
+            candidates.push(format!("{dir}/../Frameworks/{name}"));
+            candidates.push(format!("{dir}/../Resources/{name}"));
+        }
+        // The executable's own `LC_RPATH` directories, searched by leaf name.
+        if let Some(exe) = executable.as_deref() {
+            let rpaths = rpaths_of(exe);
+            let ctx = PathContext {
+                executable: Some(exe),
+                loader: Some(exe),
+                rpaths: &rpaths,
+            };
+            candidates.extend(machish::install_name::expand(
+                &format!("@rpath/{name}"),
+                &ctx,
+            ));
+        }
+        candidates.extend(search_path("DYLD_FALLBACK_LIBRARY_PATH", name));
+    }
+
+    // Each candidate is a path the *guest* named, so the prefix's spelling of it
+    // is tried before the path as given. Both, and in that order: a prefix holds
+    // the Darwin userland a guest asks for, and the runtime's own libraries -
+    // the Steam bridge, a dylib beside the executable - are on the host beside
+    // it. See `docs/prefixes.md`.
+    candidates
+        .into_iter()
+        .flat_map(|c| [prefix::ns::host_path(&c), std::path::PathBuf::from(c)])
+        .filter_map(|c| std::fs::canonicalize(&c).ok())
+        .map(|p| p.to_string_lossy().into_owned())
+        .next()
+}
+
+/// The `LC_RPATH` entries of the image at `path`, for `@rpath` expansion.
+fn rpaths_of(path: &str) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    match crate::exec::active().map(|exec| exec.engine()) {
+        Some(crate::exec::Engine::Native) => {
+            let Ok(object) = MachObject::parse_any(&bytes, crate::exec::native::HOST_SPEC) else {
+                return Vec::new();
+            };
+            object.rpaths().map(str::to_string).collect()
+        }
+        _ => {
+            let Ok(object) = MachObject::parse_any(&bytes, X86_64) else {
+                return Vec::new();
+            };
+            object.rpaths().map(str::to_string).collect()
+        }
+    }
+}
+
+/// Darwin's pseudo-handles, from `<dlfcn.h>`.
+const RTLD_NEXT: u64 = -1i64 as u64;
+const RTLD_DEFAULT: u64 = -2i64 as u64;
+const RTLD_SELF: u64 = -3i64 as u64;
+const RTLD_MAIN_ONLY: u64 = -5i64 as u64;
+
+/// Darwin's `dlopen` mode bit asking that `dlsym` on the handle search the
+/// image alone.
+const RTLD_FIRST: i32 = 0x100;
+
+/// Set in a handle opened with [`RTLD_FIRST`], as dyld sets it. Image bases and
+/// synthetic libraries are aligned, so bit 0 is free in both.
+const FIRST_ONLY: u64 = 1;
+
+/// The address `name` has in `handle`, as `dlsym` reports it to a caller in
+/// no image this runtime mapped.
+fn lookup(handle: u64, name: &str) -> Option<u64> {
+    lookup_from(handle, name, None)
+}
+
+/// [`lookup`], for a caller in the image `caller`, which is what `RTLD_SELF`
+/// and `RTLD_NEXT` search from.
+fn lookup_from(handle: u64, name: &str, caller: Option<Scope>) -> Option<u64> {
+    // A handle from the host's loader, which scopes the search itself.
+    if let Some(path) = native_handle(handle) {
+        return native_lookup(handle, name, path);
+    }
+
+    // `dlsym` takes the C identifier; a Mach-O export carries the underscore.
+    let mangled = format!("_{name}");
+    match handle {
+        RTLD_MAIN_ONLY => Scope::Main(main_exports()?).first_only(&mangled, 0),
+        // FIXME (ACCURACY): a caller in no image this runtime can name - host
+        // code, or a dylib an emulated program was linked with, which
+        // `PROGRAM_IMAGES` does not record - searches everything.
+        RTLD_SELF | RTLD_NEXT if caller.is_none() => global_lookup(name, &mangled),
+        // The caller's image and what it links against; dyld's `dlsymSelf`.
+        RTLD_SELF => search(caller?, &mangled, true),
+        // Only what the caller links against; dyld's `dlsymNext`.
+        RTLD_NEXT => search(caller?, &mangled, false),
+        RTLD_DEFAULT => global_lookup(name, &mangled),
+        _ if handle == global_handle() => global_lookup(name, &mangled),
+        _ => {
+            let root = Scope::of_handle(handle & !FIRST_ONLY)?;
+            match handle & FIRST_ONLY != 0 {
+                true => root.first_only(&mangled, 0),
+                false => search(root, &mangled, true),
+            }
+        }
+    }
+}
+
+/// `name` behind `handle`, a library the host's loader opened as `path`.
+fn native_lookup(handle: u64, name: &str, path: String) -> Option<u64> {
+    if crate::gl::owns(name) {
+        return crate::gl::symbol(name).map(|addr| remember_native_symbol(addr, name, Some(path)));
+    }
+    let c = CString::new(name).ok()?;
+    // SAFETY: a handle the host's loader holds open, and a null-terminated name.
+    let found = unsafe { libc::dlsym(handle as usize as *mut libc::c_void, c.as_ptr()) };
+    if found.is_null() {
+        return None;
+    }
+    Some(remember_native_symbol(
+        selected_native_symbol(found as usize as u64, name),
+        name,
+        Some(path),
+    ))
+}
+
+/// `dlsym(RTLD_DEFAULT, name)`.
+fn global_lookup(name: &str, mangled: &str) -> Option<u64> {
+    for image in snapshot() {
+        if let Some(export) = image.exports.get(mangled)
+            && let Some(addr) = export.address(image.slide)
+        {
+            return Some(addr);
+        }
+    }
+    // The **main executable's** own exports, which nothing above covers.
+    if let Some(main) = main_exports()
+        && let Some(export) = main.linked.exports.get(mangled)
+        && let Some(addr) = export.address(main.slide)
+    {
+        return Some(addr);
+    }
+    // Then what it was linked with, in load order.
+    for image in PROGRAM_IMAGES.get().map(Vec::as_slice).unwrap_or_default() {
+        if let Some(export) = image.exports().and_then(|exports| exports.get(mangled))
+            && let Some(addr) = export.address(image.slide)
+        {
+            return Some(addr);
+        }
+    }
+
+    // Then the libraries this runtime is.
+    if let Some(addr) = crate::frameworks::symbol(name) {
+        return Some(remember_native_symbol(addr, name, None));
+    }
+    // Ahead of the native Objective-C runtime's answer, which is a search of
+    // every host library.
+    if let Some(addr) = crate::gl::host_override(name) {
+        return Some(remember_native_symbol(addr, name, None));
+    }
+    if let Some(addr) = crate::objc::host::symbol(name) {
+        return Some(remember_native_symbol(addr, name, None));
+    }
+
+    // The global fallback, which is a *host* search - and one that has to go
+    // through `darwin`, not straight to `dlsym`. A guest asking `RTLD_DEFAULT`
+    // for `readdir` on Linux would otherwise get glibc's, whose `struct dirent`
+    // is not the one the guest was compiled against; `darwin::symbol` refuses a
+    // divergent name by the same list the loader binds against.
+    let addr = system_symbol(name)?;
+    Some(remember_native_symbol(addr, name, None))
+}
+
+/// `mangled` as `dlsym` on a handle for `root` finds it: the image unless
+/// `with_root` is false, then everything it links against, breadth first.
+fn search(root: Scope, mangled: &str, with_root: bool) -> Option<u64> {
+    if with_root && let Some(addr) = root.first_only(mangled, 0) {
+        return Some(addr);
+    }
+    let mut seen = vec![root.identity()];
+    let mut queue: std::collections::VecDeque<&'static str> = root.dependencies().into();
+    while let Some(install_name) = queue.pop_front() {
+        let Some(scope) = Scope::named(install_name) else {
+            continue;
+        };
+        if seen.contains(&scope.identity()) {
+            continue;
+        }
+        seen.push(scope.identity());
+        if let Some(addr) = scope.first_only(mangled, 0) {
+            return Some(addr);
+        }
+        queue.extend(scope.dependencies());
+    }
+    None
+}
+
+/// One image a handle's search visits.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// A library this runtime is.
+    Synthetic(&'static synthetic::Library),
+    /// An image the guest `dlopen`ed.
+    Loaded(&'static Image),
+    /// The main executable.
+    Main(&'static MainExports),
+    /// A dylib mapped with the program or with a `dlopen`ed image, and the
+    /// images it was linked with.
+    Linked(&'static LinkedImage, &'static [LinkedImage]),
+    /// A library the host's loader bound the link to - the host's libobjc
+    /// under the `native` runtime - by its handle and the install name that
+    /// reached it.
+    Host(u64, &'static str),
+}
+
+impl Scope {
+    fn of_handle(handle: u64) -> Option<Scope> {
+        if handle != 0 && handle == MAIN_HEADER.load(Ordering::Acquire) {
+            return main_exports().map(Scope::Main);
+        }
+        if let Some(image) = launch_dependencies().iter().find(|i| i.header == handle) {
+            let name = &image.name;
+            let program = PROGRAM_IMAGES.get()?;
+            let linked = program.iter().find(|l| &l.name == name)?;
+            return Some(Scope::Linked(linked, program));
+        }
+        synthetic::by_handle(handle)
+            .map(Scope::Synthetic)
+            .or_else(|| find(|i| (i.handle == handle).then_some(Scope::Loaded(i))))
+    }
+
+    /// The guest image `addr` is in.
+    fn containing(addr: u64) -> Option<Scope> {
+        let in_image = |image: &machish::report::ImageReport| {
+            image
+                .segments
+                .iter()
+                .any(|s| addr >= s.vmaddr && addr < s.vmaddr.wrapping_add(s.vmsize))
+        };
+        let loaded = find(|image| {
+            if image.unloading.load(Ordering::Acquire) {
+                return None;
+            }
+            let hit = image.report.images.iter().find(|i| in_image(i))?;
+            if image
+                .report
+                .root()
+                .is_some_and(|root| root.name == hit.name)
+            {
+                return Some(Scope::Loaded(image));
+            }
+            let carried = image.linked.iter().find(|l| l.name == hit.name)?;
+            Some(Scope::Linked(carried, &image.linked))
+        });
+        if loaded.is_some() {
+            return loaded;
+        }
+        // The program's own link: its first image is the executable.
+        let (index, name) = match MAPPED.get() {
+            Some(mapped) => mapped
+                .iter()
+                .enumerate()
+                .find(|(_, i)| i.segments.iter().any(|(lo, hi)| addr >= *lo && addr < *hi))
+                .map(|(index, i)| (index, i.name.clone()))?,
+            None => crate::thunk::current()?
+                .program
+                .report
+                .images
+                .iter()
+                .enumerate()
+                .find(|(_, i)| in_image(i))
+                .map(|(index, i)| (index, i.name.clone()))?,
+        };
+        if index == 0 {
+            return main_exports().map(Scope::Main);
+        }
+        let program = PROGRAM_IMAGES.get()?;
+        let linked = program.iter().find(|l| l.name == name)?;
+        Some(Scope::Linked(linked, program))
+    }
+
+    /// The mapped image a load command's install name names, if any. A library
+    /// this runtime is comes first, as it does for [`open`].
+    fn named(install_name: &'static str) -> Option<Scope> {
+        if let Some(library) = synthetic::find(install_name) {
+            return Some(Scope::Synthetic(library));
+        }
+        let wanted = leaf(install_name);
+        if let Some(image) = LoadedImages::holding(wanted) {
+            if leaf(&image.path) == wanted {
+                return Some(Scope::Loaded(image));
+            }
+            let carried = image.linked.iter().find(|l| l.answers_to(wanted))?;
+            return Some(Scope::Linked(carried, &image.linked));
+        }
+        let program = PROGRAM_IMAGES.get()?;
+        match program.iter().find(|l| l.answers_to(wanted)) {
+            Some(linked) => Some(Scope::Linked(linked, program)),
+            None => host_loaded(install_name).map(|handle| Scope::Host(handle, install_name)),
+        }
+    }
+
+    /// What tells two scopes apart, whichever install name reached them.
+    fn identity(self) -> usize {
+        match self {
+            Scope::Synthetic(library) => library as *const synthetic::Library as usize,
+            Scope::Loaded(image) => image as *const Image as usize,
+            Scope::Main(main) => main as *const MainExports as usize,
+            Scope::Linked(image, _) => image as *const LinkedImage as usize,
+            Scope::Host(handle, _) => handle as usize,
+        }
+    }
+
+    /// The install names this image links against, re-exports first.
+    fn dependencies(self) -> Vec<&'static str> {
+        let (reexports, all): (Vec<&'static str>, Vec<&'static str>) = match self {
+            Scope::Synthetic(library) => (
+                library.links.reexports.to_vec(),
+                library.links.dependencies.to_vec(),
+            ),
+            Scope::Loaded(image) => (
+                image.reexported_dylibs.iter().map(String::as_str).collect(),
+                image.dylibs.iter().map(String::as_str).collect(),
+            ),
+            Scope::Main(main) => (
+                main.linked.reexports.iter().map(String::as_str).collect(),
+                main.linked
+                    .dependencies
+                    .iter()
+                    .map(String::as_str)
+                    .collect(),
+            ),
+            Scope::Linked(image, _) => match image.parsed() {
+                Some(parsed) => (
+                    parsed.reexports.iter().map(String::as_str).collect(),
+                    parsed.dependencies.iter().map(String::as_str).collect(),
+                ),
+                None => return Vec::new(),
+            },
+            // FIXME (ACCURACY): the host's `dlsym` on the handle already went
+            // through the library's own dependencies, in the host's order.
+            Scope::Host(..) => return Vec::new(),
+        };
+        let rest: Vec<&'static str> = all.into_iter().filter(|d| !reexports.contains(d)).collect();
+        reexports.into_iter().chain(rest).collect()
+    }
+
+    /// `mangled` in this image alone, re-exports included: what a handle
+    /// opened with `RTLD_FIRST` searches.
+    fn first_only(self, mangled: &str, depth: usize) -> Option<u64> {
+        if depth > MAX_REEXPORT_DEPTH {
+            return None;
+        }
+        let reexports: Vec<&'static str> = match self {
+            // Recorded like any other host answer: a guest that calls it
+            // through a register reaches it by no import site unless one is
+            // made here.
+            Scope::Synthetic(library) => {
+                let name = mangled.strip_prefix('_')?;
+                if let Some(addr) = (library.symbol)(name) {
+                    return Some(remember_native_symbol(
+                        addr,
+                        name,
+                        library.names.first().cloned(),
+                    ));
+                }
+                library.links.reexports.to_vec()
+            }
+            Scope::Loaded(image) => {
+                if let Some(export) = image.exports.get(mangled) {
+                    return own_export(export, image.slide, &image.dylibs, mangled, depth);
+                }
+                image.reexported_dylibs.iter().map(String::as_str).collect()
+            }
+            Scope::Main(main) => {
+                let linked = &main.linked;
+                if let Some(export) = linked.exports.get(mangled) {
+                    return own_export(export, main.slide, &linked.dependencies, mangled, depth);
+                }
+                linked.reexports.iter().map(String::as_str).collect()
+            }
+            Scope::Linked(image, peers) => {
+                return image.resolve(peers, mangled, depth).map(|r| r.addr);
+            }
+            Scope::Host(handle, path) => {
+                let name = mangled.strip_prefix('_')?;
+                return native_lookup(handle, name, path.to_string());
+            }
+        };
+        reexports
+            .into_iter()
+            .filter_map(Scope::named)
+            .find_map(|scope| scope.first_only(mangled, depth + 1))
+    }
+}
+
+/// The address of `export`, an image's own entry for `mangled`, following a
+/// re-export into `dylibs`, the image's install names in ordinal order.
+fn own_export(
+    export: &machish::exports::Export,
+    slide: u64,
+    dylibs: &'static [String],
+    mangled: &str,
+    depth: usize,
+) -> Option<u64> {
+    let ExportValue::Reexport {
+        ordinal,
+        imported_name,
+    } = &export.value
+    else {
+        return export.address(slide);
+    };
+    let target = dylibs.get(usize::from(*ordinal).checked_sub(1)?)?;
+    let name = imported_name.as_deref().unwrap_or(mangled);
+    Scope::named(target)?.first_only(name, depth + 1)
+}
+
+/// The host half of the global search, which agrees with what the loader binds.
+pub fn system_symbol(name: &str) -> Option<u64> {
+    substituted_or(name, darwin::symbol)
+}
+
+/// What a `dlopen("/usr/lib/libSystem.B.dylib")` handle finds in libSystem
+/// itself: [`system_symbol`] without the frameworks `darwin` was told about.
+pub fn libsystem_symbol(name: &str) -> Option<u64> {
+    substituted_or(name, darwin::own_symbol)
+}
+
+fn substituted_or(name: &str, darwin: fn(&str) -> Option<u64>) -> Option<u64> {
+    // `name` is a C identifier, and `darwin` takes the Mach-O spelling: handed
+    // `_availability_version_check` bare, it strips the identifier's own
+    // underscore and finds nothing, which turns every `@available` false.
+    crate::shims::runtime::host_substitute(name)
+        .or_else(|| crate::shims::openat::host_substitute(name))
+        .or_else(|| darwin(&format!("_{name}")))
+}
+
+fn selected_native_symbol(found: u64, name: &str) -> u64 {
+    // Preserve scoped lookups of symbols a loaded library defines itself.
+    if crate::host::symbol(name) == Some(found)
+        && let Some(addr) = system_symbol(name)
+    {
+        return addr;
+    }
+    found
+}
+
+/// Native framework mode keeps host dylib handles, but builtin libc lookups
+/// must still return the same functions as guest imports.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn native_libc_dlsym(
+    handle: *mut libc::c_void,
+    name: *const libc::c_char,
+) -> *mut libc::c_void {
+    // SAFETY: the caller supplies a valid dlsym handle and C identifier.
+    let found = unsafe { libc::dlsym(handle, name) };
+    if found.is_null() || name.is_null() {
+        return found;
+    }
+    // SAFETY: the identifier was valid for the host lookup above.
+    let Ok(name) = unsafe { std::ffi::CStr::from_ptr(name) }.to_str() else {
+        return found;
+    };
+    selected_native_symbol(found as usize as u64, name) as usize as *mut libc::c_void
+}
+
+// Native guest code is not registered with the host dyld. Try Rosemary's
+// existing caller-scoped resolver for RTLD_NEXT, then leave every other case
+// to Apple's own dlsym with the original return address intact.
+#[cfg(target_os = "macos")]
+unsafe extern "C" fn native_guest_dlsym_next(
+    _handle: *mut libc::c_void,
+    name: *const libc::c_char,
+    caller: u64,
+) -> *mut libc::c_void {
+    if name.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Some(scope) = Scope::containing(caller) else {
+        return std::ptr::null_mut();
+    };
+    let Ok(name) = unsafe { std::ffi::CStr::from_ptr(name) }.to_str() else {
+        return std::ptr::null_mut();
+    };
+    let Some(found) = lookup_from(RTLD_NEXT, name, Some(scope)) else {
+        return std::ptr::null_mut();
+    };
+    // Successful dlsym must not expose an earlier host lookup failure.
+    unsafe { libc::dlerror() };
+    found as usize as *mut libc::c_void
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn native_guest_dlsym(
+    _handle: *mut libc::c_void,
+    _name: *const libc::c_char,
+) -> *mut libc::c_void {
+    core::arch::naked_asm!(
+        "cmn x0, #1", // Only RTLD_NEXT needs guest scope.
+        "b.eq 2f",
+        "b {host}",
+        "2:",
+        "stp x29, x30, [sp, #-32]!", // Preserve the guest caller's LR.
+        "stp x0, x1, [sp, #16]",
+        "mov x2, x30",
+        "bl {try_guest}",
+        "cbz x0, 3f",
+        "ldp x29, x30, [sp], #32",
+        "ret",
+        "3:",
+        "ldp x0, x1, [sp, #16]",
+        "ldp x29, x30, [sp], #32",
+        "b {host}",                   // Apple's dlsym sees the original LR.
+        try_guest = sym native_guest_dlsym_next,
+        host = sym libc::dlsym,
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn native_guest_dlsym(
+    _handle: *mut libc::c_void,
+    _name: *const libc::c_char,
+) -> *mut libc::c_void {
+    core::arch::naked_asm!(
+        "cmp rdi, -1", // Only RTLD_NEXT needs guest scope.
+        "je 2f",
+        "jmp {host}",
+        "2:",
+        "sub rsp, 24", // Align stack; preserve C arguments.
+        "mov [rsp], rdi",
+        "mov [rsp + 8], rsi",
+        "mov rdx, [rsp + 24]",       // Guest return address.
+        "call {try_guest}",
+        "test rax, rax",
+        "jz 3f",
+        "add rsp, 24",
+        "ret",
+        "3:",
+        "mov rdi, [rsp]",
+        "mov rsi, [rsp + 8]",
+        "add rsp, 24",
+        "jmp {host}",                // Original return address stays on stack.
+        try_guest = sym native_guest_dlsym_next,
+        host = sym libc::dlsym,
+    );
+}
+
+// Do not replace a host-inserted `dlsym` interposer with Rosemary's bridge.
+#[cfg(target_os = "macos")]
+fn native_host_dlsym_is_apple() -> bool {
+    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"dlsym".as_ptr()) };
+    if address.is_null() {
+        return false;
+    }
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::uninit();
+    if unsafe { libc::dladdr(address, info.as_mut_ptr()) } == 0 {
+        return false;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() || info.dli_sname.is_null() {
+        return false;
+    }
+    let (path, symbol) = unsafe {
+        (
+            std::ffi::CStr::from_ptr(info.dli_fname),
+            std::ffi::CStr::from_ptr(info.dli_sname),
+        )
+    };
+    path.to_bytes() == b"/usr/lib/system/libdyld.dylib" && symbol.to_bytes() == b"dlsym"
+}
+
+pub fn native_libc_provider() -> SyntheticDylib {
+    #[allow(unused_mut)]
+    let mut lib = SyntheticDylib::new("<rosemary native libc lookup>");
+    #[cfg(target_os = "macos")]
+    if darwin::libc_backend::using_builtin() {
+        lib.flat(true)
+            .define_fn("_dlsym", native_libc_dlsym as *const ());
+    } else if native_host_dlsym_is_apple() {
+        lib.flat(true)
+            .define_fn("_dlsym", native_guest_dlsym as *const ());
+    }
+    lib
+}
+
+/// Handles the *host's* `dlopen` returned, and the paths they were asked for.
+static NATIVE: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
+
+/// The import sites a native `dlsym` result has been given.
+static NATIVE_SYMBOLS: Mutex<BTreeMap<u64, &'static ImportSite>> = Mutex::new(BTreeMap::new());
+
+/// How many entries [`NATIVE_SYMBOLS`] has, read without the lock.
+static NATIVE_SYMBOL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Open `path` with the host's loader, as a native arm64 library.
+///
+/// `RTLD_GLOBAL` and never closed, for the reason the native provider's own fallback
+/// is: closing it would dangle every pointer already written into a guest slot.
+fn open_native(path: &str) -> Option<u64> {
+    if !host_may_serve(path) {
+        return None;
+    }
+    let c = CString::new(path).ok()?;
+    // SAFETY: a null-terminated path and the host's own loader. The handle is
+    // kept for the process; see the note above on why it is never closed.
+    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) };
+    if handle.is_null() {
+        return None;
+    }
+    let handle = handle as usize as u64;
+    let mut native = NATIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if !native.iter().any(|(h, _)| *h == handle) {
+        native.push((handle, path.to_string()));
+    }
+    Some(handle)
+}
+
+/// Whether the guest may reach the host's own library at `path`. Every symbol
+/// behind a host handle is the host's, which is exactly what `darwin::strict`
+/// withdraws; a guest `dlopen("libstdc++.so.6")` must not undo it at run time.
+fn host_may_serve(path: &str) -> bool {
+    !darwin::strict::enabled()
+        && !(crate::frameworks::no_host_frameworks()
+            && crate::frameworks::is_host_framework_path(path))
+}
+
+/// The host loader's handle for `install_name` if it already loaded it, which
+/// it has for every library it bound the program's link to.
+fn host_loaded(install_name: &str) -> Option<u64> {
+    if !host_may_serve(install_name) {
+        return None;
+    }
+    let c = CString::new(install_name).ok()?;
+    // SAFETY: a null-terminated path. `RTLD_NOLOAD` only looks a library up:
+    // a search visits what the link loaded and never loads more.
+    let handle = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
+    if handle.is_null() {
+        return None;
+    }
+    // SAFETY: drops the reference the lookup took; the link's own keeps the
+    // library, and so the handle, valid for the process.
+    unsafe { libc::dlclose(handle) };
+    Some(handle as usize as u64)
+}
+
+/// Whether `handle` came from [`open_native`], and the path it was opened as.
+fn native_handle(handle: u64) -> Option<String> {
+    NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(h, _)| *h == handle)
+        .map(|(_, path)| path.clone())
+}
+
+/// Make the host function at `addr` callable by guest code that holds its
+/// address without having imported it, under `name`'s signature: one the
+/// runtime hands back through an out-parameter, as `objc_setHook_*` does.
+pub(crate) fn describe_host_function(addr: u64, name: &str) {
+    remember_native_symbol(addr, name, None);
+}
+
+/// Record a host address handed to the guest by `dlsym`, so it can be called.
+fn remember_native_symbol(addr: u64, name: &str, library: Option<String>) -> u64 {
+    let mut map = NATIVE_SYMBOLS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = map.len();
+    let site = *map.entry(addr).or_insert_with(|| {
+        Box::leak(Box::new(ImportSite {
+            // The Mach-O spelling, because that is what the signature table is
+            // keyed by - `dlsym` takes the C identifier and drops the underscore.
+            symbol: format!("_{name}"),
+            library,
+            resolved: addr,
+            tag: 0,
+            is_stub: false,
+            binding: Default::default(),
+            plan: Default::default(),
+        }))
+    });
+    if map.len() != before {
+        // Publish the snapshot first, then the count, and both while the lock
+        // is still held.
+        let view: Vec<(u64, &'static ImportSite)> = map.iter().map(|(a, s)| (*a, *s)).collect();
+        NATIVE_SYMBOL_VIEW.store(Box::leak(Box::new(view)), Ordering::Release);
+        NATIVE_SYMBOL_COUNT.store(map.len(), Ordering::Release);
+    }
+    drop(map);
+
+    // And the whole reason this passthrough is worth optimising at all.
+    crate::trampoline::for_site(site).unwrap_or(addr)
+}
+
+/// The published, immutable half of [`NATIVE_SYMBOLS`]: a leaked, sorted slice of
+/// `(address, site)`, swapped whole.
+static NATIVE_SYMBOL_VIEW: AtomicPtr<Vec<(u64, &'static ImportSite)>> =
+    AtomicPtr::new(core::ptr::null_mut());
+
+/// The import site for a host address the guest got from `dlsym`, if any.
+pub fn native_symbol_at(host: u64) -> Option<&'static ImportSite> {
+    if NATIVE_SYMBOL_COUNT.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let published = NATIVE_SYMBOL_VIEW.load(Ordering::Acquire);
+    if published.is_null() {
+        return None;
+    }
+    // SAFETY: leaked by `remember_native_symbol` and never freed, so the slice
+    // stays valid for the life of the process - the same claim `VIEW` makes.
+    //
+    // A snapshot one `dlsym` behind can miss a site another thread has just
+    // recorded, and unlike a thunk that is harmless: the caller falls through to
+    // `UnknownIndirectCall`, which is what it would have got a microsecond
+    // earlier anyway, and the guest cannot have the address yet - `dlsym` has
+    // not returned it.
+    let view = unsafe { &*published };
+    // Sorted, so the two ends bound it: the run loop asks this of a *guest* pc on
+    // every window miss, and a guest pc is nowhere near a host symbol.
+    let (Some(first), Some(last)) = (view.first(), view.last()) else {
+        return None;
+    };
+    if host < first.0 || host > last.0 {
+        return None;
+    }
+    view.binary_search_by_key(&host, |(a, _)| *a)
+        .ok()
+        .map(|i| view[i].1)
+}
+
+/// The `add image` callbacks the guest has registered, as native-callable
+/// addresses.
+static ADD_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The `remove image` callbacks, likewise. libunwind's is one: it purges its
+/// cache of an unloaded image's frames.
+static REMOVE_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// The `objc_addLoadImageFunc` callbacks, as native-callable addresses.
+static LOAD_IMAGE: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Whether the image at `header` has Objective-C metadata, which is what
+/// libobjc keeps an image for and so what its load-image callbacks hear about.
+fn has_objc(header: u64) -> bool {
+    [b"__DATA".as_slice(), b"__DATA_CONST", b"__DATA_DIRTY"]
+        .into_iter()
+        .any(|segment| load_command_in(header, segment, Some(b"__objc_imageinfo")) != 0)
+        || load_command_in(header, b"__OBJC", Some(b"__image_info")) != 0
+}
+
+/// Tell one `objc_func_loadImage` about one image.
+fn notify_objc(thunk: u64, header: u64) {
+    // SAFETY: `thunk` is native code taking a `mach_header *` - the guest's own
+    // function, or a [`crate::thunk`] standing for it.
+    let f: extern "C" fn(u64) = unsafe { std::mem::transmute::<u64, _>(thunk) };
+    f(header);
+}
+
+/// Announce `header` to every load-image callback, if libobjc would.
+fn announce_objc(header: u64) {
+    if header == 0 || !has_objc(header) {
+        return;
+    }
+    let callbacks = LOAD_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for thunk in callbacks {
+        notify_objc(thunk, header);
+    }
+}
+
+/// The header of every guest image mapped so far: the program, what it was
+/// linked against, and everything `dlopen` mapped since.
+fn every_header() -> Vec<u64> {
+    let mut headers: Vec<u64> = match MAPPED.get() {
+        Some(images) => images.iter().map(|i| i.header).collect(),
+        None => crate::thunk::current()
+            .map(|vm| vm.program.report.images.iter().map(|i| i.base).collect())
+            .unwrap_or_default(),
+    };
+    for image in snapshot() {
+        headers.extend(image.report.images.iter().map(|i| i.base));
+    }
+    headers
+}
+
+/// Tell one callback about one image.
+///
+/// The two arguments are dyld's: the image's `mach_header` and its slide.
+fn notify(thunk: u64, header: u64, slide: u64) {
+    if thunk == 0 || header == 0 {
+        return;
+    }
+    if crate::shims::vmmap::tracing() {
+        eprintln!("rosemary: image notice: header {header:#x}, slide {slide:#x}");
+    }
+    // SAFETY: `thunk` is native code of dyld's callback signature - the guest's
+    // own function, or a [`crate::thunk`] standing for it.
+    let f: extern "C" fn(u64, u64) = unsafe { std::mem::transmute::<u64, _>(thunk) };
+    f(header, slide);
+}
+
+/// Announce `image` to every callback registered so far.
+fn announce(header: u64, slide: u64) {
+    let callbacks = ADD_IMAGE.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    for thunk in callbacks {
+        notify(thunk, header, slide);
+    }
+}
+
+fn set_error(message: String) {
+    *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = CString::new(message).ok();
+}
+
+fn clear_error() {
+    *ERROR.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// `NSLinkEditErrors` values the `NS*` image calls report.
+const NS_LINK_EDIT_FILE_ACCESS: i32 = 0;
+const NS_LINK_EDIT_FILE_FORMAT: i32 = 1;
+const NS_LINK_EDIT_UNDEFINED: i32 = 7;
+
+/// The failure `NSLinkEditError` reports, kept until the next one: the strings
+/// it hands out stay valid that long, as dyld's static buffers do.
+struct LinkEditError {
+    kind: i32,
+    errno: i32,
+    file: CString,
+    message: CString,
+}
+
+static LINK_EDIT_ERROR: Mutex<Option<LinkEditError>> = Mutex::new(None);
+
+fn set_link_edit_error(kind: i32, errno: i32, file: &str, message: String) {
+    *LINK_EDIT_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = Some(LinkEditError {
+        kind,
+        errno,
+        file: CString::new(file).unwrap_or_default(),
+        message: CString::new(message).unwrap_or_default(),
+    });
+}
+
+/// The handle an already-loaded image at `path` has, without loading it.
+fn loaded_handle(path: &str) -> Option<u64> {
+    if let Some(library) = synthetic::find(path) {
+        return Some(library.handle);
+    }
+    let resolved = resolve_path(path)?;
+    let main = MAIN_HEADER.load(Ordering::Acquire);
+    if main != 0
+        && let Some((executable, _)) = EXECUTABLE.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        && std::fs::canonicalize(&executable).is_ok_and(|p| p.to_string_lossy() == resolved)
+    {
+        return Some(main);
+    }
+    find(|i| (i.path == resolved && !i.unloading.load(Ordering::Acquire)).then_some(i.handle))
+}
+
+/// The address the Mach-O symbol `mangled` has in the image at `header`.
+///
+/// The `NS*` calls take the linker's spelling, underscore included; a name
+/// without one names nothing, as under dyld.
+fn lookup_in_image(header: u64, mangled: &str) -> Option<u64> {
+    let name = mangled.strip_prefix('_')?;
+    // `lookup` treats an unknown handle as a global search, which would let the
+    // executable's header answer with any image's symbol.
+    if header != 0 && header == MAIN_HEADER.load(Ordering::Acquire) {
+        let main = main_exports()?;
+        return main.linked.exports.get(mangled)?.address(main.slide);
+    }
+    lookup(header, name)
+}
+
+/// The `dyld_unwind_sections` this runtime fills in for one of its own images.
+///
+/// Returns false when `addr` is in no image this runtime mapped, which is the
+/// caller's cue to ask the host.
+fn unwind_sections_of(addr: u64) -> Option<[u8; 40]> {
+    let (header, slide) = guest_image_at(addr)?;
+    let mut words = [0u8; 40];
+    words[0..8].copy_from_slice(&header.to_le_bytes());
+    for (i, section) in ["__eh_frame", "__unwind_info"].into_iter().enumerate() {
+        let (at, len) = section_in(header, section)
+            .map_or((0, 0), |(addr, size)| (addr.wrapping_add(slide), size));
+        let base = 8 + i * 16;
+        words[base..base + 8].copy_from_slice(&at.to_le_bytes());
+        words[base + 8..base + 16].copy_from_slice(&len.to_le_bytes());
+    }
+    Some(words)
+}
+
+/// `(mach_header VA, slide)` for the guest image containing `va`.
+/// Whether `va` is in code the host loaded: this runtime and the host
+/// libraries it answers Darwin's system calls with. A guest image is checked
+/// first, so this is only reached for an address in no guest image.
+fn is_system_code(va: u64) -> bool {
+    let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+    // SAFETY: `dladdr` only reads its address and writes `info`.
+    unsafe {
+        libc::dladdr(va as *const std::ffi::c_void, &mut info) != 0 && !info.dli_fbase.is_null()
+    }
+}
+
+/// The install name the system header stands for: where `dyld`'s own
+/// interface lives on a Mac.
+const SYSTEM_IMAGE: &[u8] = b"/usr/lib/system/libdyld.dylib";
+
+/// A Mach-O header for the Darwin system this runtime provides, built once.
+///
+/// A Mac's system libraries are built for the OS they ship in, so their
+/// `LC_BUILD_VERSION` names it, and programs read the running OS from it -
+/// Apple's `libxcrun` takes the host version from the image containing
+/// `dyld_image_header_containing_address`. This header says the same thing
+/// as every other version answer here: the guest's macOS, as minimum OS and
+/// SDK. It has an `LC_ID_DYLIB` and an `LC_BUILD_VERSION` and no segments,
+/// because there is no system image mapped to describe.
+fn system_header() -> u64 {
+    use machish::spec::constants::{LC_BUILD_VERSION, LC_ID_DYLIB, MH_MAGIC_64, PLATFORM_MACOS};
+    const MH_DYLIB: u32 = 6;
+    const CPU_TYPE_X86_64: u32 = 0x0100_0007;
+    const CPU_TYPE_ARM64: u32 = 0x0100_000c;
+    static HEADER: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *HEADER.get_or_init(|| {
+        let (major, minor, patch) = darwin::sysctl::macos_version();
+        let version = ((major as u32) << 16) | ((minor as u32) << 8) | patch as u32;
+        let cpu = match darwin::sysctl::guest_arch() {
+            darwin::sysctl::GuestArch::X86_64 => CPU_TYPE_X86_64,
+            darwin::sysctl::GuestArch::Arm64 => CPU_TYPE_ARM64,
+        };
+        // `dylib_command`: cmd, cmdsize, name offset, timestamp, current and
+        // compatibility versions, then the name, padded to eight bytes.
+        let name_len = (SYSTEM_IMAGE.len() + 1).next_multiple_of(8);
+        let id_size = 24 + name_len as u32;
+        // `build_version_command`: cmd, cmdsize, platform, minos, sdk, ntools.
+        let build_size = 24u32;
+        let mut words: Vec<u32> = vec![
+            MH_MAGIC_64,
+            cpu,
+            0,
+            MH_DYLIB,
+            2,
+            id_size + build_size,
+            0,
+            0,
+            LC_ID_DYLIB,
+            id_size,
+            24,
+            0,
+            1 << 16,
+            1 << 16,
+        ];
+        let mut name = SYSTEM_IMAGE.to_vec();
+        name.resize(name_len, 0);
+        words.extend(
+            name.chunks(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+        );
+        words.extend([
+            LC_BUILD_VERSION,
+            build_size,
+            PLATFORM_MACOS,
+            version,
+            version,
+            0,
+        ]);
+        Box::leak(words.into_boxed_slice()).as_ptr() as usize
+    }) as u64
+}
+
+fn guest_image_at(va: u64) -> Option<(u64, u64)> {
+    with_guest_image_at(va, |header, slide, _| (header, slide))
+}
+
+/// `f(mach_header VA, slide, host path)` for the guest image containing `va`.
+fn with_guest_image_at<R>(va: u64, f: impl FnOnce(u64, u64, &str) -> R) -> Option<R> {
+    fn containing(report: &LinkReport, va: u64) -> Option<&ImageReport> {
+        report.images.iter().find(|i| {
+            i.segments
+                .iter()
+                .any(|s| va >= s.vmaddr && va < s.vmaddr.wrapping_add(s.vmsize))
+        })
+    }
+    if let Some(found) = find(|i| containing(&i.report, va)) {
+        return Some(f(found.base, found.slide, &found.path));
+    }
+    if let Some(found) = MAPPED.get().and_then(|images| {
+        images
+            .iter()
+            .find(|i| i.segments.iter().any(|(lo, hi)| va >= *lo && va < *hi))
+    }) {
+        return Some(f(found.header, found.slide, &found.path));
+    }
+    let vm = crate::thunk::current()?;
+    containing(&vm.program.report, va).map(|i| f(i.base, i.slide, &i.path))
+}
+
+/// `(unslid addr, size)` of a section in the guest image at `header`.
+///
+/// The image's own load commands, walked here rather than through libmacho's
+/// `getsectbynamefromheader_64`. That entry point is Darwin's alone, so off it
+/// the lookup failed for every image and [`unwind_sections_of`] answered with
+/// both section bounds zero - a `_dyld_find_unwind_sections` that *succeeds*
+/// and reports the frame has no unwind info. A throw then reaches
+/// `_Unwind_RaiseException`, cannot unwind even its own frame, and the process
+/// dies with a stack overflow rather than with a missing symbol.
+fn section_in(header: u64, section: &str) -> Option<(u64, u64)> {
+    /// `MH_MAGIC_64`.
+    const MAGIC: u32 = 0xfeed_facf;
+    /// `LC_SEGMENT_64`.
+    const SEGMENT_64: u32 = 0x19;
+    /// `sizeof(struct mach_header_64)`.
+    const HEADER: usize = 32;
+    /// `sizeof(struct segment_command_64)`, which the sections follow.
+    const SEGMENT: usize = 72;
+    /// `sizeof(struct section_64)`.
+    const SECTION: usize = 80;
+
+    let base = header as *const u8;
+    if base.is_null() {
+        return None;
+    }
+    // SAFETY: `header` is an image this runtime mapped, so its `mach_header_64`
+    // and the `sizeofcmds` bytes of load commands after it are mapped and stay
+    // mapped for the life of the process. Every read below is inside that run,
+    // bounded by the header's own `ncmds` and each command's `cmdsize`.
+    unsafe {
+        if base.cast::<u32>().read_unaligned() != MAGIC {
+            return None;
+        }
+        let ncmds = base.add(16).cast::<u32>().read_unaligned();
+        let mut cmd = base.add(HEADER);
+        for _ in 0..ncmds {
+            let kind = cmd.cast::<u32>().read_unaligned();
+            let cmdsize = cmd.add(4).cast::<u32>().read_unaligned() as usize;
+            if cmdsize < SEGMENT {
+                // Shorter than a segment command, so it is not one; a zero size
+                // would also loop forever.
+                if cmdsize < 8 {
+                    return None;
+                }
+                cmd = cmd.add(cmdsize);
+                continue;
+            }
+            if kind == SEGMENT_64 {
+                let nsects = cmd.add(64).cast::<u32>().read_unaligned() as usize;
+                for i in 0..nsects {
+                    let at = SEGMENT + i * SECTION;
+                    if at + SECTION > cmdsize {
+                        break;
+                    }
+                    let sect = cmd.add(at);
+                    // `sectname` is sixteen bytes, NUL-padded rather than
+                    // NUL-terminated when the name fills the field.
+                    let name = core::slice::from_raw_parts(sect, 16);
+                    let name = name.split(|b| *b == 0).next().unwrap_or_default();
+                    if name == section.as_bytes() {
+                        return Some((
+                            sect.add(32).cast::<u64>().read_unaligned(),
+                            sect.add(40).cast::<u64>().read_unaligned(),
+                        ));
+                    }
+                }
+            }
+            cmd = cmd.add(cmdsize);
+        }
+    }
+    None
+}
+
+/// A `segment_command_64`, or one of its `section_64` records, in the main
+/// guest image. The pointer is returned exactly as libmacho's process-global
+/// `getsegbyname` and `getsectbyname` return it.
+fn load_command_in(header: u64, segment: &[u8], section: Option<&[u8]>) -> u64 {
+    const MAGIC: u32 = 0xfeed_facf;
+    const SEGMENT_64: u32 = 0x19;
+    const HEADER: usize = 32;
+    const SEGMENT: usize = 72;
+    const SECTION: usize = 80;
+
+    let base = header as *const u8;
+    if base.is_null() {
+        return 0;
+    }
+    // SAFETY: `header` names the mapped main image and every load-command read
+    // is bounded by `ncmds`, `cmdsize`, and the segment's section count.
+    unsafe {
+        if base.cast::<u32>().read_unaligned() != MAGIC {
+            return 0;
+        }
+        let ncmds = base.add(16).cast::<u32>().read_unaligned();
+        let mut cmd = base.add(HEADER);
+        for _ in 0..ncmds {
+            let kind = cmd.cast::<u32>().read_unaligned();
+            let cmdsize = cmd.add(4).cast::<u32>().read_unaligned() as usize;
+            if cmdsize < 8 {
+                return 0;
+            }
+            if kind == SEGMENT_64 && cmdsize >= SEGMENT {
+                let name = core::slice::from_raw_parts(cmd.add(8), 16);
+                let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+                if name == segment {
+                    let Some(section) = section else {
+                        return cmd as usize as u64;
+                    };
+                    let nsects = cmd.add(64).cast::<u32>().read_unaligned() as usize;
+                    for index in 0..nsects {
+                        let offset = SEGMENT + index * SECTION;
+                        if offset + SECTION > cmdsize {
+                            break;
+                        }
+                        let record = cmd.add(offset);
+                        let name = core::slice::from_raw_parts(record, 16);
+                        let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+                        if name == section {
+                            return record as usize as u64;
+                        }
+                    }
+                    return 0;
+                }
+            }
+            cmd = cmd.add(cmdsize);
+        }
+    }
+    0
+}
+
+/// The main image's slide, which libmacho's unslid answers have to be moved by.
+fn main_slide() -> u64 {
+    EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map_or(0, |(_, slide)| *slide)
+}
+
+/// The end of the main image's highest mapped segment, slid.
+///
+/// libmacho counts `__LINKEDIT` too. It is left out here: a collector treats
+/// `get_etext()..get_end()` as roots to scan, and the symbol tables are not
+/// guaranteed to be mapped in full the way a segment the image writes is.
+fn main_image_end() -> u64 {
+    const SEGMENT_64: u32 = 0x19;
+    const HEADER: usize = 32;
+    const SEGMENT: usize = 72;
+    let base = MAIN_HEADER.load(Ordering::Acquire) as *const u8;
+    if base.is_null() {
+        return 0;
+    }
+    let mut end = 0;
+    // SAFETY: as in `load_command_in`, bounded by `ncmds` and `cmdsize`.
+    unsafe {
+        let ncmds = base.add(16).cast::<u32>().read_unaligned();
+        let mut cmd = base.add(HEADER);
+        for _ in 0..ncmds {
+            let kind = cmd.cast::<u32>().read_unaligned();
+            let cmdsize = cmd.add(4).cast::<u32>().read_unaligned() as usize;
+            if cmdsize < 8 {
+                break;
+            }
+            if kind == SEGMENT_64 && cmdsize >= SEGMENT {
+                let name = core::slice::from_raw_parts(cmd.add(8), 16);
+                let name = name.split(|byte| *byte == 0).next().unwrap_or_default();
+                let vmaddr = cmd.add(24).cast::<u64>().read_unaligned();
+                let vmsize = cmd.add(32).cast::<u64>().read_unaligned();
+                if name != b"__LINKEDIT" && name != b"__PAGEZERO" {
+                    end = end.max(vmaddr + vmsize);
+                }
+            }
+            cmd = cmd.add(cmdsize);
+        }
+    }
+    match end {
+        0 => 0,
+        end => end.wrapping_add(main_slide()),
+    }
+}
+
+/// What [`dladdr`] found: the four `Dl_info` fields, as host addresses.
+struct Described {
+    fname: u64,
+    fbase: u64,
+    sname: u64,
+    saddr: u64,
+}
+
+/// `addr` as an image and a symbol, if this runtime is the one that mapped it.
+///
+/// Covers both kinds of guest image - the program itself and anything [`open`] loaded -
+/// because a caller cannot tell them apart and neither should the answer.
+fn describe(addr: u64) -> Option<Described> {
+    if addr == 0 {
+        return None;
+    }
+    if let Some(found) = find(|i| {
+        region_of(i, addr).map(|_| {
+            let (sname, saddr) = nearest_export(&i.exports, i.slide, addr);
+            Described {
+                fname: path_cstr(&i.path),
+                fbase: i.handle,
+                sname,
+                saddr,
+            }
+        })
+    }) {
+        return Some(found);
+    }
+    // The main executable, which is a guest image with no `Image` record.
+    let vm = crate::thunk::current()?;
+    if !vm.program.is_guest_address(addr) {
+        return None;
+    }
+    let (path, slide) = EXECUTABLE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let (sname, saddr) = main_exports()
+        .map(|m| nearest_export(&m.linked.exports, slide, addr))
+        .unwrap_or((0, 0));
+    Some(Described {
+        fname: path_cstr(&path),
+        fbase: slide,
+        sname,
+        saddr,
+    })
+}
+
+/// The export at or below `addr`, as `(name, address)`, or `(0, 0)`.
+fn nearest_export(exports: &ExportTable, slide: u64, addr: u64) -> (u64, u64) {
+    let mut best: Option<(&str, u64)> = None;
+    for e in exports.entries() {
+        let Some(at) = e.address(slide) else {
+            continue;
+        };
+        if at <= addr && best.is_none_or(|(_, b)| at > b) {
+            best = Some((e.name.as_str(), at));
+        }
+    }
+    match best {
+        Some((name, at)) => (symbol_cstr(name), at),
+        None => (0, 0),
+    }
+}
+
+/// A NUL-terminated copy of `text`, kept for the life of the process.
+fn interned(text: &str) -> u64 {
+    static STRINGS: Mutex<Option<BTreeMap<String, &'static CString>>> = Mutex::new(None);
+    let mut map = STRINGS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = map.get_or_insert_with(BTreeMap::new);
+    if let Some(existing) = map.get(text) {
+        return existing.as_ptr() as usize as u64;
+    }
+    let Ok(owned) = CString::new(text) else {
+        return 0;
+    };
+    let leaked: &'static CString = Box::leak(Box::new(owned));
+    map.insert(text.to_string(), leaked);
+    leaked.as_ptr() as usize as u64
+}
+
+/// An image path as the guest spells it: the table keeps host paths, which a
+/// guest joining onto them would find translated into the prefix's root.
+fn guest_spelling(path: &str) -> String {
+    prefix::ns::to_guest(std::path::Path::new(path))
+        .map_or_else(|| path.to_string(), |p| p.to_string_lossy().into_owned())
+}
+
+fn path_cstr(path: &str) -> u64 {
+    interned(&guest_spelling(path))
+}
+
+/// The symbol name as C sees it: `dladdr` reports `main`, not `_main`.
+fn symbol_cstr(name: &str) -> u64 {
+    interned(name.strip_prefix('_').unwrap_or(name))
+}
+
+/// The `dyld` family, one implementation for both backends.
+///
+/// A native guest calls these through its import slots. The emulated backend
+/// reaches the same functions through the ABI table, so every signature here
+/// has a row there - and `dlopen`/`dlclose` are marked as reentering the guest,
+/// because initializers and terminators run inside them and an inlined call
+/// cannot host that.
+pub(crate) mod entry {
+    use std::ffi::{CStr, c_char, c_void};
+
+    use super::Ordering;
+
+    /// Darwin's value, not the host's.
+    const RTLD_NODELETE: i32 = 0x80;
+
+    // A guest pointer is a host pointer under both backends: the emulated
+    // guest is identity-mapped.
+
+    /// `uint32_t _dyld_image_count(void)`
+    pub extern "C" fn dyld_image_count() -> u32 {
+        super::image_count()
+    }
+
+    /// `const struct mach_header *_dyld_get_image_header(uint32_t)`
+    pub extern "C" fn dyld_get_image_header(index: u32) -> u64 {
+        super::indexed_image(index).map_or(0, |(header, _, _)| header)
+    }
+
+    /// `const struct mach_header_64 *_NSGetMachExecuteHeader(void)`
+    ///
+    /// The guest's main image, which is what `__mh_execute_header` names inside
+    /// it - never this runtime's own header.
+    pub extern "C" fn ns_get_mach_execute_header() -> u64 {
+        super::MAIN_HEADER.load(Ordering::Acquire)
+    }
+
+    /// `intptr_t _dyld_get_image_vmaddr_slide(uint32_t)`
+    pub extern "C" fn dyld_get_image_vmaddr_slide(index: u32) -> u64 {
+        super::indexed_image(index).map_or(0, |(_, slide, _)| slide)
+    }
+
+    /// `const char *_dyld_get_image_name(uint32_t)`
+    pub extern "C" fn dyld_get_image_name(index: u32) -> u64 {
+        super::indexed_image(index).map_or(0, |(_, _, path)| super::path_cstr(&path))
+    }
+
+    /// `const struct mach_header *_dyld_image_containing_address(const void *)`
+    ///
+    /// A guest image's own header, or, for code this runtime serves as Darwin's
+    /// system, the header standing for that system (see `system_header`).
+    pub extern "C" fn dyld_image_containing_address(va: u64) -> u64 {
+        super::guest_image_at(va)
+            .map(|(header, _)| header)
+            .or_else(|| super::is_system_code(va).then(super::system_header))
+            .unwrap_or(0)
+    }
+
+    /// `const struct mach_header *dyld_image_header_containing_address(const
+    /// void *)`: the current name of `_dyld_image_containing_address`.
+    pub extern "C" fn dyld_image_header_containing_address(va: u64) -> u64 {
+        dyld_image_containing_address(va)
+    }
+
+    /// `const char *dyld_image_path_containing_address(const void *)`
+    pub extern "C" fn dyld_image_path_containing_address(va: u64) -> u64 {
+        super::with_guest_image_at(va, |_, _, path| super::path_cstr(path)).unwrap_or(0)
+    }
+
+    // The shared cache's half of dyld's private interface. There is no shared
+    // cache: every image is loaded from its own file.
+
+    /// `bool dyld_shared_cache_some_image_overridden(void)`
+    pub extern "C" fn dyld_shared_cache_some_image_overridden() -> bool {
+        false
+    }
+
+    /// `const void *_dyld_get_shared_cache_range(size_t *length)`
+    ///
+    /// # Safety
+    ///
+    /// `length` is null or writable.
+    pub unsafe extern "C" fn dyld_get_shared_cache_range(length: *mut u64) -> u64 {
+        if !length.is_null() {
+            // SAFETY: the caller's writable word.
+            unsafe { length.write_unaligned(0) };
+        }
+        0
+    }
+
+    /// `bool _dyld_is_preoptimized_objc_image_loaded(uint16_t imageID)`: an
+    /// image ID numbers an image in the shared cache's Objective-C tables.
+    pub extern "C" fn dyld_is_preoptimized_objc_image_loaded(_image: u16) -> bool {
+        false
+    }
+
+    /// `const void *_dyld_get_swift_prespecialized_data(void)`: the shared
+    /// cache's table of prebuilt generic metadata.
+    pub extern "C" fn dyld_get_swift_prespecialized_data() -> u64 {
+        0
+    }
+
+    /// `const void *_dyld_find_pointer_hash_table_entry(const void *table,
+    /// const void *key1, size_t restKeysCount, const void **restKeys)`: a
+    /// lookup in a shared cache table, which nothing here can have handed out.
+    pub extern "C" fn dyld_find_pointer_hash_table_entry(
+        _table: u64,
+        _key: u64,
+        _rest_count: u64,
+        _rest: u64,
+    ) -> u64 {
+        0
+    }
+
+    /// `void _dyld_register_func_for_add_image(void (*)(const struct mach_header *,
+    /// intptr_t))`
+    ///
+    /// `f` is native code: a thunk under emulation, since the table names it as a
+    /// callback.
+    pub extern "C" fn dyld_register_func_for_add_image(f: u64) {
+        if f == 0 {
+            return;
+        }
+        // Registered before the retrospective notices, so an image one of them
+        // loads is announced rather than missed.
+        super::ADD_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(f);
+
+        let mut already: Vec<(u64, u64)> = Vec::new();
+        if let Some((_, slide)) = super::EXECUTABLE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            already.push((super::MAIN_HEADER.load(Ordering::Acquire), slide));
+        }
+        already.extend(super::snapshot().iter().map(|i| (i.handle, i.slide)));
+        for (header, slide) in already {
+            super::notify(f, header, slide);
+        }
+    }
+
+    /// `void objc_addLoadImageFunc(void (*)(const struct mach_header *))`
+    ///
+    /// libobjc's, served here because it is about images: `f` hears about
+    /// every image with Objective-C metadata, those already loaded first.
+    /// Swift finds its type and conformance records this way.
+    pub extern "C" fn objc_add_load_image_func(f: u64) {
+        if f == 0 {
+            return;
+        }
+        // Registered first, as `dyld_register_func_for_add_image` is.
+        super::LOAD_IMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(f);
+        for header in super::every_header() {
+            if super::has_objc(header) {
+                super::notify_objc(f, header);
+            }
+        }
+    }
+
+    /// `void _dyld_register_func_for_remove_image(void (*)(const struct
+    /// mach_header *, intptr_t))`. Called for each image `dlclose` unloads.
+    pub extern "C" fn dyld_register_func_for_remove_image(f: u64) {
+        if f != 0 {
+            super::REMOVE_IMAGE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(f);
+        }
+    }
+
+    /// `bool _dyld_find_unwind_sections(void *addr, struct dyld_unwind_sections *)`
+    ///
+    /// dyld answers only for images it mapped, so without this every guest frame
+    /// has no unwind info and a `throw` reaches `terminate`. The layout, read out
+    /// of the vendored `libunwind`: five words - `mach_header *`, then address
+    /// and length of `__eh_frame` and of `__unwind_info`.
+    ///
+    /// # Safety
+    ///
+    /// `out` is null or forty writable bytes.
+    pub unsafe extern "C" fn dyld_find_unwind_sections(addr: *const c_void, out: *mut u8) -> bool {
+        let addr = addr as usize as u64;
+        let Some(words) = super::unwind_sections_of(addr) else {
+            let Some(host) = crate::host::symbol("_dyld_find_unwind_sections") else {
+                return false;
+            };
+            // SAFETY: `bool (*)(void *, struct dyld_unwind_sections *)`, with the
+            // caller's own arguments.
+            let f: unsafe extern "C" fn(u64, *mut u8) -> bool =
+                unsafe { core::mem::transmute(host as usize as *const ()) };
+            return unsafe { f(addr, out) };
+        };
+        if out.is_null() {
+            return false;
+        }
+        // SAFETY: the caller reserved the forty bytes written here.
+        unsafe { core::ptr::copy_nonoverlapping(words.as_ptr(), out, words.len()) };
+        // True even when both sections are absent: that is an answer.
+        true
+    }
+
+    /// `const struct segment_command_64 *getsegbyname(const char *)`, over the
+    /// guest's main image rather than this process's.
+    ///
+    /// # Safety
+    ///
+    /// `segment` is NUL-terminated.
+    pub unsafe extern "C" fn getsegbyname(segment: *const c_char) -> u64 {
+        if segment.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states `segment` is NUL-terminated.
+        let segment = unsafe { CStr::from_ptr(segment) };
+        super::load_command_in(
+            super::MAIN_HEADER.load(Ordering::Acquire),
+            segment.to_bytes(),
+            None,
+        )
+    }
+
+    /// `const struct section_64 *getsectbyname(const char *, const char *)`
+    ///
+    /// # Safety
+    ///
+    /// Both names are NUL-terminated.
+    pub unsafe extern "C" fn getsectbyname(segment: *const c_char, section: *const c_char) -> u64 {
+        if segment.is_null() || section.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states both are NUL-terminated.
+        let (segment, section) = unsafe { (CStr::from_ptr(segment), CStr::from_ptr(section)) };
+        super::load_command_in(
+            super::MAIN_HEADER.load(Ordering::Acquire),
+            segment.to_bytes(),
+            Some(section.to_bytes()),
+        )
+    }
+
+    /// `const struct section_64 *getsectbynamefromheader_64(const struct
+    /// mach_header_64 *, const char *, const char *)`
+    ///
+    /// # Safety
+    ///
+    /// `header` is a mapped image's header, and both names are NUL-terminated.
+    pub unsafe extern "C" fn getsectbynamefromheader_64(
+        header: u64,
+        segment: *const c_char,
+        section: *const c_char,
+    ) -> u64 {
+        if segment.is_null() || section.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states both are NUL-terminated.
+        let (segment, section) = unsafe { (CStr::from_ptr(segment), CStr::from_ptr(section)) };
+        super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
+    }
+
+    /// `uint8_t *getsectiondata(const struct mach_header_64 *, const char
+    /// *segname, const char *sectname, unsigned long *size)`: a section's
+    /// contents, slid by how far `header` is from its `__TEXT`.
+    ///
+    /// # Safety
+    ///
+    /// `header` is a mapped image's header, both names are NUL-terminated, and
+    /// `size` is writable.
+    pub unsafe extern "C" fn getsectiondata(
+        header: u64,
+        segment: *const c_char,
+        section: *const c_char,
+        size: *mut u64,
+    ) -> u64 {
+        if segment.is_null() || section.is_null() || size.is_null() {
+            return 0;
+        }
+        let text = super::load_command_in(header, b"__TEXT", None) as *const u8;
+        // SAFETY: the caller states both are NUL-terminated.
+        let (segment, section) = unsafe { (CStr::from_ptr(segment), CStr::from_ptr(section)) };
+        let record = super::load_command_in(header, segment.to_bytes(), Some(section.to_bytes()))
+            as *const u8;
+        if text.is_null() || record.is_null() {
+            return 0;
+        }
+        // SAFETY: a `segment_command_64` and a `section_64` inside the mapped
+        // header: `vmaddr` is the segment's word at 24, `addr` and `size` the
+        // section's at 32 and 40.
+        unsafe {
+            let slide = header.wrapping_sub(text.add(24).cast::<u64>().read_unaligned());
+            size.write_unaligned(record.add(40).cast::<u64>().read_unaligned());
+            record
+                .add(32)
+                .cast::<u64>()
+                .read_unaligned()
+                .wrapping_add(slide)
+        }
+    }
+
+    /// `unsigned long get_etext(void)`: the end of the main image's
+    /// `__TEXT,__text`, slid - which is where its writable data starts as far
+    /// as a collector registering roots is concerned.
+    pub extern "C" fn get_etext() -> u64 {
+        let section = super::load_command_in(
+            super::MAIN_HEADER.load(Ordering::Acquire),
+            b"__TEXT",
+            Some(b"__text"),
+        ) as *const u8;
+        if section.is_null() {
+            return 0;
+        }
+        // SAFETY: a `section_64` inside the mapped header; `addr` and `size`
+        // are its two words at 32 and 40.
+        let (addr, size) = unsafe {
+            (
+                section.add(32).cast::<u64>().read_unaligned(),
+                section.add(40).cast::<u64>().read_unaligned(),
+            )
+        };
+        (addr + size).wrapping_add(super::main_slide())
+    }
+
+    /// `unsigned long get_end(void)`: the end of the main image, slid.
+    pub extern "C" fn get_end() -> u64 {
+        super::main_image_end()
+    }
+
+    /// `void *dlopen(const char *path, int mode)`
+    ///
+    /// Of the mode, only `RTLD_NODELETE` and `RTLD_FIRST` are honoured: every
+    /// image is global. The values are Darwin's, which differ from glibc's.
+    ///
+    /// # Safety
+    ///
+    /// `path` is null or NUL-terminated.
+    pub unsafe extern "C" fn dlopen(path: *const c_char, mode: i32) -> *mut c_void {
+        let first_only = mode & super::RTLD_FIRST != 0;
+        if path.is_null() {
+            super::clear_error();
+            let handle = match first_only {
+                true => super::RTLD_MAIN_ONLY,
+                false => super::global_handle(),
+            };
+            return handle as usize as *mut c_void;
+        }
+        // SAFETY: the caller states `path` is NUL-terminated.
+        let path = unsafe { CStr::from_ptr(path) }
+            .to_string_lossy()
+            .into_owned();
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: dlopen({path:?}, flags {mode:#x})");
+        }
+        // dyld hands back the main executable's own handle for its path, as for a
+        // null one, rather than loading a second copy with statics of its own.
+        if super::names_main_executable(&path) {
+            super::clear_error();
+            let handle = match first_only {
+                true => super::RTLD_MAIN_ONLY,
+                false => super::global_handle(),
+            };
+            return handle as usize as *mut c_void;
+        }
+        let handle = match super::open(&path) {
+            Ok(handle) => {
+                if mode & RTLD_NODELETE != 0 {
+                    super::pin(handle);
+                }
+                Some(match first_only {
+                    true => handle | super::FIRST_ONLY,
+                    false => handle,
+                })
+            }
+            // No Mach-O for this backend on disk under that name.
+            Err(reason) => super::open_native(&path).or_else(|| {
+                let strict = match darwin::strict::enabled() {
+                    true => format!(" (and {} refuses the host's loader)", darwin::strict::VAR),
+                    false => String::new(),
+                };
+                super::set_error(format!("dlopen({path}): {reason}{strict}"));
+                None
+            }),
+        };
+        match handle {
+            Some(handle) => {
+                super::clear_error();
+                handle as usize as *mut c_void
+            }
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// `void *dlsym(void *handle, const char *name)`, which hands its return
+    /// address to [`dlsym_from`]: `RTLD_SELF` and `RTLD_NEXT` search from the
+    /// caller's image, as dyld finds it by `__builtin_return_address`.
+    #[cfg(target_arch = "aarch64")]
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn dlsym() {
+        core::arch::naked_asm!(
+            "mov x2, x30",
+            "b   {from}",
+            from = sym dlsym_from,
+        )
+    }
+
+    /// As the aarch64 `dlsym`: the return address is on top of the stack.
+    #[cfg(not(target_arch = "aarch64"))]
+    #[unsafe(naked)]
+    pub unsafe extern "C" fn dlsym() {
+        core::arch::naked_asm!(
+            "mov rdx, [rsp]",
+            "jmp {from}",
+            from = sym dlsym_from,
+        )
+    }
+
+    /// `dlsym`, called from `return_address`.
+    ///
+    /// # Safety
+    ///
+    /// `name` is NUL-terminated. `handle` is never dereferenced.
+    unsafe extern "C" fn dlsym_from(
+        handle: *mut c_void,
+        name: *const c_char,
+        return_address: u64,
+    ) -> *mut c_void {
+        if name.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        // Emulated, this is reached from the import exit, so the guest's
+        // return address is in its context rather than in a register.
+        let caller = match crate::exec::active().map(|exec| exec.engine()) {
+            Some(crate::exec::Engine::Emulated) => {
+                crate::thunk::current().and_then(|vm| vm.import_return_address())
+            }
+            _ => Some(return_address),
+        };
+        let caller = caller.and_then(super::Scope::containing);
+        match super::lookup_from(handle as usize as u64, &name, caller) {
+            Some(addr) => {
+                super::clear_error();
+                addr as usize as *mut c_void
+            }
+            None => {
+                // Traced only: a null `dlsym` is how a program asks whether
+                // something exists, sometimes once a frame.
+                let err = format!("dlsym({name}): symbol not found");
+                if crate::shims::vmmap::tracing() {
+                    eprintln!("rosemary: {err}");
+                }
+                super::set_error(err);
+                std::ptr::null_mut()
+            }
+        }
+    }
+
+    /// `int dlclose(void *handle)`, which unloads the image once every `dlopen`
+    /// of it is matched, running its terminators first.
+    pub extern "C" fn dlclose(handle: *mut c_void) -> i32 {
+        match super::close(handle as usize as u64) {
+            Ok(()) => {
+                super::clear_error();
+                0
+            }
+            Err(reason) => {
+                super::set_error(reason);
+                -1
+            }
+        }
+    }
+
+    /// `char *dlerror(void)`, which clears the error it reports.
+    pub extern "C" fn dlerror() -> *const c_char {
+        let taken = super::ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let mut reported = super::REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+        *reported = taken;
+        reported
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr().cast())
+    }
+
+    /// `int dladdr(const void *addr, Dl_info *info)`
+    ///
+    /// # Safety
+    ///
+    /// `info` is null or four writable words.
+    pub unsafe extern "C" fn dladdr(addr: *const c_void, info: *mut u64) -> i32 {
+        let addr = addr as usize as u64;
+        let Some(found) = super::describe(addr) else {
+            // Darwin apps have no business meddling around with non-guest shared objects
+            if !darwin::libc_backend::using_builtin() {
+                // Not ours; the host knows its own images.
+                let Some(host) = crate::host::symbol("dladdr") else {
+                    return 0;
+                };
+                let f: unsafe extern "C" fn(u64, *mut u64) -> i32 =
+                    unsafe { core::mem::transmute(host as usize as *const ()) };
+                return unsafe { f(addr, info) };
+            } else {
+                return 0;
+            }
+        };
+        if info.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states `info` is four writable words.
+        unsafe {
+            info.write(found.fname);
+            info.add(1).write(found.fbase);
+            info.add(2).write(found.sname);
+            info.add(3).write(found.saddr);
+        }
+        // Non-zero on success, unlike the rest of `<dlfcn.h>`.
+        1
+    }
+
+    /// What dyld does when an `NS*` call fails without its `RETURN_ON_ERROR`
+    /// option: the caller asked not to be told, so there is nobody to tell.
+    fn halt(message: &str) -> ! {
+        eprintln!("dyld: {message}");
+        std::process::abort();
+    }
+
+    /// `const struct mach_header *NSAddImage(const char *image_name, uint32_t options)`
+    ///
+    /// The old spelling of `dlopen`, which XPCOM's standalone glue still uses to
+    /// load `XUL`. An image added this way is never unloaded: there is no call
+    /// to remove one.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_add_image(name: *const c_char, options: u32) -> u64 {
+        const RETURN_ON_ERROR: u32 = 0x1;
+        const RETURN_ONLY_IF_LOADED: u32 = 0x4;
+        if name.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let path = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: NSAddImage({path:?}, options {options:#x})");
+        }
+        // Not loaded is an answer here, not a failure.
+        if options & RETURN_ONLY_IF_LOADED != 0 {
+            return super::loaded_handle(&path).unwrap_or(0);
+        }
+        match super::open(&path) {
+            Ok(handle) => {
+                super::pin(handle);
+                handle
+            }
+            Err(reason) => {
+                let (kind, errno) = match super::resolve_path(&path) {
+                    Some(_) => (super::NS_LINK_EDIT_FILE_FORMAT, 0),
+                    None => (super::NS_LINK_EDIT_FILE_ACCESS, libc::ENOENT),
+                };
+                let message = format!("NSAddImage({path}): {reason}");
+                if options & RETURN_ON_ERROR == 0 {
+                    halt(&message);
+                }
+                super::set_link_edit_error(kind, errno, &path, message);
+                0
+            }
+        }
+    }
+
+    /// `NSSymbol NSLookupSymbolInImage(const struct mach_header *image,
+    /// const char *symbolName, uint32_t options)`
+    ///
+    /// An `NSSymbol` is the symbol's address: nothing else is ever asked of one.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_lookup_symbol_in_image(
+        image: u64,
+        name: *const c_char,
+        options: u32,
+    ) -> u64 {
+        const RETURN_ON_ERROR: u32 = 0x4;
+        if name.is_null() {
+            return 0;
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        if let Some(addr) = super::lookup_in_image(image, &name) {
+            return addr;
+        }
+        let message = format!("NSLookupSymbolInImage({image:#x}, {name}): symbol not found");
+        if options & RETURN_ON_ERROR == 0 {
+            halt(&message);
+        }
+        if crate::shims::vmmap::tracing() {
+            eprintln!("rosemary: {message}");
+        }
+        super::set_link_edit_error(super::NS_LINK_EDIT_UNDEFINED, 0, "", message);
+        0
+    }
+
+    /// `bool NSIsSymbolNameDefined(const char *symbolName)`
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_is_symbol_name_defined(name: *const c_char) -> bool {
+        if name.is_null() {
+            return false;
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+        super::lookup_in_image(super::global_handle(), &name).is_some()
+    }
+
+    /// `NSSymbol NSLookupAndBindSymbol(const char *symbolName)`, which dyld
+    /// treats an undefined name as fatal for: the caller was meant to ask
+    /// `NSIsSymbolNameDefined` first.
+    ///
+    /// # Safety
+    ///
+    /// `name` is null or NUL-terminated.
+    pub unsafe extern "C" fn ns_lookup_and_bind_symbol(name: *const c_char) -> u64 {
+        if name.is_null() {
+            halt("NSLookupAndBindSymbol(NULL)");
+        }
+        // SAFETY: the caller states `name` is NUL-terminated.
+        let name = unsafe { CStr::from_ptr(name) }.to_string_lossy();
+        super::lookup_in_image(super::global_handle(), &name).unwrap_or_else(|| {
+            halt(&format!(
+                "NSLookupAndBindSymbol({name}): symbol not defined"
+            ))
+        })
+    }
+
+    /// `void *NSAddressOfSymbol(NSSymbol symbol)`, the identity: see
+    /// [`ns_lookup_symbol_in_image`].
+    pub extern "C" fn ns_address_of_symbol(symbol: u64) -> u64 {
+        symbol
+    }
+
+    /// `void NSLinkEditError(NSLinkEditErrors *c, int *errorNumber,
+    /// const char **fileName, const char **errorString)`
+    ///
+    /// The strings stay valid until the next failure replaces them.
+    ///
+    /// # Safety
+    ///
+    /// Each out-parameter is null or writable.
+    pub unsafe extern "C" fn ns_link_edit_error(
+        kind: *mut i32,
+        errno: *mut i32,
+        file: *mut *const c_char,
+        message: *mut *const c_char,
+    ) {
+        let error = super::LINK_EDIT_ERROR
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (k, n, f, m) = match error.as_ref() {
+            Some(e) => (e.kind, e.errno, e.file.as_ptr(), e.message.as_ptr()),
+            None => (0, 0, c"".as_ptr(), c"".as_ptr()),
+        };
+        // SAFETY: the caller states each is null or writable.
+        unsafe {
+            if !kind.is_null() {
+                kind.write(k);
+            }
+            if !errno.is_null() {
+                errno.write(n);
+            }
+            if !file.is_null() {
+                file.write(f);
+            }
+            if !message.is_null() {
+                message.write(m);
+            }
+        }
+    }
+}
+
+/// Every name [`provider`] defines, and the function it binds to.
+fn entries() -> [(&'static str, *const ()); 33] {
+    [
+        ("_NSAddImage", entry::ns_add_image as *const ()),
+        (
+            "_NSLookupSymbolInImage",
+            entry::ns_lookup_symbol_in_image as *const (),
+        ),
+        (
+            "_NSIsSymbolNameDefined",
+            entry::ns_is_symbol_name_defined as *const (),
+        ),
+        (
+            "_NSLookupAndBindSymbol",
+            entry::ns_lookup_and_bind_symbol as *const (),
+        ),
+        (
+            "_NSAddressOfSymbol",
+            entry::ns_address_of_symbol as *const (),
+        ),
+        ("_NSLinkEditError", entry::ns_link_edit_error as *const ()),
+        ("_dlopen", entry::dlopen as *const ()),
+        ("_dlsym", entry::dlsym as *const ()),
+        ("_dlclose", entry::dlclose as *const ()),
+        ("_dlerror", entry::dlerror as *const ()),
+        ("_dladdr", entry::dladdr as *const ()),
+        ("__dyld_image_count", entry::dyld_image_count as *const ()),
+        (
+            "__dyld_get_image_header",
+            entry::dyld_get_image_header as *const (),
+        ),
+        (
+            "__NSGetMachExecuteHeader",
+            entry::ns_get_mach_execute_header as *const (),
+        ),
+        (
+            "__dyld_get_image_vmaddr_slide",
+            entry::dyld_get_image_vmaddr_slide as *const (),
+        ),
+        (
+            "__dyld_get_image_name",
+            entry::dyld_get_image_name as *const (),
+        ),
+        (
+            "__dyld_image_containing_address",
+            entry::dyld_image_containing_address as *const (),
+        ),
+        (
+            "_dyld_image_path_containing_address",
+            entry::dyld_image_path_containing_address as *const (),
+        ),
+        (
+            "_dyld_image_header_containing_address",
+            entry::dyld_image_header_containing_address as *const (),
+        ),
+        (
+            "_dyld_shared_cache_some_image_overridden",
+            entry::dyld_shared_cache_some_image_overridden as *const (),
+        ),
+        (
+            "__dyld_get_shared_cache_range",
+            entry::dyld_get_shared_cache_range as *const (),
+        ),
+        (
+            "__dyld_is_preoptimized_objc_image_loaded",
+            entry::dyld_is_preoptimized_objc_image_loaded as *const (),
+        ),
+        (
+            "__dyld_get_swift_prespecialized_data",
+            entry::dyld_get_swift_prespecialized_data as *const (),
+        ),
+        (
+            "__dyld_find_pointer_hash_table_entry",
+            entry::dyld_find_pointer_hash_table_entry as *const (),
+        ),
+        (
+            "__dyld_register_func_for_add_image",
+            entry::dyld_register_func_for_add_image as *const (),
+        ),
+        (
+            "_objc_addLoadImageFunc",
+            entry::objc_add_load_image_func as *const (),
+        ),
+        (
+            "__dyld_register_func_for_remove_image",
+            entry::dyld_register_func_for_remove_image as *const (),
+        ),
+        ("_getsegbyname", entry::getsegbyname as *const ()),
+        ("_getsectbyname", entry::getsectbyname as *const ()),
+        (
+            "_getsectbynamefromheader_64",
+            entry::getsectbynamefromheader_64 as *const (),
+        ),
+        ("_getsectiondata", entry::getsectiondata as *const ()),
+        ("_get_etext", entry::get_etext as *const ()),
+        ("_get_end", entry::get_end as *const ()),
+    ]
+}
+
+/// The `dyld` family, claimed ahead of the host's: dyld never saw the images
+/// this runtime mapped, and off a Mac there is no dyld at all.
+///
+/// `__dyld_find_unwind_sections` is [`crate::shims::runtime::provider`]'s,
+/// which is in the native chain even when this one is not.
+pub fn provider() -> SyntheticDylib {
+    let mut lib = SyntheticDylib::new("<rosemary dyld>");
+    lib.flat(true);
+    for (name, f) in entries() {
+        lib.define_fn(name, f);
+    }
+    lib
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::abi::{Classification, Lookup};
+
+    #[test]
+    fn native_library_handles_cannot_bypass_builtin_gl() {
+        if !cfg!(target_os = "macos") || !crate::frameworks::using_builtin() {
+            return;
+        }
+        crate::frameworks::provider();
+        let handle = open_native(opengl::INSTALL_PATHS[0]).expect("host OpenGL framework");
+        // Prove the host really has the entry point that the guest must not see.
+        let host = unsafe {
+            libc::dlsym(
+                handle as *mut libc::c_void,
+                c"CGLDescribePixelFormat".as_ptr(),
+            )
+        };
+        assert!(!host.is_null());
+        assert!(lookup(handle, "CGLDescribePixelFormat").is_none());
+        assert!(lookup(handle, "gluPerspective").is_none());
+        let expected = appkit::symbol("CGLGetCurrentContext").unwrap();
+        assert_eq!(
+            lookup(handle, "CGLGetCurrentContext"),
+            Some(remember_native_symbol(
+                expected,
+                "CGLGetCurrentContext",
+                None
+            ))
+        );
+    }
+
+    /// A provided framework's bundle and the folder it is in exist for the
+    /// File Manager, and a framework nobody registered does not.
+    #[test]
+    fn a_registered_framework_makes_its_bundle_directory_exist() {
+        synthetic::register(
+            &["/System/Library/Frameworks/RosemaryProbe.framework/RosemaryProbe"],
+            |_| None,
+            Links::default(),
+        );
+        assert!(virtual_directory("/System/Library/Frameworks"));
+        assert!(virtual_directory("/System/Library/Frameworks/"));
+        assert!(virtual_directory(
+            "/System/Library/Frameworks/RosemaryProbe.framework"
+        ));
+        assert!(virtual_directory(
+            "/System/Library/Frameworks/RosemaryProbe.framework/"
+        ));
+        assert!(!virtual_directory(
+            "/System/Library/Frameworks/RosemaryAbsent.framework"
+        ));
+        assert!(!virtual_directory(
+            "/System/Library/Frameworks/RosemaryProbe.framework/RosemaryProbe"
+        ));
+        assert!(!virtual_directory(
+            "/Library/Frameworks/RosemaryProbe.framework"
+        ));
+    }
+
+    /// Mono probes `DllImport("libc")` as the bare `libc.dylib`, which dyld
+    /// finds through its `/usr/lib` fallback.
+    #[test]
+    fn a_bare_leaf_finds_the_library_installed_under_usr_lib() {
+        synthetic::register(
+            &["/usr/lib/librosemaryprobe.dylib"],
+            |_| None,
+            Links::default(),
+        );
+        let by_path = synthetic::find("/usr/lib/librosemaryprobe.dylib").unwrap();
+        let by_leaf = synthetic::find("librosemaryprobe.dylib").unwrap();
+        assert_eq!(by_leaf.handle, by_path.handle);
+        assert!(synthetic::find("librosemaryabsent.dylib").is_none());
+    }
+
+    #[test]
+    fn every_entry_has_a_signature_the_emulated_backend_can_call() {
+        let mut claimed = Vec::new();
+        machish::resolve::SymbolProvider::enumerate(&provider(), &mut |name, _| {
+            claimed.push(name.to_string())
+        });
+        assert_eq!(claimed.len(), entries().len());
+        for name in claimed
+            .iter()
+            .map(String::as_str)
+            .chain(["__dyld_find_unwind_sections"])
+        {
+            assert!(
+                matches!(crate::abi::table::lookup(0, name), Lookup::Known(_)),
+                "{name} has no signature"
+            );
+            assert!(!crate::shims::is_shimmed(name), "{name} is still shimmed");
+        }
+    }
+
+    #[test]
+    fn calls_that_run_guest_code_are_never_inlined() {
+        for name in [
+            "_dlopen",
+            "_dlclose",
+            "_NSAddImage",
+            "__dyld_register_func_for_add_image",
+            "__dyld_register_func_for_remove_image",
+        ] {
+            assert_eq!(
+                crate::abi::classify(0, name),
+                Classification::Slow,
+                "{name}"
+            );
+        }
+    }
+
+    /// Roblox calls `dlsym(RTLD_NEXT, "objc_autoreleasePoolPush")` from a static
+    /// initializer and calls the answer without checking it.
+    #[test]
+    fn a_global_search_finds_the_objc_runtime() {
+        const RTLD_NEXT: u64 = u64::MAX;
+        let name = "objc_autoreleasePoolPush";
+        let expected = crate::objc::host::symbol(name).expect("the runtime defines it");
+        let expected = remember_native_symbol(expected, name, None);
+        assert_eq!(lookup(RTLD_NEXT, name), Some(expected));
+        assert_eq!(lookup(global_handle(), name), Some(expected));
+    }
+
+    /// compiler-rt's `@available` asks `dlsym(RTLD_DEFAULT,
+    /// "_availability_version_check")`, a C name with its own underscore; Unity
+    /// gates its shadow comparison sampler on the answer.
+    #[test]
+    fn a_global_search_finds_an_underscored_libsystem_name() {
+        const RTLD_DEFAULT: u64 = -2i64 as u64;
+        let name = "_availability_version_check";
+        let expected = darwin::symbol(&format!("_{name}")).expect("darwin defines it");
+        assert_eq!(system_symbol(name), Some(expected));
+        assert!(lookup(RTLD_DEFAULT, name).is_some());
+    }
+
+    /// Three probe libraries: a framework linking a library that re-exports
+    /// another, each defining only its own name.
+    fn probe_libraries() -> (u64, u64) {
+        fn own(name: &'static str) -> impl Fn(&str) -> Option<u64> + Send + Sync {
+            move |asked| (asked == name).then_some(name.as_ptr() as u64)
+        }
+        synthetic::register(
+            &["/usr/lib/librosemaryinner.dylib"],
+            own("inner"),
+            Links::default(),
+        );
+        synthetic::register(
+            &["/usr/lib/librosemarybase.dylib"],
+            own("base"),
+            Links {
+                reexports: &["/usr/lib/librosemaryinner.dylib"],
+                dependencies: &[],
+            },
+        );
+        synthetic::register(
+            &["/System/Library/Frameworks/RosemaryKit.framework/RosemaryKit"],
+            own("kit"),
+            Links {
+                reexports: &[],
+                dependencies: &["/usr/lib/librosemarybase.dylib"],
+            },
+        );
+        let handle = |path| synthetic::find(path).unwrap().handle;
+        (
+            handle("/System/Library/Frameworks/RosemaryKit.framework/RosemaryKit"),
+            handle("/usr/lib/librosemarybase.dylib"),
+        )
+    }
+
+    #[test]
+    fn a_handle_searches_what_its_library_links_against() {
+        let (kit, _) = probe_libraries();
+        assert!(lookup(kit, "kit").is_some());
+        assert!(lookup(kit, "base").is_some());
+        assert!(lookup(kit, "inner").is_some());
+    }
+
+    #[test]
+    fn a_handle_does_not_search_what_links_against_it() {
+        let (_, base) = probe_libraries();
+        assert!(lookup(base, "inner").is_some());
+        assert!(lookup(base, "kit").is_none());
+    }
+
+    #[test]
+    fn a_first_only_handle_searches_the_library_and_its_reexports() {
+        let (kit, base) = probe_libraries();
+        assert!(lookup(kit | FIRST_ONLY, "kit").is_some());
+        assert!(lookup(kit | FIRST_ONLY, "base").is_none());
+        assert!(lookup(base | FIRST_ONLY, "inner").is_some());
+    }
+
+    #[test]
+    fn rtld_self_searches_the_caller_and_what_it_links() {
+        let (kit, _) = probe_libraries();
+        let caller = Some(Scope::of_handle(kit).unwrap());
+        assert!(lookup_from(RTLD_SELF, "kit", caller).is_some());
+        assert!(lookup_from(RTLD_SELF, "inner", caller).is_some());
+    }
+
+    #[test]
+    fn rtld_next_skips_the_caller() {
+        let (kit, base) = probe_libraries();
+        let caller = Some(Scope::of_handle(kit).unwrap());
+        assert!(lookup_from(RTLD_NEXT, "kit", caller).is_none());
+        assert!(lookup_from(RTLD_NEXT, "base", caller).is_some());
+        assert!(lookup_from(RTLD_NEXT, "inner", caller).is_some());
+        let caller = Some(Scope::of_handle(base).unwrap());
+        assert!(lookup_from(RTLD_NEXT, "kit", caller).is_none());
+    }
+
+    /// Only an exit puts the guest's return address in its context.
+    #[test]
+    fn dlsym_is_never_inlined() {
+        assert_eq!(crate::abi::classify(0, "_dlsym"), Classification::Slow);
+    }
+
+    #[test]
+    fn an_unknown_handle_finds_nothing() {
+        let (kit, _) = probe_libraries();
+        assert!(lookup(kit + 0x10, "kit").is_none());
+    }
+
+    #[test]
+    fn a_libsystem_handle_does_not_answer_opengl() {
+        if !crate::frameworks::using_builtin() {
+            return;
+        }
+        crate::frameworks::provider();
+        let system = synthetic::find("/usr/lib/libSystem.B.dylib")
+            .unwrap()
+            .handle;
+        assert!(lookup(system, "malloc").is_some());
+        assert!(lookup(system, "CGLChoosePixelFormat").is_none());
+        assert!(lookup(system, "glGetString").is_none());
+    }
+
+    #[test]
+    fn a_libsystem_handle_does_not_answer_frameworks() {
+        if !crate::frameworks::using_builtin() {
+            return;
+        }
+        crate::frameworks::provider();
+        let system = synthetic::find("/usr/lib/libSystem.B.dylib")
+            .unwrap()
+            .handle;
+        assert!(lookup(system, "CFStringCreateWithCString").is_none());
+        assert!(lookup(system, "NSApplicationMain").is_none());
+    }
+
+    #[test]
+    fn a_framework_handle_answers_what_it_links_and_not_what_links_it() {
+        if !crate::frameworks::using_builtin() {
+            return;
+        }
+        crate::frameworks::provider();
+        let handle = |leaf: &str| {
+            synthetic::find(&format!(
+                "/System/Library/Frameworks/{leaf}.framework/{leaf}"
+            ))
+            .unwrap()
+            .handle
+        };
+        assert!(lookup(handle("AppKit"), "CFStringCreateWithCString").is_some());
+        assert!(lookup(handle("AppKit"), "malloc").is_some());
+        assert!(lookup(handle("CoreFoundation"), "NSApplicationMain").is_none());
+    }
+
+    #[test]
+    fn main_only_does_not_search_libraries() {
+        assert!(lookup(RTLD_MAIN_ONLY, "malloc").is_none());
+    }
+
+    #[test]
+    fn the_global_handle_is_not_a_plausible_image_base() {
+        // Compared against `Image::handle`, a mapped base address.
+        assert!(global_handle() > 0x1000);
+    }
+
+    #[test]
+    fn a_missing_file_is_a_named_failure_rather_than_a_panic() {
+        let err = open("/nonexistent/libnothing.dylib").unwrap_err();
+        assert!(err.contains("libnothing.dylib"), "{err}");
+    }
+
+    #[test]
+    fn a_native_arm64_image_is_refused_by_name() {
+        let host_dylib = "/usr/lib/libSystem.B.dylib";
+        if std::path::Path::new(host_dylib).exists() {
+            let err = open(host_dylib).unwrap_err();
+            assert!(
+                err.contains("x86-64") || err.contains("no such file"),
+                "{err}"
+            );
+        }
+    }
+
+    fn linked(name: &str, slide: u64, exports: Vec<machish::exports::Export>) -> LinkedImage {
+        let deps = |reexport: bool| match (name, reexport) {
+            ("/usr/lib/libc++.1.dylib", _) => vec!["/usr/lib/libc++abi.dylib".to_string()],
+            ("/usr/lib/libfwd.dylib", false) => vec!["/usr/lib/libc++abi.dylib".to_string()],
+            _ => Vec::new(),
+        };
+        LinkedImage {
+            name: name.to_string(),
+            // Unreadable on purpose: the exports below are the whole image.
+            path: format!("/nonexistent{name}"),
+            slide,
+            parsed: OnceLock::from(Some(LinkedExports {
+                exports: ExportTable::from_entries(exports),
+                dependencies: deps(false),
+                reexports: deps(true),
+            })),
+        }
+    }
+
+    fn export(name: &str, vmaddr: u64, value: ExportValue) -> machish::exports::Export {
+        machish::exports::Export {
+            name: name.to_string(),
+            flags: 0,
+            kind: machish::exports::ExportKind::Regular,
+            vmaddr,
+            value,
+        }
+    }
+
+    /// `libc++` re-exports `libc++abi` by load command, so `___dynamic_cast` is
+    /// in no trie a plugin's reference to `libc++` names. Unfollowed, the import
+    /// fell through to the host's `libstdc++` and crashed Roblox Studio.
+    #[test]
+    fn follows_whole_dylib_reexport_to_the_defining_image() {
+        let peers = [
+            linked("/usr/lib/libc++.1.dylib", 0x1000, Vec::new()),
+            linked(
+                "/usr/lib/libc++abi.dylib",
+                0x2000,
+                vec![export("___dynamic_cast", 0x40, ExportValue::Direct)],
+            ),
+        ];
+        let found = peers[0].resolve(&peers, "___dynamic_cast", 0);
+        assert_eq!(found.map(|r| r.addr), Some(0x2040));
+    }
+
+    #[test]
+    fn follows_renaming_trie_reexport_by_ordinal() {
+        let peers = [
+            linked(
+                "/usr/lib/libfwd.dylib",
+                0x1000,
+                vec![export(
+                    "_outer",
+                    0,
+                    ExportValue::Reexport {
+                        ordinal: 1,
+                        imported_name: Some("_inner".to_string()),
+                    },
+                )],
+            ),
+            linked(
+                "/usr/lib/libc++abi.dylib",
+                0x2000,
+                vec![export("_inner", 0x10, ExportValue::Direct)],
+            ),
+        ];
+        let found = peers[0].resolve(&peers, "_outer", 0);
+        assert_eq!(found.map(|r| r.addr), Some(0x2010));
+    }
+
+    #[test]
+    fn reexport_with_no_mapped_target_is_unresolved() {
+        let peers = [linked("/usr/lib/libc++.1.dylib", 0x1000, Vec::new())];
+        assert!(peers[0].resolve(&peers, "___dynamic_cast", 0).is_none());
+    }
+}

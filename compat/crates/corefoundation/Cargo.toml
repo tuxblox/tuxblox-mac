@@ -1,0 +1,23 @@
+[package]
+name = "corefoundation"
+description = "CoreFoundation, implemented on this tree's own Objective-C runtime."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+darwin.workspace = true
+starnix.workspace = true
+objc.workspace = true
+prefix.workspace = true
+libc.workspace = true
+getrandom.workspace = true
+hashbrown.workspace = true
+static_init.workspace = true
+sdl3.workspace = true
+icu_normalizer.workspace = true
+icu_properties.workspace = true
+
+[lints]
+workspace = true

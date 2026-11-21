@@ -1,0 +1,1942 @@
+// The C spellings are the interface; renaming them would only hide it.
+#![allow(non_snake_case)]
+
+use std::ffi::{CStr, CString, c_char, c_void};
+
+use crate::class::{Class, Imp, Ivar, Method};
+use crate::object::Id;
+use crate::protocol::{Description, Protocol};
+use crate::sel::Sel;
+
+/// A borrowed C string, or `None` for null.
+///
+/// # Safety
+///
+/// `p` must be null or a NUL-terminated string that outlives the call.
+unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a CStr> {
+    (!p.is_null()).then(|| unsafe { CStr::from_ptr(p) })
+}
+
+/// A class pointer as a class.
+///
+/// # Safety
+///
+/// `p` must be null or a class pointer this runtime produced.
+unsafe fn class(p: *const c_void) -> Option<&'static Class> {
+    unsafe { crate::class::from_ptr(p as *const Class) }
+}
+
+/// A `Method` handle.
+///
+/// # Safety
+///
+/// `p` must be null or a handle this runtime produced.
+unsafe fn method(p: *const c_void) -> Option<&'static Method> {
+    crate::debug::validate_handle(p, "method", "Objective-C method API");
+    (!p.is_null()).then(|| unsafe { &*(p as *const Method) })
+}
+
+/// A `Protocol *`.
+///
+/// # Safety
+///
+/// `p` must be null or a protocol this runtime produced.
+unsafe fn protocol(p: *const c_void) -> Option<&'static Protocol> {
+    crate::debug::validate_handle(p, "protocol", "Objective-C protocol API");
+    (!p.is_null()).then(|| unsafe { &*(p as *const Protocol) })
+}
+
+fn as_ptr<T>(value: Option<&'static T>) -> *mut c_void {
+    value.map_or(std::ptr::null_mut(), |v| v as *const T as *mut c_void)
+}
+
+pub unsafe extern "C" fn sel_registerName(name: *const c_char) -> Sel {
+    match unsafe { cstr(name) } {
+        Some(name) => crate::sel::register(name),
+        None => std::ptr::null(),
+    }
+}
+
+pub unsafe extern "C" fn sel_getName(sel: Sel) -> *const c_char {
+    match sel.is_null() {
+        true => c"<null selector>".as_ptr(),
+        false => crate::sel::name(sel),
+    }
+}
+
+pub unsafe extern "C" fn sel_isEqual(a: Sel, b: Sel) -> bool {
+    crate::sel::is_equal(a, b)
+}
+
+pub unsafe extern "C" fn objc_getClass(name: *const c_char) -> *mut c_void {
+    as_ptr(unsafe { cstr(name) }.and_then(crate::class::look_up))
+}
+
+/// The same as [`objc_getClass`] here.
+///
+/// Apple's two differ in whether the deprecated class handler runs, and this
+/// runtime has none; both ask the `getClass` hook.
+pub unsafe extern "C" fn objc_lookUpClass(name: *const c_char) -> *mut c_void {
+    unsafe { objc_getClass(name) }
+}
+
+pub unsafe extern "C" fn objc_getRequiredClass(name: *const c_char) -> *mut c_void {
+    let found = unsafe { objc_getClass(name) };
+    if found.is_null() {
+        let name = unsafe { cstr(name) }.map_or("<null>".into(), |n| n.to_string_lossy());
+        crate::fail!("objc_getRequiredClass: no class named {name}");
+    }
+    found
+}
+
+pub unsafe extern "C" fn objc_getMetaClass(name: *const c_char) -> *mut c_void {
+    as_ptr(
+        unsafe { cstr(name) }
+            .and_then(crate::class::look_up)
+            .map(|c| c.metaclass()),
+    )
+}
+
+pub unsafe extern "C" fn objc_allocateClassPair(
+    superclass: *const c_void,
+    name: *const c_char,
+    extra: usize,
+) -> *mut c_void {
+    let Some(name) = (unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: as above. Null is a root class, which is what `nil` means here.
+    let superclass = unsafe { class(superclass) };
+    as_ptr(crate::class::allocate_pair(superclass, name, extra))
+}
+
+pub unsafe extern "C" fn objc_registerClassPair(cls: *const c_void) {
+    if let Some(cls) = unsafe { class(cls) } {
+        crate::class::register_pair(cls);
+    }
+}
+
+pub unsafe extern "C" fn objc_disposeClassPair(cls: *const c_void) {
+    if let Some(cls) = unsafe { class(cls) } {
+        crate::class::dispose_pair(cls);
+    }
+}
+
+pub unsafe extern "C" fn class_getName(cls: *const c_void) -> *const c_char {
+    unsafe { class(cls) }.map_or(c"nil".as_ptr(), |c| c.name())
+}
+
+pub unsafe extern "C" fn class_getSuperclass(cls: *const c_void) -> *mut c_void {
+    as_ptr(unsafe { class(cls) }.and_then(|c| c.superclass()))
+}
+
+pub unsafe extern "C" fn class_isMetaClass(cls: *const c_void) -> bool {
+    unsafe { class(cls) }.is_some_and(|c| c.is_meta())
+}
+
+pub unsafe extern "C" fn class_getInstanceSize(cls: *const c_void) -> usize {
+    unsafe { class(cls) }.map_or(0, |c| c.instance_size())
+}
+
+pub unsafe extern "C" fn class_addMethod(
+    cls: *const c_void,
+    name: Sel,
+    imp: Imp,
+    types: *const c_char,
+) -> bool {
+    let (Some(cls), Some(types)) = (unsafe { class(cls) }, unsafe { cstr(types) }) else {
+        return false;
+    };
+    cls.add_method(name, imp, types)
+}
+
+pub unsafe extern "C" fn class_replaceMethod(
+    cls: *const c_void,
+    name: Sel,
+    imp: Imp,
+    types: *const c_char,
+) -> Imp {
+    let (Some(cls), Some(types)) = (unsafe { class(cls) }, unsafe { cstr(types) }) else {
+        return std::ptr::null();
+    };
+    cls.replace_method(name, imp, types)
+}
+
+pub unsafe extern "C" fn class_addIvar(
+    cls: *const c_void,
+    name: *const c_char,
+    size: usize,
+    alignment: u8,
+    types: *const c_char,
+) -> bool {
+    let (Some(cls), Some(name), Some(types)) =
+        (unsafe { class(cls) }, unsafe { cstr(name) }, unsafe {
+            cstr(types)
+        })
+    else {
+        return false;
+    };
+    cls.add_ivar(name, size, alignment, types)
+}
+
+pub unsafe extern "C" fn class_getInstanceVariable(
+    cls: *const c_void,
+    name: *const c_char,
+) -> *const c_void {
+    let (Some(cls), Some(name)) = (unsafe { class(cls) }, unsafe { cstr(name) }) else {
+        return std::ptr::null();
+    };
+    cls.ivar(name)
+        .map_or(std::ptr::null(), |i| i as *const Ivar as *const c_void)
+}
+
+pub unsafe extern "C" fn class_getInstanceMethod(cls: *const c_void, name: Sel) -> *const c_void {
+    unsafe { class(cls) }
+        .and_then(|c| c.method(name))
+        .map_or(std::ptr::null(), |m| m as *const Method as *const c_void)
+}
+
+pub unsafe extern "C" fn class_getClassMethod(cls: *const c_void, name: Sel) -> *const c_void {
+    unsafe { class(cls) }
+        .and_then(|c| c.metaclass().method(name))
+        .map_or(std::ptr::null(), |m| m as *const Method as *const c_void)
+}
+
+/// The resolved `IMP` itself, never a forwarding trampoline.
+///
+/// `rosemary`'s dispatch caches this value and re-probes it to notice a swizzle,
+/// so it must change exactly when the resolution does. See the crate doc.
+/// Like Apple's, this sends `+initialize` first: a caller that looks up an
+/// `IMP` to call it is about to message the class.
+pub unsafe extern "C" fn class_getMethodImplementation(cls: *const c_void, name: Sel) -> Imp {
+    unsafe { class(cls) }.map_or(std::ptr::null(), |c| {
+        crate::class::ensure_initialized(c);
+        crate::class::method_implementation(c, name)
+    })
+}
+
+pub unsafe extern "C" fn class_respondsToSelector(cls: *const c_void, name: Sel) -> bool {
+    unsafe { class(cls) }.is_some_and(|c| c.method(name).is_some())
+}
+
+pub unsafe extern "C" fn class_addProtocol(cls: *const c_void, proto: *const c_void) -> bool {
+    let (Some(cls), Some(proto)) = (unsafe { class(cls) }, unsafe { protocol(proto) }) else {
+        return false;
+    };
+    cls.add_protocol(proto)
+}
+
+pub unsafe extern "C" fn class_conformsToProtocol(
+    cls: *const c_void,
+    proto: *const c_void,
+) -> bool {
+    let (Some(cls), Some(proto)) = (unsafe { class(cls) }, unsafe { protocol(proto) }) else {
+        return false;
+    };
+    cls.conforms_to(proto)
+}
+
+pub unsafe extern "C" fn class_createInstance(cls: *const c_void, extra: usize) -> Id {
+    unsafe { class(cls) }.map_or(std::ptr::null_mut(), |c| {
+        crate::object::create_instance(c, extra)
+    })
+}
+
+/// The `IMP` exactly as it was installed.
+///
+/// Never a wrapper: `rosemary` compares this against its own thunk table to tell
+/// a guest method from a host one. See the crate doc.
+pub unsafe extern "C" fn method_getImplementation(m: *const c_void) -> Imp {
+    unsafe { method(m) }.map_or(std::ptr::null(), |m| m.implementation())
+}
+
+pub unsafe extern "C" fn method_getTypeEncoding(m: *const c_void) -> *const c_char {
+    unsafe { method(m) }.map_or(std::ptr::null(), |m| m.types())
+}
+
+pub unsafe extern "C" fn method_getName(m: *const c_void) -> Sel {
+    unsafe { method(m) }.map_or(std::ptr::null(), |m| m.sel)
+}
+
+pub unsafe extern "C" fn method_setImplementation(m: *const c_void, imp: Imp) -> Imp {
+    unsafe { method(m) }.map_or(std::ptr::null(), |m| m.set_implementation(imp))
+}
+
+/// Swap two methods' implementations, as one step: a send racing the swap sees
+/// one implementation or the other, never the same one twice.
+pub unsafe extern "C" fn method_exchangeImplementations(a: *const c_void, b: *const c_void) {
+    let (Some(a), Some(b)) = (unsafe { method(a) }, unsafe { method(b) }) else {
+        return;
+    };
+    let first = a.implementation();
+    let second = b.set_implementation(first);
+    a.set_implementation(second);
+}
+
+pub unsafe extern "C" fn ivar_getOffset(ivar: *const c_void) -> isize {
+    crate::debug::validate_handle(ivar, "ivar", "ivar_getOffset");
+    // SAFETY: an `Ivar` this runtime produced, or null.
+    match ivar.is_null() {
+        true => 0,
+        false => unsafe { &*(ivar as *const Ivar) }.offset(),
+    }
+}
+
+pub unsafe extern "C" fn ivar_getName(ivar: *const c_void) -> *const c_char {
+    crate::debug::validate_handle(ivar, "ivar", "ivar_getName");
+    match ivar.is_null() {
+        true => std::ptr::null(),
+        false => unsafe { &*(ivar as *const Ivar) }.name(),
+    }
+}
+
+pub unsafe extern "C" fn ivar_getTypeEncoding(ivar: *const c_void) -> *const c_char {
+    crate::debug::validate_handle(ivar, "ivar", "ivar_getTypeEncoding");
+    match ivar.is_null() {
+        true => std::ptr::null(),
+        false => unsafe { &*(ivar as *const Ivar) }.types().as_ptr(),
+    }
+}
+
+/// The bytes of a method's type encoding.
+///
+/// # Safety
+///
+/// As [`method`].
+unsafe fn method_types<'a>(m: *const c_void) -> Option<&'a [u8]> {
+    unsafe { method(m) }.map(|m| unsafe { CStr::from_ptr(m.types()) }.to_bytes())
+}
+
+pub unsafe extern "C" fn method_getNumberOfArguments(m: *const c_void) -> u32 {
+    unsafe { method_types(m) }.map_or(0, |t| crate::encoding::arguments(t).count() as u32)
+}
+
+pub unsafe extern "C" fn method_copyReturnType(m: *const c_void) -> *mut c_char {
+    let types = unsafe { method_types(m) }.unwrap_or_default();
+    unsafe { copied_string(crate::encoding::return_type(types)) }
+}
+
+/// Null when the method has no argument `index`.
+pub unsafe extern "C" fn method_copyArgumentType(m: *const c_void, index: u32) -> *mut c_char {
+    match unsafe { method_types(m) }.and_then(|t| crate::encoding::arguments(t).nth(index as usize))
+    {
+        Some(argument) => unsafe { copied_string(argument) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+pub unsafe extern "C" fn method_getReturnType(m: *const c_void, dst: *mut c_char, dst_len: usize) {
+    let types = unsafe { method_types(m) }.unwrap_or_default();
+    unsafe { fill(dst, dst_len, crate::encoding::return_type(types)) };
+}
+
+/// An empty string when the method has no argument `index`.
+pub unsafe extern "C" fn method_getArgumentType(
+    m: *const c_void,
+    index: u32,
+    dst: *mut c_char,
+    dst_len: usize,
+) {
+    let argument = unsafe { method_types(m) }
+        .and_then(|t| crate::encoding::arguments(t).nth(index as usize))
+        .unwrap_or_default();
+    unsafe { fill(dst, dst_len, argument) };
+}
+
+/// `strncpy` of `value` into `dst`: truncated without a terminator if it does
+/// not fit, and the rest of the buffer zeroed if it does.
+///
+/// # Safety
+///
+/// `dst` must be null or writable for `dst_len` bytes.
+unsafe fn fill(dst: *mut c_char, dst_len: usize, value: &[u8]) {
+    if dst.is_null() {
+        return;
+    }
+    let copied = value.len().min(dst_len);
+    // SAFETY: the caller's obligation; `copied` and the rest are within `dst_len`.
+    unsafe {
+        std::ptr::copy_nonoverlapping(value.as_ptr(), dst as *mut u8, copied);
+        std::ptr::write_bytes((dst as *mut u8).add(copied), 0, dst_len - copied);
+    }
+}
+
+/// A NUL-terminated copy of `value` the caller frees with `free`.
+///
+/// # Safety
+///
+/// As [`copied_list`].
+unsafe fn copied_string(value: &[u8]) -> *mut c_char {
+    // SAFETY: a positive size, and the result is checked before it is written.
+    let block = unsafe { crate::allocator::guest_malloc(value.len() + 1) } as *mut u8;
+    if !block.is_null() {
+        // SAFETY: `value.len() + 1` bytes, freshly ours.
+        unsafe {
+            std::ptr::copy_nonoverlapping(value.as_ptr(), block, value.len());
+            block.add(value.len()).write(0);
+        }
+    }
+    block as *mut c_char
+}
+
+pub unsafe extern "C" fn class_copyIvarList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let ivars = unsafe { class(cls) }
+        .map(|c| c.own_ivars())
+        .unwrap_or_default();
+    let values = ivars.into_iter().map(|i| i as *const Ivar as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn class_copyMethodList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let methods = unsafe { class(cls) }
+        .map(|c| c.own_methods())
+        .unwrap_or_default();
+    let values = methods
+        .into_iter()
+        .map(|m| m as *const Method as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn class_copyProtocolList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let protocols = unsafe { class(cls) }
+        .map(|c| c.own_protocols())
+        .unwrap_or_default();
+    let values = protocols
+        .into_iter()
+        .map(|p| p as *const Protocol as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+/// An ivar of the metaclass, which is what Apple means by a class variable.
+pub unsafe extern "C" fn class_getClassVariable(
+    cls: *const c_void,
+    name: *const c_char,
+) -> *const c_void {
+    let (Some(cls), Some(name)) = (unsafe { class(cls) }, unsafe { cstr(name) }) else {
+        return std::ptr::null();
+    };
+    cls.metaclass()
+        .ivar(name)
+        .map_or(std::ptr::null(), |i| i as *const Ivar as *const c_void)
+}
+
+pub unsafe extern "C" fn class_getVersion(cls: *const c_void) -> i32 {
+    unsafe { class(cls) }.map_or(0, |c| c.version())
+}
+
+pub unsafe extern "C" fn class_setVersion(cls: *const c_void, version: i32) {
+    if let Some(cls) = unsafe { class(cls) } {
+        cls.set_version(version);
+    }
+}
+
+/// FIXME (ACCURACY): only a layout `class_setIvarLayout` set is known. The
+/// layout the compiler emits for a guest class is not carried across, so a
+/// guest class with strong ivars answers null, which means it has none.
+pub unsafe extern "C" fn class_getIvarLayout(cls: *const c_void) -> *const u8 {
+    unsafe { class(cls) }
+        .and_then(|c| c.ivar_layout(false))
+        .map_or(std::ptr::null(), |l| l.as_ptr().cast())
+}
+
+/// FIXME (ACCURACY): as [`class_getIvarLayout`], for weak ivars.
+pub unsafe extern "C" fn class_getWeakIvarLayout(cls: *const c_void) -> *const u8 {
+    unsafe { class(cls) }
+        .and_then(|c| c.ivar_layout(true))
+        .map_or(std::ptr::null(), |l| l.as_ptr().cast())
+}
+
+pub unsafe extern "C" fn class_setIvarLayout(cls: *const c_void, layout: *const u8) {
+    if let Some(cls) = unsafe { class(cls) } {
+        cls.set_ivar_layout(false, unsafe { cstr(layout.cast()) });
+    }
+}
+
+pub unsafe extern "C" fn class_setWeakIvarLayout(cls: *const c_void, layout: *const u8) {
+    if let Some(cls) = unsafe { class(cls) } {
+        cls.set_ivar_layout(true, unsafe { cstr(layout.cast()) });
+    }
+}
+
+/// The `getImageName` hook chain's answer, which Swift gives for its own
+/// classes; see [`default_get_image_name`] for the rest.
+pub unsafe extern "C" fn class_getImageName(cls: *const c_void) -> *const c_char {
+    if cls.is_null() {
+        return std::ptr::null();
+    }
+    let hook = *GET_IMAGE_NAME_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut name = std::ptr::null();
+    // SAFETY: an installed hook, given a class and a writable `const char *`.
+    match unsafe { hook(cls, &mut name) } {
+        true => name,
+        false => std::ptr::null(),
+    }
+}
+
+/// `Class class_setSuperclass(Class cls, Class newSuper)`
+pub unsafe extern "C" fn class_setSuperclass(
+    cls: *const c_void,
+    new_superclass: *const c_void,
+) -> *mut c_void {
+    let Some(cls) = (unsafe { class(cls) }) else {
+        return std::ptr::null_mut();
+    };
+    // SAFETY: as above. Null makes the class a root.
+    let superclass = unsafe { class(new_superclass) };
+    as_ptr(crate::class::set_superclass(cls, superclass))
+}
+
+// The hooks a Swift runtime installs, so the Objective-C runtime can ask it
+// about Swift classes. Each setter hands back the hook it replaced, which the
+// new one calls for a class it does not know.
+
+/// `BOOL (*objc_hook_getClass)(const char *name, Class *outClass)`
+pub type GetClassHook = unsafe extern "C" fn(*const c_char, *mut *mut c_void) -> bool;
+/// `BOOL (*objc_hook_getImageName)(Class cls, const char **outImageName)`
+pub type GetImageNameHook = unsafe extern "C" fn(*const c_void, *mut *const c_char) -> bool;
+/// `const char *(*objc_hook_lazyClassNamer)(Class cls)`
+pub type LazyClassNamerHook = unsafe extern "C" fn(*const c_void) -> *const c_char;
+
+/// Each chain's first hook, as the one pointer both the chain and
+/// [`crate::default_hooks`] read: a function's address is not unique once
+/// ThinLTO has copied it into another codegen unit.
+pub(crate) static DEFAULT_GET_CLASS_HOOK: GetClassHook = default_get_class;
+pub(crate) static DEFAULT_GET_IMAGE_NAME_HOOK: GetImageNameHook = default_get_image_name;
+pub(crate) static DEFAULT_LAZY_CLASS_NAMER_HOOK: LazyClassNamerHook = default_lazy_class_namer;
+
+static GET_CLASS_HOOK: std::sync::Mutex<GetClassHook> =
+    std::sync::Mutex::new(DEFAULT_GET_CLASS_HOOK);
+static GET_IMAGE_NAME_HOOK: std::sync::Mutex<GetImageNameHook> =
+    std::sync::Mutex::new(DEFAULT_GET_IMAGE_NAME_HOOK);
+static LAZY_CLASS_NAMER_HOOK: std::sync::Mutex<LazyClassNamerHook> =
+    std::sync::Mutex::new(DEFAULT_LAZY_CLASS_NAMER_HOOK);
+/// Whether anything replaced the `getClass` hook, so a lookup that misses
+/// skips the chain when only the default would answer.
+static GET_CLASS_HOOKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The class the `getClass` hook chain answers for `name`, as Apple's
+/// `look_up_class` asks after a miss: Swift's hook finds a Swift class by its
+/// mangled or `Module.Class` name. Not asked again for a name this thread is
+/// already asking about, since the hook may look it up itself.
+pub(crate) fn class_from_hook(name: &CStr) -> Option<&'static Class> {
+    thread_local! {
+        static ASKING: std::cell::RefCell<Vec<CString>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if !GET_CLASS_HOOKED.load(std::sync::atomic::Ordering::Acquire)
+        || ASKING.with(|asking| asking.borrow().iter().any(|n| n.as_c_str() == name))
+    {
+        return None;
+    }
+    let hook = *GET_CLASS_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    ASKING.with(|asking| asking.borrow_mut().push(CString::from(name)));
+    let mut found = std::ptr::null_mut();
+    // SAFETY: an installed hook, given a NUL-terminated name and a writable
+    // `Class`, as its type says.
+    let answered = unsafe { hook(name.as_ptr(), &mut found) };
+    ASKING.with(|asking| asking.borrow_mut().pop());
+    // Swift realizes what it answers before answering, so anything else is
+    // not a class.
+    (answered && crate::class::is_known(found as *const Class))
+        // SAFETY: a class this runtime adopted or built.
+        .then(|| unsafe { &*(found as *const Class) })
+}
+
+/// The first hook in the chain: a class nobody else found does not exist.
+unsafe extern "C" fn default_get_class(name: *const c_char, out: *mut *mut c_void) -> bool {
+    let _ = name;
+    if !out.is_null() {
+        // SAFETY: the caller's writable `Class`.
+        unsafe { *out = std::ptr::null_mut() };
+    }
+    false
+}
+
+/// The first hook in the chain: this runtime's own answer, which is none.
+///
+/// FIXME (ACCURACY): classes are not tracked by the image that declared them.
+unsafe extern "C" fn default_get_image_name(_cls: *const c_void, out: *mut *const c_char) -> bool {
+    if !out.is_null() {
+        // SAFETY: the caller's writable `const char *`.
+        unsafe { *out = std::ptr::null() };
+    }
+    false
+}
+
+/// The name the lazy class namer chain gives `class`, empty if none does.
+pub(crate) fn lazy_class_name(class: &Class) -> CString {
+    let hook = *LAZY_CLASS_NAMER_HOOK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // SAFETY: an installed hook, given a class.
+    let name = unsafe { hook(std::ptr::from_ref(class).cast()) };
+    match name.is_null() {
+        true => CString::default(),
+        // SAFETY: a namer answers a NUL-terminated name it keeps.
+        false => unsafe { CStr::from_ptr(name) }.into(),
+    }
+}
+
+/// The first hook in the chain: no class here has a lazy name.
+unsafe extern "C" fn default_lazy_class_namer(_cls: *const c_void) -> *const c_char {
+    std::ptr::null()
+}
+
+/// Install `new` in `hook`, writing the one it replaces to `out_old` first so
+/// that `new` can already call it.
+///
+/// # Safety
+///
+/// `out_old` is writable.
+unsafe fn set_hook<F: Copy>(hook: &std::sync::Mutex<F>, new: F, out_old: *mut F) {
+    let mut current = hook.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the caller's obligation.
+    unsafe { out_old.write(*current) };
+    *current = new;
+}
+
+/// `void objc_setHook_getClass(objc_hook_getClass newValue, objc_hook_getClass
+/// *outOldValue)`
+pub unsafe extern "C" fn objc_setHook_getClass(new: GetClassHook, out_old: *mut GetClassHook) {
+    unsafe { set_hook(&GET_CLASS_HOOK, new, out_old) };
+    GET_CLASS_HOOKED.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// `void objc_setHook_getImageName(objc_hook_getImageName newValue,
+/// objc_hook_getImageName *outOldValue)`
+pub unsafe extern "C" fn objc_setHook_getImageName(
+    new: GetImageNameHook,
+    out_old: *mut GetImageNameHook,
+) {
+    unsafe { set_hook(&GET_IMAGE_NAME_HOOK, new, out_old) }
+}
+
+/// `void objc_setHook_lazyClassNamer(objc_hook_lazyClassNamer newValue,
+/// objc_hook_lazyClassNamer *oldOutValue)`
+pub unsafe extern "C" fn objc_setHook_lazyClassNamer(
+    new: LazyClassNamerHook,
+    out_old: *mut LazyClassNamerHook,
+) {
+    unsafe { set_hook(&LAZY_CLASS_NAMER_HOOK, new, out_old) }
+}
+
+/// How a compiled class reaches [`CompiledClassRealizer`].
+#[derive(Clone, Copy, Debug)]
+pub enum Realize {
+    /// Handed over by `objc_readClassPair` or `_objc_realizeClassFromSwift`,
+    /// whose `previously` this is.
+    HandedOver { previously: *mut c_void },
+    /// Met as the `isa` of `object` (null when not met through an object) and
+    /// not a class this runtime has. Asked of anything an object's first word
+    /// holds, so a realizer declines quietly what is not a compiled class
+    /// waiting; a metaclass is realized as `object`, its class.
+    FirstTouch { object: *mut c_void },
+}
+
+/// Adopts a compiled class pair this runtime does not have yet - one Swift
+/// built or finished - and answers the class, or null if it could not be. See
+/// [`set_compiled_class_realizer`].
+pub type CompiledClassRealizer = fn(cls: *mut c_void, how: Realize) -> *mut c_void;
+
+static COMPILED_CLASS_REALIZER: std::sync::OnceLock<CompiledClassRealizer> =
+    std::sync::OnceLock::new();
+
+/// Install what [`objc_readClassPair`] and [`_objc_realizeClassFromSwift`]
+/// call. The embedder's: it is the one that can read the class's methods out
+/// of the image that defines them and make them callable. Only the first
+/// install takes.
+pub fn set_compiled_class_realizer(realizer: CompiledClassRealizer) {
+    COMPILED_CLASS_REALIZER.get_or_init(|| realizer);
+}
+
+pub(crate) fn realize_compiled_class(cls: *mut c_void, how: Realize) -> *mut c_void {
+    if cls.is_null() || crate::class::is_known(cls as *const Class) {
+        return cls;
+    }
+    match COMPILED_CLASS_REALIZER.get() {
+        Some(realize) => realize(cls, how),
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `Class _objc_realizeClassFromSwift(Class cls, void *previously)`: Swift
+/// asks the runtime to adopt a class it has just finished, or one it built and
+/// moved from `previously`. A class already adopted is answered as it is.
+pub unsafe extern "C" fn _objc_realizeClassFromSwift(
+    cls: *mut c_void,
+    previously: *mut c_void,
+) -> *mut c_void {
+    realize_compiled_class(cls, Realize::HandedOver { previously })
+}
+
+/// `Class objc_readClassPair(Class cls, const struct objc_image_info *info)`:
+/// adopt a class pair laid out as a compiler would, which is how Swift hands
+/// over a generic class it has instantiated.
+pub unsafe extern "C" fn objc_readClassPair(cls: *mut c_void, _info: *const c_void) -> *mut c_void {
+    realize_compiled_class(
+        cls,
+        Realize::HandedOver {
+            previously: std::ptr::null_mut(),
+        },
+    )
+}
+
+/// FIXME (ACCURACY): no image is listed, for the reason
+/// [`default_get_image_name`] gives.
+pub unsafe extern "C" fn objc_copyImageNames(out_count: *mut u32) -> *mut *const c_char {
+    unsafe { copied_handles(Vec::new(), out_count) }.cast()
+}
+
+/// FIXME (ACCURACY): no image is known, so this answers as Apple's does for a
+/// path that names none.
+pub unsafe extern "C" fn objc_copyClassNamesForImage(
+    _image: *const c_char,
+    out_count: *mut u32,
+) -> *mut *const c_char {
+    unsafe { copied_handles(Vec::new(), out_count) }.cast()
+}
+
+/// Every registered class: the count, and as many as `buffer` holds.
+pub unsafe extern "C" fn objc_getClassList(buffer: *mut *const c_void, buffer_count: i32) -> i32 {
+    let classes = crate::class::registered();
+    if !buffer.is_null() {
+        for (i, class) in classes
+            .iter()
+            .take(buffer_count.max(0) as usize)
+            .enumerate()
+        {
+            // SAFETY: `i` is below the caller's `buffer_count`.
+            unsafe { *buffer.add(i) = crate::class::ptr(class) as *const c_void };
+        }
+    }
+    classes.len() as i32
+}
+
+pub unsafe extern "C" fn objc_copyClassList(out_count: *mut u32) -> *mut *const c_void {
+    let classes = crate::class::registered().into_iter();
+    let values = classes.map(|c| crate::class::ptr(c) as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+/// Apple's answers the `isa` as it stands and realizes nothing. Swift asks it
+/// of a generic class it is still building, for the metaclass whose RO data it
+/// fills in next; realizing the pair then would adopt a class whose ivars are
+/// not laid out yet.
+pub unsafe extern "C" fn object_getClass(object: Id) -> *mut c_void {
+    unsafe { crate::object::isa(object) }.cast_mut().cast()
+}
+
+pub unsafe extern "C" fn object_setClass(object: Id, cls: *const c_void) -> *mut c_void {
+    let Some(cls) = (unsafe { class(cls) }) else {
+        return std::ptr::null_mut();
+    };
+    as_ptr(unsafe { crate::object::set_class(object, cls) })
+}
+
+pub unsafe extern "C" fn object_getClassName(object: Id) -> *const c_char {
+    unsafe { crate::object::class_of(object) }.map_or(c"nil".as_ptr(), |c| c.name())
+}
+
+pub unsafe extern "C" fn object_getIndexedIvars(object: Id) -> *mut c_void {
+    unsafe { crate::object::indexed_ivars(object) }
+}
+
+pub unsafe extern "C" fn object_getIvar(object: Id, ivar: *const c_void) -> Id {
+    crate::debug::validate_handle(ivar, "ivar", "object_getIvar");
+    if crate::debug::enabled()
+        && !object.is_null()
+        && !ivar.is_null()
+        // SAFETY: the object and ivar handles were validated above.
+        && !unsafe { crate::object::class_of(object) }
+            .is_some_and(|class| class.contains_ivar(ivar as *const Ivar))
+    {
+        crate::fail!("objc debug: object_getIvar was given an ivar from another class");
+    }
+    let Some(name) = (unsafe { cstr(ivar_getName(ivar)) }) else {
+        return std::ptr::null_mut();
+    };
+    unsafe { crate::object::get_ivar(object, name) }
+}
+
+/// `Ivar object_getInstanceVariable(id, const char *name, void **outValue)`:
+/// the ivar by name, and its value as a pointer-sized word.
+pub unsafe extern "C" fn object_getInstanceVariable(
+    object: Id,
+    name: *const c_char,
+    out: *mut *mut c_void,
+) -> *const c_void {
+    let Some(class) = (unsafe { crate::object::class_of(object) }) else {
+        return std::ptr::null();
+    };
+    let ivar = unsafe { class_getInstanceVariable(crate::class::ptr(class).cast(), name) };
+    if !ivar.is_null() && !out.is_null() {
+        let offset = unsafe { ivar_getOffset(ivar) };
+        // SAFETY: the ivar is inside the object, and the caller asked for its
+        // first word.
+        unsafe { *out = *((object as *const u8).offset(offset) as *const *mut c_void) };
+    }
+    ivar
+}
+
+pub unsafe extern "C" fn object_setIvar(object: Id, ivar: *const c_void, value: Id) {
+    crate::debug::validate_handle(ivar, "ivar", "object_setIvar");
+    crate::debug::validate(value, "object_setIvar value");
+    if crate::debug::enabled()
+        && !object.is_null()
+        && !ivar.is_null()
+        // SAFETY: the object and ivar handles were validated above.
+        && !unsafe { crate::object::class_of(object) }
+            .is_some_and(|class| class.contains_ivar(ivar as *const Ivar))
+    {
+        crate::fail!("objc debug: object_setIvar was given an ivar from another class");
+    }
+    let Some(name) = (unsafe { cstr(ivar_getName(ivar)) }) else {
+        return;
+    };
+    unsafe { crate::object::set_ivar(object, name, value) }
+}
+
+pub unsafe extern "C" fn objc_constructInstance(cls: *const c_void, bytes: *mut c_void) -> Id {
+    let Some(cls) = (unsafe { class(cls) }) else {
+        return std::ptr::null_mut();
+    };
+    if bytes.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: the caller says `bytes` is at least `instance_size` bytes.
+    unsafe { *(bytes as *mut *mut Class) = crate::class::ptr(cls) };
+    bytes
+}
+
+pub unsafe extern "C" fn objc_destructInstance(object: Id) -> Id {
+    crate::debug::validate(object, "objc_destructInstance");
+    // SAFETY: the caller is about to free the object itself.
+    unsafe { crate::object::destruct_instance(object) };
+    object
+}
+
+/// A new instance of `object`'s class holding a copy of its bytes, with `extra`
+/// bytes after the ivars.
+///
+/// FIXME (ACCURACY): Apple's then retains the strong ivars an ARC class's ivar
+/// layout names; without those layouts (see [`class_getIvarLayout`]) the copy
+/// shares them unretained.
+pub unsafe extern "C" fn object_copy(object: Id, extra: usize) -> Id {
+    let Some(class) = (unsafe { crate::object::class_of(object) }) else {
+        return std::ptr::null_mut();
+    };
+    let copy = crate::object::create_instance(class, extra);
+    if !copy.is_null() {
+        let word = size_of::<usize>();
+        // SAFETY: both are `instance_size + extra` bytes, as Apple's contract
+        // for `extra` requires of the original; the `isa` is already set.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                (object as *const u8).add(word),
+                (copy as *mut u8).add(word),
+                class.instance_size() + extra - word,
+            )
+        };
+    }
+    copy
+}
+
+pub unsafe extern "C" fn object_dispose(object: Id) -> Id {
+    crate::debug::validate(object, "object_dispose");
+    // SAFETY: the caller gives up the object.
+    unsafe { crate::object::dispose_instance(object) };
+    std::ptr::null_mut()
+}
+
+pub unsafe extern "C" fn object_setInstanceVariable(
+    object: Id,
+    name: *const c_char,
+    value: *mut c_void,
+) -> *const c_void {
+    let Some(class) = (unsafe { crate::object::class_of(object) }) else {
+        return std::ptr::null();
+    };
+    let ivar = unsafe { class_getInstanceVariable(crate::class::ptr(class).cast(), name) };
+    if !ivar.is_null() {
+        unsafe { object_setIvar(object, ivar, value) };
+    }
+    ivar
+}
+
+/// `objc_property_attribute_t`: a name and a value, both C strings.
+#[repr(C)]
+pub struct PropertyAttribute {
+    pub name: *const c_char,
+    pub value: *const c_char,
+}
+
+/// A property handle.
+///
+/// # Safety
+///
+/// `p` must be null or a handle this runtime produced.
+unsafe fn property(p: *const c_void) -> Option<&'static crate::property::Property> {
+    crate::debug::validate_handle(p, "property", "Objective-C property API");
+    (!p.is_null()).then(|| unsafe { &*(p as *const crate::property::Property) })
+}
+
+/// A block the caller frees with `free`, holding `values`.
+///
+/// The whole family of `class_copy...List` works this way, and a Rust
+/// allocation handed across it would be freed by an allocator that never made
+/// it. Neither would this process's own `malloc`: see [`crate::allocator`],
+/// which is why the block comes from the *guest's* allocator and not from
+/// `libc`.
+unsafe fn copied_list<T>(values: Vec<T>, out_count: *mut u32) -> *mut T {
+    // SAFETY: a nullable out-parameter, as every `copy...List` has.
+    if !out_count.is_null() {
+        unsafe { *out_count = values.len() as u32 };
+    }
+    if values.is_empty() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: a positive size, and the result is checked before it is written.
+    let block = unsafe { crate::allocator::guest_malloc(size_of::<T>() * values.len()) } as *mut T;
+    if block.is_null() {
+        return block;
+    }
+    for (i, value) in values.into_iter().enumerate() {
+        // SAFETY: `i` is inside the allocation, which is uninitialized.
+        unsafe { block.add(i).write(value) };
+    }
+    block
+}
+
+/// A nil-terminated list the caller frees with `free`, or null when empty, as
+/// every `copy...List` of handles is.
+///
+/// # Safety
+///
+/// As [`copied_list`].
+unsafe fn copied_handles(
+    mut values: Vec<*const c_void>,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let count = values.len() as u32;
+    if !values.is_empty() {
+        values.push(std::ptr::null());
+    }
+    let list = unsafe { copied_list(values, out_count) };
+    // SAFETY: null or writable, as above.
+    if !out_count.is_null() {
+        unsafe { *out_count = count };
+    }
+    list
+}
+
+pub unsafe extern "C" fn class_copyPropertyList(
+    cls: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let properties = unsafe { class(cls) }
+        .map(|c| c.properties())
+        .unwrap_or_default();
+    let values: Vec<*const c_void> = properties
+        .into_iter()
+        .map(|p| p as *const crate::property::Property as *const c_void)
+        .collect();
+    // SAFETY: `out_count` is null or writable, as the C prototype requires.
+    unsafe { copied_handles(values, out_count) }
+}
+
+pub unsafe extern "C" fn class_getProperty(
+    cls: *const c_void,
+    name: *const c_char,
+) -> *const c_void {
+    let (Some(cls), Some(name)) = (unsafe { class(cls) }, unsafe { cstr(name) }) else {
+        return std::ptr::null();
+    };
+    cls.property(name)
+        .map_or(std::ptr::null(), |p| p as *const _ as *const c_void)
+}
+
+/// `class_addProperty`, which takes the attributes apart rather than as the
+/// string the compiler emits - so they are put back together here.
+pub unsafe extern "C" fn class_addProperty(
+    cls: *const c_void,
+    name: *const c_char,
+    attributes: *const PropertyAttribute,
+    count: u32,
+) -> bool {
+    let (Some(cls), Some(name)) = (unsafe { class(cls) }, unsafe { cstr(name) }) else {
+        return false;
+    };
+    if cls.property(name).is_some() {
+        return false;
+    }
+    // SAFETY: as above; `attributes` is null or `count` entries long.
+    unsafe { cls.set_property(name, &attribute_string(attributes, count)) };
+    true
+}
+
+pub unsafe extern "C" fn class_replaceProperty(
+    cls: *const c_void,
+    name: *const c_char,
+    attributes: *const PropertyAttribute,
+    count: u32,
+) {
+    let (Some(cls), Some(name)) = (unsafe { class(cls) }, unsafe { cstr(name) }) else {
+        return;
+    };
+    unsafe { cls.set_property(name, &attribute_string(attributes, count)) };
+}
+
+/// The attribute string an `objc_property_attribute_t` array spells.
+///
+/// # Safety
+///
+/// `attributes` must be null or `count` entries of NUL-terminated strings.
+unsafe fn attribute_string(attributes: *const PropertyAttribute, count: u32) -> std::ffi::CString {
+    let mut fields: Vec<Vec<u8>> = Vec::new();
+    for i in 0..count as usize {
+        if attributes.is_null() {
+            break;
+        }
+        let entry = unsafe { &*attributes.add(i) };
+        let (Some(name), value) = (unsafe { cstr(entry.name) }, unsafe { cstr(entry.value) })
+        else {
+            continue;
+        };
+        let mut field = name.to_bytes().to_vec();
+        field.extend_from_slice(value.map_or(b"", |v| v.to_bytes()));
+        fields.push(field);
+    }
+    std::ffi::CString::new(fields.join(&b',')).unwrap_or_default()
+}
+
+pub unsafe extern "C" fn property_getName(p: *const c_void) -> *const c_char {
+    unsafe { property(p) }.map_or(c"".as_ptr(), |p| p.name())
+}
+
+pub unsafe extern "C" fn property_getAttributes(p: *const c_void) -> *const c_char {
+    unsafe { property(p) }.map_or(std::ptr::null(), |p| p.attributes())
+}
+
+/// `property_copyAttributeList`.
+///
+/// The strings the entries point at are the property's own and outlive the call;
+/// only the array is the caller's to free, which is what Apple documents and
+/// what a caller that frees the whole thing with one `free` depends on.
+pub unsafe extern "C" fn property_copyAttributeList(
+    p: *const c_void,
+    out_count: *mut u32,
+) -> *mut PropertyAttribute {
+    let Some(p) = (unsafe { property(p) }) else {
+        // SAFETY: null or writable.
+        if !out_count.is_null() {
+            unsafe { *out_count = 0 };
+        }
+        return std::ptr::null_mut();
+    };
+    // Leaked with the property, because the caller frees the array and not what
+    // it points at.
+    let values: Vec<PropertyAttribute> = p
+        .attribute_list()
+        .into_iter()
+        .map(|(name, value)| PropertyAttribute {
+            name: Box::leak(Box::new(name)).as_ptr(),
+            value: Box::leak(Box::new(value)).as_ptr(),
+        })
+        .collect();
+    // SAFETY: `out_count` is null or writable.
+    unsafe { copied_list(values, out_count) }
+}
+
+/// The value of the attribute `name`, a copy the caller frees, or null if the
+/// property has no such attribute.
+pub unsafe extern "C" fn property_copyAttributeValue(
+    p: *const c_void,
+    name: *const c_char,
+) -> *mut c_char {
+    let (Some(p), Some(name)) = (unsafe { property(p) }, unsafe { cstr(name) }) else {
+        return std::ptr::null_mut();
+    };
+    match p
+        .attribute_list()
+        .into_iter()
+        .find(|(n, _)| n.as_c_str() == name)
+    {
+        Some((_, value)) => unsafe { copied_string(value.to_bytes()) },
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// `objc_loadClassref`, which resolves a class reference slot.
+///
+/// Apple's low bit marks a *stub* class, whose initializer has to be called
+/// before the slot means anything. This runtime has no stub classes - a class is
+/// a class from the moment it is allocated - so the slot already holds the
+/// answer and the bit is never set.
+pub unsafe extern "C" fn objc_loadClassref(slot: *mut *mut c_void) -> *mut c_void {
+    match slot.is_null() {
+        true => std::ptr::null_mut(),
+        // SAFETY: the caller's obligation: a writable class reference slot.
+        false => unsafe { *slot },
+    }
+}
+
+pub unsafe extern "C" fn objc_getProtocol(name: *const c_char) -> *mut c_void {
+    as_ptr(unsafe { cstr(name) }.and_then(crate::protocol::lookup))
+}
+
+pub unsafe extern "C" fn objc_allocateProtocol(name: *const c_char) -> *mut c_void {
+    as_ptr(unsafe { cstr(name) }.and_then(crate::protocol::allocate))
+}
+
+pub unsafe extern "C" fn objc_registerProtocol(proto: *const c_void) {
+    if let Some(proto) = unsafe { protocol(proto) } {
+        crate::protocol::register(proto);
+    }
+}
+
+pub unsafe extern "C" fn protocol_getName(proto: *const c_void) -> *const c_char {
+    unsafe { protocol(proto) }.map_or(c"nil".as_ptr(), |p| p.name())
+}
+
+pub unsafe extern "C" fn protocol_addProtocol(proto: *const c_void, addition: *const c_void) {
+    if let (Some(proto), Some(addition)) =
+        (unsafe { protocol(proto) }, unsafe { protocol(addition) })
+    {
+        proto.add_protocol(addition);
+    }
+}
+
+pub unsafe extern "C" fn protocol_addMethodDescription(
+    proto: *const c_void,
+    name: Sel,
+    types: *const c_char,
+    is_required: bool,
+    is_instance: bool,
+) {
+    if let (Some(proto), Some(types)) = (unsafe { protocol(proto) }, unsafe { cstr(types) }) {
+        proto.add_method(name, types, is_required, is_instance);
+    }
+}
+
+/// Returned by value: two words, a selector and a type encoding.
+pub unsafe extern "C" fn protocol_getMethodDescription(
+    proto: *const c_void,
+    name: Sel,
+    is_required: bool,
+    is_instance: bool,
+) -> Description {
+    unsafe { protocol(proto) }.map_or(
+        Description {
+            sel: std::ptr::null(),
+            types: std::ptr::null(),
+        },
+        |p| p.method(name, is_required, is_instance),
+    )
+}
+
+/// The protocol's own methods in one group, ending in a zeroed entry.
+pub unsafe extern "C" fn protocol_copyMethodDescriptionList(
+    proto: *const c_void,
+    is_required: bool,
+    is_instance: bool,
+    out_count: *mut u32,
+) -> *mut Description {
+    let mut values = unsafe { protocol(proto) }
+        .map(|p| p.methods(is_required, is_instance))
+        .unwrap_or_default();
+    let count = values.len() as u32;
+    if !values.is_empty() {
+        values.push(Description {
+            sel: std::ptr::null(),
+            types: std::ptr::null(),
+        });
+    }
+    let list = unsafe { copied_list(values, out_count) };
+    // SAFETY: null or writable.
+    if !out_count.is_null() {
+        unsafe { *out_count = count };
+    }
+    list
+}
+
+pub unsafe extern "C" fn protocol_conformsToProtocol(
+    proto: *const c_void,
+    other: *const c_void,
+) -> bool {
+    let (Some(proto), Some(other)) = (unsafe { protocol(proto) }, unsafe { protocol(other) })
+    else {
+        return false;
+    };
+    proto.conforms_by_name(other)
+}
+
+/// Equal when each conforms to the other, which is how Apple's decides.
+pub unsafe extern "C" fn protocol_isEqual(proto: *const c_void, other: *const c_void) -> bool {
+    std::ptr::eq(proto, other)
+        || unsafe {
+            protocol_conformsToProtocol(proto, other) && protocol_conformsToProtocol(other, proto)
+        }
+}
+
+pub unsafe extern "C" fn protocol_copyProtocolList(
+    proto: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let adopted = unsafe { protocol(proto) }
+        .map(|p| p.adopted())
+        .unwrap_or_default();
+    let values = adopted
+        .into_iter()
+        .map(|p| p as *const Protocol as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn objc_copyProtocolList(out_count: *mut u32) -> *mut *const c_void {
+    let protocols = crate::protocol::registered().into_iter();
+    let values = protocols.map(|p| p as *const Protocol as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn protocol_addProperty(
+    proto: *const c_void,
+    name: *const c_char,
+    attributes: *const PropertyAttribute,
+    count: u32,
+    is_required: bool,
+    is_instance: bool,
+) {
+    let (Some(proto), Some(name)) = (unsafe { protocol(proto) }, unsafe { cstr(name) }) else {
+        return;
+    };
+    // SAFETY: `attributes` is null or `count` entries long.
+    let attributes = unsafe { attribute_string(attributes, count) };
+    proto.add_property(name, &attributes, is_required, is_instance);
+}
+
+/// Only a required property is ever found, because only those are kept.
+pub unsafe extern "C" fn protocol_getProperty(
+    proto: *const c_void,
+    name: *const c_char,
+    is_required: bool,
+    is_instance: bool,
+) -> *const c_void {
+    let (Some(proto), Some(name)) = (unsafe { protocol(proto) }, unsafe { cstr(name) }) else {
+        return std::ptr::null();
+    };
+    if !is_required {
+        return std::ptr::null();
+    }
+    proto
+        .property(name, is_instance)
+        .map_or(std::ptr::null(), |p| p as *const _ as *const c_void)
+}
+
+/// The required instance properties the protocol declares itself.
+pub unsafe extern "C" fn protocol_copyPropertyList(
+    proto: *const c_void,
+    out_count: *mut u32,
+) -> *mut *const c_void {
+    let properties = unsafe { protocol(proto) }
+        .map(|p| p.properties(true))
+        .unwrap_or_default();
+    let values = properties
+        .into_iter()
+        .map(|p| p as *const crate::property::Property as *const c_void);
+    unsafe { copied_handles(values.collect(), out_count) }
+}
+
+pub unsafe extern "C" fn objc_retain(object: Id) -> Id {
+    crate::arc::retain(object)
+}
+
+pub unsafe extern "C" fn objc_release(object: Id) {
+    crate::arc::release(object);
+}
+
+pub unsafe extern "C" fn objc_autorelease(object: Id) -> Id {
+    crate::arc::autorelease(object)
+}
+
+/// `id _objc_rootAutorelease(id)`: what `-[NSObject autorelease]` does, for a
+/// root class of another runtime's that implements its own. Never sends.
+pub unsafe extern "C" fn _objc_rootAutorelease(object: Id) -> Id {
+    crate::arc::autorelease(object)
+}
+
+pub unsafe extern "C" fn objc_autoreleasePoolPush() -> *mut c_void {
+    crate::arc::pool_push()
+}
+
+pub unsafe extern "C" fn objc_autoreleasePoolPop(token: *mut c_void) {
+    crate::arc::pool_pop(token);
+}
+
+/// The return-value handoff: a callee that ends in `objc_autoreleaseReturnValue`
+/// and a caller that begins with `objc_retainAutoreleasedReturnValue` skip the
+/// autorelease and the retain between them.
+///
+/// Not an optimisation a guest can do without. Code that returns objects on a
+/// thread with no autorelease pool - Unity's render thread does, every frame -
+/// is correct on a Mac only because the handoff keeps those objects out of the
+/// pool; without it they pile up in a pool that is never drained.
+///
+/// The callee recognises a caller that will claim the object from the
+/// instruction at its return address, as Apple's runtime does, and leaves the
+/// object for it in a thread-local slot. The slot names the object, so a claim
+/// of anything else takes the ordinary path.
+mod handoff {
+    use std::cell::Cell;
+
+    use crate::object::Id;
+
+    thread_local! {
+        static PENDING: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Whether the caller returned to at `ra` claims the object at once.
+    ///
+    /// # Safety
+    ///
+    /// `ra` must be a return address: code that is mapped and readable.
+    unsafe fn caller_claims(ra: usize) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: every address read is code the caller is about to run, or a
+        // pointer slot that code reads.
+        unsafe {
+            let read32 = |at: usize| (at as *const i32).read_unaligned() as isize;
+            let code = ra as *const u8;
+            // mov rdi, rax
+            if std::slice::from_raw_parts(code, 3) != [0x48, 0x89, 0xc7] {
+                return false;
+            }
+            let slot = match *code.add(3) {
+                // call stub; the stub is `jmp [rip + slot]`.
+                0xe8 => {
+                    let stub = (ra + 8).wrapping_add_signed(read32(ra + 4));
+                    if (stub as *const [u8; 2]).read_unaligned() != [0xff, 0x25] {
+                        return false;
+                    }
+                    (stub + 6).wrapping_add_signed(read32(stub + 2))
+                }
+                // call [rip + slot]
+                0xff if *code.add(4) == 0x15 => (ra + 9).wrapping_add_signed(read32(ra + 5)),
+                _ => return false,
+            };
+            let target = (slot as *const usize).read_unaligned();
+            target == super::objc_retainAutoreleasedReturnValue as *const () as usize
+                || target == super::objc_unsafeClaimAutoreleasedReturnValue as *const () as usize
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: the instruction the caller returns to.
+        unsafe {
+            // mov x29, x29: the marker a claiming caller puts after its call.
+            (ra as *const u32).read_unaligned() == 0xaa1d03fd
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            let _ = ra;
+            false
+        }
+    }
+
+    /// Hand `object`, which carries a reference the caller is owed, to a
+    /// claiming caller, or autorelease it.
+    pub(super) unsafe extern "C" fn give(object: Id, ra: usize) -> Id {
+        // SAFETY: `ra` came from the trampoline, which read the return address.
+        if !object.is_null() && unsafe { caller_claims(ra) } {
+            let stale = PENDING.replace(object as usize);
+            if stale != 0 {
+                // A handoff nobody claimed; its reference was owed to a pool.
+                crate::arc::autorelease(stale as Id);
+            }
+            return object;
+        }
+        crate::arc::autorelease(object)
+    }
+
+    /// Whether `object` was handed off on this thread, taking it if so.
+    pub(super) fn claim(object: Id) -> bool {
+        if object.is_null() || PENDING.get() != object as usize {
+            return false;
+        }
+        PENDING.set(0);
+        true
+    }
+
+    pub(super) unsafe extern "C" fn retain_and_give(object: Id, ra: usize) -> Id {
+        unsafe { give(crate::arc::retain(object), ra) }
+    }
+}
+
+/// Enters `$target(object, return address)`.
+macro_rules! with_return_address {
+    ($name:ident, $target:path) => {
+        #[cfg(target_arch = "x86_64")]
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn $name(object: Id) -> Id {
+            core::arch::naked_asm!("mov rsi, [rsp]", "jmp {target}", target = sym $target)
+        }
+        #[cfg(target_arch = "aarch64")]
+        #[unsafe(naked)]
+        pub unsafe extern "C" fn $name(object: Id) -> Id {
+            core::arch::naked_asm!("mov x1, x30", "b {target}", target = sym $target)
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        pub unsafe extern "C" fn $name(object: Id) -> Id {
+            unsafe { $target(object, 0) }
+        }
+    };
+}
+
+with_return_address!(objc_autoreleaseReturnValue, handoff::give);
+with_return_address!(objc_retainAutoreleaseReturnValue, handoff::retain_and_give);
+
+pub unsafe extern "C" fn objc_retainAutoreleasedReturnValue(object: Id) -> Id {
+    if handoff::claim(object) {
+        return object;
+    }
+    crate::arc::retain(object)
+}
+
+pub unsafe extern "C" fn objc_unsafeClaimAutoreleasedReturnValue(object: Id) -> Id {
+    crate::debug::validate(object, "objc_unsafeClaimAutoreleasedReturnValue");
+    if handoff::claim(object) {
+        // The handoff carried a reference this caller does not keep.
+        crate::arc::release(object);
+    }
+    object
+}
+
+pub unsafe extern "C" fn objc_retainAutorelease(object: Id) -> Id {
+    crate::arc::autorelease(crate::arc::retain(object))
+}
+
+pub unsafe extern "C" fn objc_storeStrong(slot: *mut Id, value: Id) {
+    if slot.is_null() {
+        return;
+    }
+    // SAFETY: the caller owns `slot`.
+    let previous = unsafe { *slot };
+    if previous == value {
+        return;
+    }
+    crate::arc::retain(value);
+    unsafe { *slot = value };
+    crate::arc::release(previous);
+}
+
+pub unsafe extern "C" fn objc_initWeak(slot: *mut Id, value: Id) -> Id {
+    if slot.is_null() {
+        return std::ptr::null_mut();
+    }
+    crate::arc::init_weak(slot, value)
+}
+
+pub unsafe extern "C" fn objc_storeWeak(slot: *mut Id, value: Id) -> Id {
+    match slot.is_null() {
+        true => std::ptr::null_mut(),
+        false => crate::arc::store_weak(slot, value),
+    }
+}
+
+pub unsafe extern "C" fn objc_loadWeakRetained(slot: *mut Id) -> Id {
+    match slot.is_null() {
+        true => std::ptr::null_mut(),
+        false => crate::arc::load_weak_retained(slot),
+    }
+}
+
+pub unsafe extern "C" fn objc_loadWeak(slot: *mut Id) -> Id {
+    // SAFETY: the caller owns `slot`.
+    match slot.is_null() {
+        true => std::ptr::null_mut(),
+        false => crate::arc::autorelease(unsafe { objc_loadWeakRetained(slot) }),
+    }
+}
+
+pub unsafe extern "C" fn objc_destroyWeak(slot: *mut Id) {
+    if !slot.is_null() {
+        crate::arc::destroy_weak(slot);
+    }
+}
+
+pub unsafe extern "C" fn objc_copyWeak(to: *mut Id, from: *mut Id) {
+    if to.is_null() || from.is_null() {
+        return;
+    }
+    crate::debug::weak_load(from, "objc_copyWeak");
+    // SAFETY: the caller owns both slots and `to` is uninitialized.
+    crate::arc::init_weak(to, unsafe { *from });
+}
+
+pub unsafe extern "C" fn objc_moveWeak(to: *mut Id, from: *mut Id) {
+    // SAFETY: the caller owns both slots.
+    unsafe { objc_copyWeak(to, from) };
+    unsafe { objc_destroyWeak(from) };
+}
+
+pub unsafe extern "C" fn objc_sync_enter(object: Id) -> i32 {
+    crate::arc::sync_enter(object);
+    0
+}
+
+pub unsafe extern "C" fn objc_sync_exit(object: Id) -> i32 {
+    crate::arc::sync_exit(object);
+    0
+}
+
+pub unsafe extern "C" fn objc_setAssociatedObject(
+    object: Id,
+    key: *const c_void,
+    value: Id,
+    policy: usize,
+) {
+    crate::arc::set_associated_with_policy(object, key, value, policy);
+}
+
+pub unsafe extern "C" fn objc_removeAssociatedObjects(object: Id) {
+    crate::arc::remove_associated(object);
+}
+
+pub unsafe extern "C" fn objc_getAssociatedObject(object: Id, key: *const c_void) -> Id {
+    crate::arc::associated(object, key)
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod tests {
+    use super::*;
+
+    /// A caller's code after its call: `mov rdi, rax`, then a call through
+    /// `slot` (`call [rip + slot]`), or through a stub (`call stub`, where the
+    /// stub is `jmp [rip + slot]`). Answers the code and its return address.
+    fn caller(through_stub: bool, claimer: usize) -> (Box<[u8; 64]>, usize) {
+        let mut code = Box::new([0xccu8; 64]);
+        let base = code.as_ptr() as usize;
+        let slot = 48;
+        code[slot..slot + 8].copy_from_slice(&claimer.to_le_bytes());
+        code[..3].copy_from_slice(&[0x48, 0x89, 0xc7]);
+        let rel = |from: usize, to: usize| ((to as isize - from as isize) as i32).to_le_bytes();
+        if through_stub {
+            let stub = 32;
+            code[3] = 0xe8;
+            code[4..8].copy_from_slice(&rel(base + 8, base + stub));
+            code[stub..stub + 2].copy_from_slice(&[0xff, 0x25]);
+            code[stub + 2..stub + 6].copy_from_slice(&rel(base + stub + 6, base + slot));
+        } else {
+            code[3..5].copy_from_slice(&[0xff, 0x15]);
+            code[5..9].copy_from_slice(&rel(base + 9, base + slot));
+        }
+        (code, base)
+    }
+
+    fn object() -> Id {
+        crate::bootstrap();
+        let class = crate::class::lookup(c"NSObject").expect("NSObject");
+        crate::object::create_instance(class, 0)
+    }
+
+    /// The count `object` is left with once a pool around `body` drains.
+    fn after_pool(object: Id, body: impl FnOnce()) -> usize {
+        let pool = crate::arc::pool_push();
+        body();
+        crate::arc::pool_pop(pool);
+        crate::arc::retain_count(object)
+    }
+
+    #[test]
+    fn a_claimed_return_value_never_reaches_the_pool() {
+        let claimer = objc_retainAutoreleasedReturnValue as *const () as usize;
+        for through_stub in [false, true] {
+            let (_code, ra) = caller(through_stub, claimer);
+            let object = object();
+            // The callee's +1 is handed over and the claim keeps it, with
+            // nothing left in the pool to release it again.
+            let count = after_pool(object, || unsafe {
+                let returned = handoff::give(object, ra);
+                assert_eq!(objc_retainAutoreleasedReturnValue(returned), object);
+                assert_eq!(crate::arc::retain_count(object), 1, "{through_stub}");
+            });
+            assert_eq!(count, 1, "through_stub={through_stub}");
+            crate::arc::release(object);
+        }
+    }
+
+    #[test]
+    fn an_unsafe_claim_gives_the_handed_reference_back() {
+        let claimer = objc_unsafeClaimAutoreleasedReturnValue as *const () as usize;
+        let (_code, ra) = caller(false, claimer);
+        let object = object();
+        crate::arc::retain(object);
+        let count = after_pool(object, || unsafe {
+            let returned = handoff::give(object, ra);
+            objc_unsafeClaimAutoreleasedReturnValue(returned);
+            assert_eq!(crate::arc::retain_count(object), 1);
+        });
+        assert_eq!(count, 1);
+        crate::arc::release(object);
+    }
+
+    #[test]
+    fn a_caller_that_does_not_claim_gets_an_autoreleased_value() {
+        let (_code, ra) = caller(false, objc_retain as *const () as usize);
+        let object = object();
+        crate::arc::retain(object);
+        // Autoreleased, so the pool takes the extra reference back.
+        let count = after_pool(object, || unsafe {
+            handoff::give(object, ra);
+        });
+        assert_eq!(count, 1);
+        // A later claim of the same object is an ordinary retain.
+        unsafe { objc_retainAutoreleasedReturnValue(object) };
+        assert_eq!(crate::arc::retain_count(object), 2);
+        crate::arc::release(object);
+        crate::arc::release(object);
+    }
+
+    /// A retaining association keeps its value alive, and the value is let
+    /// go of when the owner is destroyed - so a later object at the owner's
+    /// address does not inherit it.
+    #[test]
+    fn a_retained_association_lives_and_dies_with_its_owner() {
+        static KEY: u8 = 0;
+        let key = &KEY as *const u8 as *const c_void;
+        let (owner, value) = (object(), object());
+        // SAFETY: two live objects; 0x301 is OBJC_ASSOCIATION_RETAIN.
+        unsafe { objc_setAssociatedObject(owner, key, value, 0x301) };
+        assert_eq!(crate::arc::retain_count(value), 2);
+        assert_eq!(unsafe { objc_getAssociatedObject(owner, key) }, value);
+        // SAFETY: the owner is intact and about to be freed.
+        unsafe { crate::object::destruct_instance(owner) };
+        assert_eq!(crate::arc::retain_count(value), 1);
+        assert!(unsafe { objc_getAssociatedObject(owner, key) }.is_null());
+        crate::arc::release(value);
+    }
+
+    static FORWARD_TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn answer(_receiver: Id, _sel: crate::sel::Sel) -> usize {
+        42
+    }
+
+    unsafe extern "C" fn target_for(
+        _receiver: Id,
+        _sel: crate::sel::Sel,
+        _wanted: crate::sel::Sel,
+    ) -> Id {
+        FORWARD_TARGET.load(std::sync::atomic::Ordering::Acquire) as Id
+    }
+
+    /// A message the receiver does not answer goes to the object its
+    /// `-forwardingTargetForSelector:` names, and arrives with that object as
+    /// its receiver.
+    #[test]
+    fn a_forwarding_target_receives_the_message() {
+        crate::bootstrap();
+        let root = crate::class::lookup(c"NSObject").unwrap();
+        let answering = crate::class::allocate_pair(Some(root), c"ForwardTestTarget", 0).unwrap();
+        answering.add_method(
+            crate::sel::get("forwardTestAnswer"),
+            answer as crate::class::Imp,
+            c"Q16@0:8",
+        );
+        crate::class::register_pair(answering);
+        let proxy = crate::class::allocate_pair(Some(root), c"ForwardTestProxy", 0).unwrap();
+        proxy.add_method(
+            crate::sel::get("forwardingTargetForSelector:"),
+            target_for as crate::class::Imp,
+            c"@24@0:8:16",
+        );
+        crate::class::register_pair(proxy);
+        let target = crate::object::create_instance(answering, 0);
+        FORWARD_TARGET.store(target as usize, std::sync::atomic::Ordering::Release);
+        let sender = crate::object::create_instance(proxy, 0);
+        // SAFETY: `NSUInteger (id, SEL)`, sent through the trampoline.
+        let got = unsafe {
+            let f: unsafe extern "C" fn(Id, crate::sel::Sel) -> usize =
+                std::mem::transmute(crate::msg::entry());
+            f(sender, crate::sel::get("forwardTestAnswer"))
+        };
+        assert_eq!(got, 42);
+        crate::arc::release(sender);
+        crate::arc::release(target);
+    }
+}
+
+#[cfg(test)]
+mod introspection {
+    use super::*;
+
+    unsafe extern "C" fn nothing(_receiver: Id, _sel: Sel) {}
+
+    fn class_named(name: &CStr) -> &'static Class {
+        crate::bootstrap();
+        let nsobject = crate::class::lookup(c"NSObject").expect("NSObject");
+        crate::class::allocate_pair(Some(nsobject), name, 0).expect("a fresh name")
+    }
+
+    /// The handles in a nil-terminated list, which is freed.
+    unsafe fn take(list: *mut *const c_void, count: u32) -> Vec<*const c_void> {
+        if list.is_null() {
+            return Vec::new();
+        }
+        let handles = unsafe { std::slice::from_raw_parts(list, count as usize + 1) }.to_vec();
+        assert!(
+            handles[count as usize].is_null(),
+            "the list is nil-terminated"
+        );
+        unsafe { crate::allocator::guest_free(list.cast()) };
+        handles[..count as usize].to_vec()
+    }
+
+    #[test]
+    fn copies_a_classs_own_ivars_and_methods() {
+        let class = class_named(c"RosemaryCopyLists");
+        assert!(class.add_ivar(c"first", 8, 3, c"@"));
+        assert!(class.add_ivar(c"second", 4, 2, c"i"));
+        let sel = crate::sel::get("tick:");
+        assert!(class.add_method(sel, nothing as *const c_void, c"v24@0:8@16"));
+        crate::class::register_pair(class);
+        let cls = crate::class::ptr(class) as *const c_void;
+        let mut count = 0;
+        unsafe {
+            let ivars = take(class_copyIvarList(cls, &mut count), count);
+            let names: Vec<&CStr> = ivars
+                .iter()
+                .map(|&i| CStr::from_ptr(ivar_getName(i)))
+                .collect();
+            assert_eq!(names, [c"first", c"second"]);
+            assert_eq!(CStr::from_ptr(ivar_getTypeEncoding(ivars[1])), c"i");
+
+            let methods = take(class_copyMethodList(cls, &mut count), count);
+            assert_eq!(methods.len(), 1);
+            assert_eq!(method_getName(methods[0]), sel);
+        }
+    }
+
+    #[test]
+    fn reads_argument_types_out_of_a_method_encoding() {
+        let class = class_named(c"RosemaryMethodTypes");
+        let sel = crate::sel::get("tick:");
+        assert!(class.add_method(sel, nothing as *const c_void, c"v24@0:8^{CGPoint=dd}16"));
+        let method = class.own_method(sel).unwrap() as *const Method as *const c_void;
+        unsafe {
+            assert_eq!(method_getNumberOfArguments(method), 3);
+            let argument = method_copyArgumentType(method, 2);
+            assert_eq!(CStr::from_ptr(argument), c"^{CGPoint=dd}");
+            crate::allocator::guest_free(argument.cast());
+            assert!(method_copyArgumentType(method, 3).is_null());
+
+            let mut buffer = [0x7f as c_char; 4];
+            method_getReturnType(method, buffer.as_mut_ptr(), buffer.len());
+            assert_eq!(buffer, [b'v' as c_char, 0, 0, 0]);
+            method_getArgumentType(method, 9, buffer.as_mut_ptr(), buffer.len());
+            assert_eq!(buffer, [0; 4]);
+        }
+    }
+
+    #[test]
+    fn a_metaclass_starts_at_version_seven() {
+        let class = class_named(c"RosemaryVersions");
+        let cls = crate::class::ptr(class) as *const c_void;
+        let meta = crate::class::ptr(class.metaclass()) as *const c_void;
+        unsafe {
+            assert_eq!(class_getVersion(cls), 0);
+            assert_eq!(class_getVersion(meta), 7);
+            class_setVersion(cls, 3);
+            assert_eq!(class_getVersion(cls), 3);
+        }
+    }
+
+    #[test]
+    fn protocol_properties_and_conformance() {
+        let base = crate::protocol::allocate(c"RosemaryBaseProtocol").unwrap();
+        let attributes = [PropertyAttribute {
+            name: c"T".as_ptr(),
+            value: c"@".as_ptr(),
+        }];
+        let base_ptr = base as *const Protocol as *const c_void;
+        unsafe {
+            protocol_addProperty(
+                base_ptr,
+                c"title".as_ptr(),
+                attributes.as_ptr(),
+                1,
+                true,
+                true,
+            );
+            protocol_addProperty(
+                base_ptr,
+                c"hint".as_ptr(),
+                attributes.as_ptr(),
+                1,
+                false,
+                true,
+            );
+        }
+        crate::protocol::register(base);
+        let derived = crate::protocol::allocate(c"RosemaryDerivedProtocol").unwrap();
+        derived.add_protocol(base);
+        crate::protocol::register(derived);
+        let derived_ptr = derived as *const Protocol as *const c_void;
+        let mut count = 0;
+        unsafe {
+            let title = protocol_getProperty(derived_ptr, c"title".as_ptr(), true, true);
+            assert_eq!(CStr::from_ptr(property_getAttributes(title)), c"T@");
+            assert!(protocol_getProperty(base_ptr, c"hint".as_ptr(), false, true).is_null());
+            assert_eq!(
+                take(protocol_copyPropertyList(base_ptr, &mut count), count).len(),
+                1
+            );
+            assert_eq!(
+                take(protocol_copyProtocolList(derived_ptr, &mut count), count),
+                [base_ptr]
+            );
+
+            assert!(protocol_conformsToProtocol(derived_ptr, base_ptr));
+            assert!(!protocol_conformsToProtocol(base_ptr, derived_ptr));
+            assert!(!protocol_isEqual(derived_ptr, base_ptr));
+        }
+    }
+}
+
+#[cfg(test)]
+mod swift_hooks {
+    use super::*;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static PREVIOUS_GET_CLASS: OnceLock<GetClassHook> = OnceLock::new();
+    static PREVIOUS_IMAGE_NAME: OnceLock<GetImageNameHook> = OnceLock::new();
+    static RECURSIVE_ASKS: AtomicUsize = AtomicUsize::new(0);
+    /// Not a class: what a broken hook might hand back.
+    static NOT_A_CLASS: [usize; 5] = [0; 5];
+
+    /// Answers a few `Module.Class` names the way Swift's hook does, passing
+    /// every other name down the chain.
+    unsafe extern "C" fn get_class(name: *const c_char, out: *mut *mut c_void) -> bool {
+        // SAFETY: the runtime passes a NUL-terminated name.
+        let answer = match unsafe { CStr::from_ptr(name) }.to_bytes() {
+            b"RosemaryHook.Found" => crate::class::lookup(c"NSObject").map(crate::class::ptr),
+            b"RosemaryHook.NotAClass" => Some(NOT_A_CLASS.as_ptr() as *mut Class),
+            b"RosemaryHook.Recursive" => {
+                RECURSIVE_ASKS.fetch_add(1, Ordering::AcqRel);
+                // SAFETY: the same name, which the runtime must not ask about again.
+                let again = unsafe { objc_getClass(name) };
+                assert!(again.is_null());
+                None
+            }
+            _ => return unsafe { PREVIOUS_GET_CLASS.get().unwrap()(name, out) },
+        };
+        // SAFETY: the caller's writable `Class`.
+        unsafe { *out = answer.map_or(std::ptr::null_mut(), |c| c.cast()) };
+        answer.is_some()
+    }
+
+    unsafe extern "C" fn image_name(cls: *const c_void, out: *mut *const c_char) -> bool {
+        let nsobject = crate::class::lookup(c"NSObject").map(crate::class::ptr);
+        if nsobject.is_some_and(|n| n as *const c_void == cls) {
+            // SAFETY: the caller's writable `const char *`.
+            unsafe { *out = c"/usr/lib/libobjc.A.dylib".as_ptr() };
+            return true;
+        }
+        unsafe { PREVIOUS_IMAGE_NAME.get().unwrap()(cls, out) }
+    }
+
+    fn install() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        crate::bootstrap();
+        ONCE.call_once(|| unsafe {
+            let mut old_class: GetClassHook = default_get_class;
+            objc_setHook_getClass(get_class, &mut old_class);
+            PREVIOUS_GET_CLASS.set(old_class).ok();
+            let mut old_image: GetImageNameHook = default_get_image_name;
+            objc_setHook_getImageName(image_name, &mut old_image);
+            PREVIOUS_IMAGE_NAME.set(old_image).ok();
+        });
+    }
+
+    #[test]
+    fn a_lookup_miss_is_answered_by_the_get_class_hook() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject")
+            .map(crate::class::ptr)
+            .unwrap();
+        // SAFETY: NUL-terminated literals.
+        unsafe {
+            assert_eq!(
+                objc_getClass(c"RosemaryHook.Found".as_ptr()),
+                nsobject.cast()
+            );
+            assert_eq!(
+                objc_lookUpClass(c"RosemaryHook.Found".as_ptr()),
+                nsobject.cast()
+            );
+            assert!(objc_getClass(c"RosemaryHook.Missing".as_ptr()).is_null());
+        }
+    }
+
+    #[test]
+    fn a_hook_answer_that_is_not_a_class_is_not_returned() {
+        install();
+        // SAFETY: a NUL-terminated literal.
+        assert!(unsafe { objc_getClass(c"RosemaryHook.NotAClass".as_ptr()) }.is_null());
+    }
+
+    #[test]
+    fn a_hook_looking_up_its_own_name_is_not_asked_again() {
+        install();
+        // SAFETY: a NUL-terminated literal.
+        assert!(unsafe { objc_getClass(c"RosemaryHook.Recursive".as_ptr()) }.is_null());
+        assert_eq!(RECURSIVE_ASKS.load(Ordering::Acquire), 1);
+    }
+
+    static LAZILY_NAMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static PREVIOUS_NAMER: OnceLock<LazyClassNamerHook> = OnceLock::new();
+
+    unsafe extern "C" fn namer(cls: *const c_void) -> *const c_char {
+        if cls as usize == LAZILY_NAMED.load(Ordering::Acquire) {
+            return c"RosemaryLazilyNamed".as_ptr();
+        }
+        unsafe { PREVIOUS_NAMER.get().unwrap()(cls) }
+    }
+
+    #[test]
+    fn a_class_without_a_name_is_named_by_the_lazy_namer() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject");
+        let class = crate::class::allocate_pair(nsobject, c"", 0).expect("a nameless pair");
+        crate::class::register_pair(class);
+        LAZILY_NAMED.store(crate::class::ptr(class) as usize, Ordering::Release);
+        unsafe {
+            let mut old: LazyClassNamerHook = default_lazy_class_namer;
+            objc_setHook_lazyClassNamer(namer, &mut old);
+            PREVIOUS_NAMER.set(old).ok();
+        }
+        // SAFETY: a registered class.
+        let name = unsafe { CStr::from_ptr(class_getName(crate::class::ptr(class).cast())) };
+        assert_eq!(name, c"RosemaryLazilyNamed");
+        // Found by its address only, as Apple's is.
+        assert!(crate::class::lookup(c"RosemaryLazilyNamed").is_none());
+    }
+
+    #[test]
+    fn class_get_image_name_is_the_hooks_answer() {
+        install();
+        let nsobject = crate::class::lookup(c"NSObject")
+            .map(crate::class::ptr)
+            .unwrap();
+        // SAFETY: a registered class.
+        let name = unsafe { class_getImageName(nsobject.cast()) };
+        assert_eq!(unsafe { CStr::from_ptr(name) }, c"/usr/lib/libobjc.A.dylib");
+    }
+}

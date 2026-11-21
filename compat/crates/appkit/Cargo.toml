@@ -1,0 +1,30 @@
+[package]
+name = "appkit"
+description = "Reimplementation of AppKit on top of SDL3 and cross-platform Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+exports.workspace = true
+darwin.workspace = true
+objc.workspace = true
+corefoundation.workspace = true
+coretext.workspace = true
+prefix.workspace = true
+server.workspace = true
+foundation.workspace = true
+sdl3.workspace = true
+chrome.workspace = true
+gamecontroller.workspace = true
+iosurface.workspace = true
+static_init.workspace = true
+owned_ttf_parser.workspace = true
+tiny-skia.workspace = true
+
+[dev-dependencies]
+sdl3 = { workspace = true, features = ["test-support"] }
+libc.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,1390 @@
+mod clock;
+mod deferred;
+mod format;
+mod guard;
+mod host;
+mod memory;
+mod pipeline_cache;
+mod placement;
+mod pools;
+mod submit;
+mod trace;
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{
+    Arc, Condvar, Mutex, MutexGuard, Once, OnceLock,
+    atomic::{AtomicBool, AtomicUsize},
+};
+
+use ash::{Device, Entry, Instance, vk};
+use static_init::dynamic;
+
+use crate::heap::{Allocation, Heap};
+
+pub(crate) use format::sample_count;
+pub use format::{
+    aspect_of, block_extent, is_integer, is_srgb, pixel_format, pixel_format_components,
+    shader_aspect, srgb_twin, texel_size,
+};
+
+/// The Vulkan attachment format which can carry Metal's independently
+/// declared depth and stencil formats in one image.
+pub(crate) fn combined_depth_stencil_format(
+    depth: vk::Format,
+    stencil: vk::Format,
+) -> Option<vk::Format> {
+    use vk::Format as F;
+    match (depth, stencil) {
+        (F::UNDEFINED, F::UNDEFINED) => None,
+        (format, F::UNDEFINED) | (F::UNDEFINED, format) => Some(format),
+        (left, right)
+            if left == right
+                && aspect_of(left)
+                    .contains(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(left)
+        }
+        (F::D16_UNORM | F::D16_UNORM_S8_UINT, stencil)
+            if aspect_of(stencil).contains(vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(F::D16_UNORM_S8_UINT)
+        }
+        (F::D32_SFLOAT | F::D32_SFLOAT_S8_UINT, stencil)
+            if aspect_of(stencil).contains(vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(F::D32_SFLOAT_S8_UINT)
+        }
+        (F::X8_D24_UNORM_PACK32 | F::D24_UNORM_S8_UINT, stencil)
+            if aspect_of(stencil).contains(vk::ImageAspectFlags::STENCIL) =>
+        {
+            Some(F::D24_UNORM_S8_UINT)
+        }
+        _ => None,
+    }
+}
+pub(crate) use guard::{Guard, GuardedVec};
+pub use host::HostPages;
+pub use memory::Fill;
+pub use placement::Placement;
+pub use submit::{Batch, Commit, EventSignal};
+use trace::dump_spirv;
+pub use trace::{milestone, trace, trace_once};
+
+type DescriptorLayoutKey = (Vec<(u32, vk::DescriptorType)>, vk::ShaderStageFlags, bool);
+type DescriptorLayouts = HashMap<DescriptorLayoutKey, vk::DescriptorSetLayout>;
+
+// ash 0.38 was generated before robustness2 was ratified. The KHR feature
+// structures and structure types alias the EXT spellings exactly, so only the
+// extension name needs spelling locally until ash carries the newer headers.
+const ROBUSTNESS_2_KHR: &std::ffi::CStr = c"VK_KHR_robustness2";
+
+#[derive(Clone, Copy)]
+struct DeviceCapabilities {
+    portability_subset: bool,
+    null_descriptors: bool,
+    vertex_attribute_divisor: bool,
+    swapchain_maintenance1: bool,
+    /// Whether `VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE` is legal, as
+    /// the Vulkan 1.2 feature bit rather than the extension.
+    sampler_mirror_clamp_to_edge: bool,
+    host_query_reset: bool,
+    timeline_semaphores: bool,
+    /// Whether culling, winding, depth and stencil state may be set per draw,
+    /// as `VK_EXT_extended_dynamic_state` - core in Vulkan 1.3 - allows.
+    extended_dynamic_state: bool,
+    dynamic_rendering: bool,
+    dynamic_raster: bool,
+}
+
+/// What `VK_KHR_depth_stencil_resolve` - core in Vulkan 1.2 - can do on this
+/// device, and how a render pass which uses it is created.
+pub(crate) struct DepthStencilResolve {
+    /// `VK_KHR_create_renderpass2`'s entry points, where the resolve is
+    /// reached through the extension rather than through Vulkan 1.2 core.
+    pub renderpass2: Option<ash::khr::create_renderpass2::Device>,
+    pub support: ResolveSupport,
+}
+
+/// The depth and stencil resolve modes a device reports. Sample-zero is the
+/// only one every implementation supporting the feature must have; average,
+/// minimum and maximum are optional, so a Metal filter is mapped only when
+/// the device names it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ResolveSupport {
+    pub depth_modes: vk::ResolveModeFlags,
+    pub stencil_modes: vk::ResolveModeFlags,
+    /// Whether one aspect may resolve while the other does not.
+    pub independent_none: bool,
+    /// Whether the two aspects may use different modes.
+    pub independent: bool,
+}
+
+/// One logical device and the Vulkan queue onto which this implementation
+/// deliberately serializes every Metal command queue. Multiple Vulkan queues
+/// require resource hazard tracking which this runtime does not yet have.
+pub struct Gpu {
+    pub device: Device,
+    pub physical: vk::PhysicalDevice,
+    pub queue_family: u32,
+    /// Vulkan requires external synchronization on a queue, and Metal lets any
+    /// thread commit a command buffer.
+    queue: Mutex<vk::Queue>,
+    /// Serialize driver WSI construction with presentation on the same GPU.
+    /// Some ICDs do not tolerate concurrent VkSwapchain/semaphore creation
+    /// and vkQueuePresentKHR for different windows on a shared device.
+    pub(crate) wsi: Mutex<()>,
+    /// Command buffers committed and not yet submitted. Whoever takes the
+    /// queue submits them first, so the queue keeps the order of commits.
+    commits: submit::Commits,
+    /// Submissions on the queue which wait for an event. Work behind one may
+    /// run only once the CPU signals it, after writes it makes past commit.
+    pub(crate) event_waits_in_flight: AtomicUsize,
+    /// In-flight work and its completion worker are device-local. Independent
+    /// Vulkan devices must never head-of-line block one another.
+    pub(crate) submissions: crate::submission::Tracker,
+    /// Texture work Metal performs outside any command buffer, run ahead of
+    /// the next submission.
+    deferred: deferred::Deferred,
+    /// The thread drawables are presented on, so presentation never holds
+    /// up a commit.
+    pub(crate) presenter: crate::present::Presenter,
+    /// VK_ERROR_DEVICE_LOST invalidates the logical device, not one window.
+    pub(crate) lost: AtomicBool,
+    memory: vk::PhysicalDeviceMemoryProperties,
+    pub limits: vk::PhysicalDeviceLimits,
+    pub(crate) max_viewports: u32,
+    /// One layout per distinct set of Metal binding indices, so pipelines
+    /// sharing a resource shape share a layout.
+    layouts: Mutex<DescriptorLayouts>,
+    render_passes: Mutex<crate::hash::FastMap<RenderPassKey, vk::RenderPass>>,
+    pipeline_cache: pipeline_cache::PipelineCache,
+    /// Fence-owned immediate command contexts. Recording or waiting on an
+    /// unrelated window must not hold a global command-pool mutex.
+    immediate: Mutex<ImmediatePool>,
+    immediate_ready: Condvar,
+    #[cfg(test)]
+    fail_immediate_wait_after_submit: AtomicBool,
+    /// The blocks Metal buffers are cut out of, made on first use because the
+    /// memory type depends on what a buffer's requirements admit.
+    buffers: OnceLock<Heap>,
+    /// The blocks `MTLStorageModePrivate` buffers are cut out of: device
+    /// memory, never mapped.
+    private_buffers: OnceLock<Heap>,
+    /// The blocks ordinary textures are cut out of, one heap per memory
+    /// type: textures disagree on which types admit them, and none is
+    /// linear, so none needs `bufferImageGranularity` from a neighbour.
+    private_images: [OnceLock<Heap>; vk::MAX_MEMORY_TYPES],
+    /// Zeros a reused heap range is copied from where a texture cannot be
+    /// cleared: see `Gpu::zero_image`. Never written after it is made.
+    zeros: OnceLock<vk::Buffer>,
+    /// Two-timestamp query pools, one per command buffer in flight, kept for
+    /// reuse by command-buffer timing and the optional statistics.
+    timestamp_pools: Mutex<Vec<vk::QueryPool>>,
+    timestamp_period: f32,
+    timestamp_valid_bits: u32,
+    /// Samples the device clock against the host's, where the device can.
+    calibration: Option<clock::Calibration>,
+    /// Occlusion query pools whose submission has retired.
+    occlusion_pools: Mutex<Vec<vk::QueryPool>>,
+    /// Whether an occlusion query can count samples rather than only say
+    /// whether any passed.
+    pub(crate) occlusion_precise: bool,
+    /// Whether a pipeline can force coverage-written alpha to one.
+    pub(crate) alpha_to_one: bool,
+    /// Whether culling, winding, depth and stencil state and the topology
+    /// within its class are set per draw, as Vulkan 1.3 can, rather than
+    /// compiled into one pipeline per combination.
+    pub(crate) dynamic_render_state: bool,
+    /// Whether a pass begins with `vkCmdBeginRendering` rather than a render
+    /// pass and framebuffer, so a pipeline is independent of the pass's load,
+    /// store and resolve actions.
+    pub(crate) dynamic_rendering: bool,
+    /// `VK_EXT_extended_dynamic_state3`'s polygon mode and depth clamp, where
+    /// the device has both: fill and depth clip mode are then set per draw too.
+    pub(crate) dynamic_raster: Option<ash::ext::extended_dynamic_state3::Device>,
+    host_query_reset: bool,
+    /// Whether the device has timeline semaphores, which `MTLEvent`s are.
+    pub(crate) timeline_semaphores: bool,
+    /// Command pools, descriptor pools and upload chunks whose submission has
+    /// retired, kept for the next command buffer. A game commits several
+    /// command buffers a frame, and creating and destroying each one's pool,
+    /// fence and descriptor pools every frame is driver work on the thread the
+    /// guest records on.
+    contexts: Mutex<Vec<CommandContext>>,
+    /// Secondary command buffers, one per parallel render sub-encoder.
+    secondaries: Mutex<Vec<SecondaryContext>>,
+    context_budget: ContextBudget,
+    descriptor_pools: Mutex<Vec<vk::DescriptorPool>>,
+    /// Each with when it was handed back, as for `staging_buffers`.
+    upload_chunks: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
+    /// Larger host-visible buffers for texture uploads and readbacks.
+    /// Each with when it was handed back, so idle ones can be freed.
+    staging_buffers: Mutex<Vec<(GpuBuffer, std::time::Instant)>>,
+    /// When the pools above are next checked for idle buffers.
+    staging_trim_due: Mutex<std::time::Instant>,
+    /// `VK_KHR_push_descriptor`, where advertised, and the descriptor limit
+    /// which decides whether one set in a pipeline can use it.
+    push_descriptor_api: Option<ash::khr::push_descriptor::Device>,
+    pub max_push_descriptors: u32,
+    /// Whether null buffer and image-view descriptors have defined Metal-like
+    /// reads and writes on this device.
+    pub(crate) null_descriptors: bool,
+    /// Largest per-instance vertex step rate supported through
+    /// `VK_KHR_vertex_attribute_divisor`, or zero when it is unavailable.
+    pub(crate) max_vertex_attribute_divisor: u32,
+    /// Whether a draw using a vertex divisor may have a non-zero base instance.
+    pub(crate) divisor_non_zero_first_instance: bool,
+    /// Whether a sampler may use `MTLSamplerAddressModeMirrorClampToEdge`.
+    /// The mode is not legal on an unextended Vulkan 1.1 device, and a
+    /// sampler which asks for it there is rejected rather than given a
+    /// different wrap.
+    pub(crate) sampler_mirror_clamp_to_edge: bool,
+    /// robustness2 does not permit a null standalone sampler descriptor.
+    /// This neutral sampler keeps an otherwise-null resource table valid.
+    pub(crate) null_sampler: vk::Sampler,
+    /// The samplers shaders describe themselves, made once per description and
+    /// kept, like `null_sampler`, for the life of the device.
+    pub(crate) inline_samplers: Mutex<HashMap<metal_translate::ir::InlineSampler, vk::Sampler>>,
+    /// `VK_KHR_swapchain`'s device functions, where the device has it. `None`
+    /// is a device which cannot present at all, and presentation falls back
+    /// to reading the frame back and blitting it through SDL's window
+    /// surface.
+    swapchain_api: Option<ash::khr::swapchain::Device>,
+    /// Whether present operations can carry fences which retire their wait
+    /// semaphores and swapchain resources without making the whole queue idle.
+    swapchain_maintenance1: bool,
+    /// Depth/stencil resolve, where the device has it. `None` is a device
+    /// which cannot resolve a multisampled depth or stencil attachment at
+    /// all, and a pass which asks for one is reported and left unresolved.
+    pub(crate) depth_stencil_resolve: Option<DepthStencilResolve>,
+    /// Sampling Linux dma-bufs, where the device can import them. `None`
+    /// is a device whose windows are only ever given pixels.
+    pub(crate) dmabuf: Option<DmabufImport>,
+    /// Importing host memory, where the device can: large shared buffers are
+    /// then lazily committed pages, as Metal's are. See `host`.
+    host_import: Option<host::HostImport>,
+    /// Bytes of host pages imported, for `ROSEMARY_METAL_STATS`.
+    host_imported: std::sync::atomic::AtomicU64,
+}
+
+/// What importing a dma-buf as an image takes.
+pub(crate) struct DmabufImport {
+    pub memory_fd: ash::khr::external_memory_fd::Device,
+    /// Whether ownership comes from `VK_QUEUE_FAMILY_FOREIGN_EXT`, rather
+    /// than the less specific `VK_QUEUE_FAMILY_EXTERNAL`.
+    pub foreign: bool,
+    /// The device's DRM render node, as `st_rdev`, where it says.
+    pub render_node: Option<u64>,
+}
+
+struct Immediate {
+    pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    fence: vk::Fence,
+    /// Submission-owned buffers, descriptors, imports and images are retired
+    /// only after the fence, even if the synchronous waiter returned an error.
+    retained: Option<Box<dyn Send>>,
+}
+
+/// Bounded recycler: command pools are never reused until their GPU fence
+/// completes. A failed wait quarantines the context instead of resetting a
+/// command buffer which the Vulkan queue may still be reading.
+#[derive(Default)]
+struct ImmediatePool {
+    available: Vec<Immediate>,
+    quarantined: Vec<Immediate>,
+    in_use: usize,
+    retiring: usize,
+}
+
+/// One command buffer with the pool it was allocated from and the fence its
+/// submission signals.
+pub struct CommandContext {
+    pub pool: vk::CommandPool,
+    pub command_buffer: vk::CommandBuffer,
+    pub fence: vk::Fence,
+}
+
+/// A secondary command buffer with the pool it was allocated from. It is
+/// executed by a primary one and retires with that primary's submission.
+pub struct SecondaryContext {
+    pub pool: vk::CommandPool,
+    pub command_buffer: vk::CommandBuffer,
+}
+
+struct ContextBudget {
+    used: Mutex<usize>,
+    available: std::sync::Condvar,
+    limit: usize,
+}
+
+impl ContextBudget {
+    fn new() -> Self {
+        let limit = std::env::var("ROSEMARY_METAL_MAX_COMMAND_BUFFERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(64);
+        Self {
+            used: Mutex::new(0),
+            available: std::sync::Condvar::new(),
+            limit,
+        }
+    }
+
+    /// How many retired command contexts are kept for reuse. A larger budget
+    /// lets more command buffers retire together, and each one past this is
+    /// rebuilt from scratch on the next acquire.
+    fn recycled_contexts(&self) -> usize {
+        self.limit.div_ceil(2)
+    }
+
+    /// How many upload chunks are kept for reuse, in proportion to the
+    /// command buffers whose `-setBytes:` copies they hold.
+    fn recycled_upload_chunks(&self) -> usize {
+        self.limit.div_ceil(4)
+    }
+}
+
+/// How many retired objects of each kind are kept for reuse. Enough for the
+/// command buffers of a few frames in flight; a burst beyond it is destroyed
+/// rather than held for the rest of the run.
+const RECYCLED: usize = 32;
+
+/// The size of one chunk `-setBytes:` copies are cut from. Metal limits one
+/// copy to four kilobytes, so a chunk holds a frame's worth of them.
+pub const UPLOAD_CHUNK: u64 = 256 << 10;
+
+/// The most staging memory a device keeps for reuse between transfers too
+/// large for an upload chunk.
+const STAGING_POOL_BYTES: u64 = 64 << 20;
+
+/// The size of the zero-filled buffer textures that cannot be cleared are
+/// copied from, a band at a time.
+const ZERO_SOURCE: u64 = 1 << 20;
+
+/// How long a pooled staging buffer may sit unused before it is freed, so a
+/// burst of large transfers does not keep its memory for good.
+const STAGING_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the submission path looks for idle staging buffers. Looking on
+/// every commit cost two locks and a clock read per pooled buffer.
+const STAGING_TRIM_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Makes the next device behave as one without `VK_KHR_push_descriptor`, so
+/// its descriptor paths are tested on a device which has the extension.
+#[cfg(test)]
+pub(crate) static TEST_WITHOUT_PUSH_DESCRIPTORS: AtomicBool = AtomicBool::new(false);
+
+/// Makes the next device begin passes through render passes and keep fill
+/// and depth clip mode in its pipelines, so the paths for devices without
+/// dynamic rendering are tested on one which has it.
+#[cfg(test)]
+pub(crate) static TEST_WITHOUT_DYNAMIC_RENDERING: AtomicBool = AtomicBool::new(false);
+
+/// How many occlusion queries one pool holds; a command buffer which needs
+/// more takes another pool.
+pub const OCCLUSION_QUERIES: u32 = 256;
+
+fn create_device(
+    instance: &Instance,
+    physical: vk::PhysicalDevice,
+    queues: &[vk::DeviceQueueCreateInfo<'_>],
+    features: &vk::PhysicalDeviceFeatures,
+    extensions: &[*const std::ffi::c_char],
+    target: &metal_translate::TargetProfile,
+    capabilities: DeviceCapabilities,
+) -> Result<Device, String> {
+    let mut v11 = vk::PhysicalDeviceVulkan11Features {
+        storage_buffer16_bit_access: target.storage_buffer16_bit_access.into(),
+        uniform_and_storage_buffer16_bit_access: target
+            .uniform_and_storage_buffer16_bit_access
+            .into(),
+        storage_push_constant16: target.storage_push_constant16.into(),
+        storage_input_output16: target.storage_input_output16.into(),
+        variable_pointers_storage_buffer: target.variable_pointers_storage_buffer.into(),
+        variable_pointers: target.variable_pointers.into(),
+        shader_draw_parameters: target.shader_draw_parameters.into(),
+        ..Default::default()
+    };
+    let mut v12 = vk::PhysicalDeviceVulkan12Features {
+        storage_buffer8_bit_access: target.storage_buffer8_bit_access.into(),
+        uniform_and_storage_buffer8_bit_access: target
+            .uniform_and_storage_buffer8_bit_access
+            .into(),
+        storage_push_constant8: target.storage_push_constant8.into(),
+        shader_float16: target.shader_float16.into(),
+        shader_int8: target.shader_int8.into(),
+        shader_output_viewport_index: target.shader_output_viewport_index.into(),
+        sampler_mirror_clamp_to_edge: capabilities.sampler_mirror_clamp_to_edge.into(),
+        host_query_reset: capabilities.host_query_reset.into(),
+        timeline_semaphore: capabilities.timeline_semaphores.into(),
+        ..Default::default()
+    };
+    let mut v13 = vk::PhysicalDeviceVulkan13Features {
+        shader_demote_to_helper_invocation: target.demote_to_helper_invocation.into(),
+        dynamic_rendering: capabilities.dynamic_rendering.into(),
+        ..Default::default()
+    };
+    let mut extended_dynamic_state = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT {
+        extended_dynamic_state: capabilities.extended_dynamic_state.into(),
+        ..Default::default()
+    };
+    let mut dynamic_raster = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+        extended_dynamic_state3_polygon_mode: vk::TRUE,
+        extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
+        ..Default::default()
+    };
+    let mut storage16 = vk::PhysicalDevice16BitStorageFeatures {
+        storage_buffer16_bit_access: target.storage_buffer16_bit_access.into(),
+        uniform_and_storage_buffer16_bit_access: target
+            .uniform_and_storage_buffer16_bit_access
+            .into(),
+        storage_push_constant16: target.storage_push_constant16.into(),
+        storage_input_output16: target.storage_input_output16.into(),
+        ..Default::default()
+    };
+    let mut pointers = vk::PhysicalDeviceVariablePointersFeatures {
+        variable_pointers_storage_buffer: target.variable_pointers_storage_buffer.into(),
+        variable_pointers: target.variable_pointers.into(),
+        ..Default::default()
+    };
+    let mut draw = vk::PhysicalDeviceShaderDrawParametersFeatures {
+        shader_draw_parameters: target.shader_draw_parameters.into(),
+        ..Default::default()
+    };
+    let mut storage8 = vk::PhysicalDevice8BitStorageFeatures {
+        storage_buffer8_bit_access: target.storage_buffer8_bit_access.into(),
+        uniform_and_storage_buffer8_bit_access: target
+            .uniform_and_storage_buffer8_bit_access
+            .into(),
+        storage_push_constant8: target.storage_push_constant8.into(),
+        ..Default::default()
+    };
+    let mut small = vk::PhysicalDeviceShaderFloat16Int8Features {
+        shader_float16: target.shader_float16.into(),
+        shader_int8: target.shader_int8.into(),
+        ..Default::default()
+    };
+    let mut demote = vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures {
+        shader_demote_to_helper_invocation: target.demote_to_helper_invocation.into(),
+        ..Default::default()
+    };
+    let mut robustness2 = vk::PhysicalDeviceRobustness2FeaturesEXT {
+        null_descriptor: capabilities.null_descriptors.into(),
+        ..Default::default()
+    };
+    let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR {
+        vertex_attribute_instance_rate_divisor: capabilities.vertex_attribute_divisor.into(),
+        ..Default::default()
+    };
+    let mut swapchain_maintenance1 = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT {
+        swapchain_maintenance1: capabilities.swapchain_maintenance1.into(),
+        ..Default::default()
+    };
+
+    let mut create_info = vk::DeviceCreateInfo::default()
+        .queue_create_infos(queues)
+        .enabled_features(features)
+        .enabled_extension_names(extensions);
+    let mut portability = vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
+    if capabilities.portability_subset {
+        let mut queried = vk::PhysicalDeviceFeatures2::default().push_next(&mut portability);
+        // SAFETY: the extension is advertised and both structures live across the query.
+        unsafe { instance.get_physical_device_features2(physical, &mut queried) };
+        create_info = create_info.push_next(&mut portability);
+    }
+    if target.vulkan_version >= (1, 2) {
+        create_info = create_info.push_next(&mut v11).push_next(&mut v12);
+        if target.vulkan_version >= (1, 3) {
+            create_info = create_info.push_next(&mut v13);
+        } else if target.demote_to_helper_invocation {
+            create_info = create_info.push_next(&mut demote);
+        }
+    } else {
+        create_info = create_info
+            .push_next(&mut storage16)
+            .push_next(&mut pointers)
+            .push_next(&mut draw);
+        if target.storage_buffer8_bit_access
+            || target.uniform_and_storage_buffer8_bit_access
+            || target.storage_push_constant8
+        {
+            create_info = create_info.push_next(&mut storage8);
+        }
+        if target.shader_float16 || target.shader_int8 {
+            create_info = create_info.push_next(&mut small);
+        }
+        if target.demote_to_helper_invocation {
+            create_info = create_info.push_next(&mut demote);
+        }
+    }
+    if capabilities.null_descriptors {
+        create_info = create_info.push_next(&mut robustness2);
+    }
+    if capabilities.vertex_attribute_divisor {
+        create_info = create_info.push_next(&mut divisor);
+    }
+    if capabilities.swapchain_maintenance1 {
+        create_info = create_info.push_next(&mut swapchain_maintenance1);
+    }
+    if capabilities.extended_dynamic_state {
+        create_info = create_info.push_next(&mut extended_dynamic_state);
+    }
+    if capabilities.dynamic_raster {
+        create_info = create_info.push_next(&mut dynamic_raster);
+    }
+    // SAFETY: all feature structures and borrowed create-info data live
+    // across the call, and every enabled bit came from the adapter query.
+    unsafe { instance.create_device(physical, &create_info, None) }
+        .map_err(|error| format!("vkCreateDevice failed with {error:?}"))
+}
+
+/// A DRM node's device number, as `stat` gives it; only Linux has them.
+fn render_node(major: i64, minor: i64) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    return Some(libc::makedev(major as u32, minor as u32));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (major, minor);
+        None
+    }
+}
+
+/// Which spelling of mirror-clamp sampling a device offers: the Vulkan 1.2
+/// feature bit, or the extension which preceded it. Enabling both would be
+/// redundant, and neither means the address mode is rejected.
+fn mirror_clamp_support(core_feature: bool, extension: bool) -> (bool, bool) {
+    match core_feature {
+        true => (true, false),
+        false => (false, extension),
+    }
+}
+
+/// A render pass is keyed by the formats and load/store actions of its
+/// attachments: Vulkan bakes into the pass what Metal carries on the
+/// descriptor.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RenderPassKey {
+    /// The pass's actual colour attachment descriptions, packed for the
+    /// framebuffer and Vulkan attachment table.
+    pub colors: Vec<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    /// Metal render-target index to packed attachment index. A gap becomes
+    /// `VK_ATTACHMENT_UNUSED` in a render pass or a null dynamic attachment.
+    pub color_slots: Vec<Option<u32>>,
+    /// The single-sample attachment each colour is resolved into, where the
+    /// Metal store action asks for a resolve, and `None` where it does not.
+    /// One entry per colour, because Vulkan's resolve list is positional.
+    pub color_resolves: Vec<Option<vk::Format>>,
+    pub depth: Option<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    pub stencil: Option<(vk::Format, vk::AttachmentLoadOp, vk::AttachmentStoreOp)>,
+    /// Whether the depth and stencil slots use one image subresource. Vulkan
+    /// requires this under both render-pass APIs; separate Metal textures are
+    /// copied through a temporary combined image before this key is made.
+    pub depth_stencil_shared: bool,
+    /// The single-sample attachment the depth/stencil attachment resolves
+    /// into. Vulkan carries one for the whole subpass rather than one per
+    /// aspect, which is why Metal's two resolve destinations must be the same
+    /// texture.
+    pub depth_resolve: Option<DepthResolve>,
+    pub samples: vk::SampleCountFlags,
+}
+
+impl RenderPassKey {
+    /// The Vulkan formats declared for the depth and stencil slots. They are
+    /// the same when both are present, including a bridged Metal pair.
+    pub fn depth_stencil_formats(&self) -> (vk::Format, vk::Format) {
+        (
+            self.depth.map_or(vk::Format::UNDEFINED, |depth| depth.0),
+            self.stencil
+                .map_or(vk::Format::UNDEFINED, |stencil| stencil.0),
+        )
+    }
+}
+
+/// A depth/stencil resolve destination and the mode each aspect resolves
+/// with. `NONE` on an aspect is an aspect which is not resolved.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct DepthResolve {
+    pub format: vk::Format,
+    pub depth_mode: vk::ResolveModeFlags,
+    pub stencil_mode: vk::ResolveModeFlags,
+}
+
+impl Gpu {
+    pub fn create(
+        entry: &Entry,
+        instance: &Instance,
+        physical: vk::PhysicalDevice,
+        target: &metal_translate::TargetProfile,
+    ) -> Result<Self, String> {
+        // SAFETY: the physical device came from this live instance.
+        let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
+        let queue_family = families
+            .iter()
+            .position(|family| {
+                family
+                    .queue_flags
+                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            })
+            .ok_or("the Vulkan device has no graphics and compute queue family")?
+            as u32;
+
+        // Vulkan accepts every feature the device reports, and Metal's own
+        // feature set is wide: a translated shader may need any of Int64,
+        // format-less storage images, cube arrays or BC compression. Enabling
+        // what the device already advertises costs nothing and avoids a
+        // per-feature list that would drift from the emitter.
+        // SAFETY: the physical device belongs to this live instance.
+        let features = unsafe { instance.get_physical_device_features(physical) };
+
+        // SAFETY: the physical device belongs to this live instance.
+        let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }
+            .map_err(|error| format!("vkEnumerateDeviceExtensionProperties failed: {error:?}"))?;
+        let has = |name: &std::ffi::CStr| {
+            extensions.iter().any(|property| {
+                property
+                    .extension_name_as_c_str()
+                    .is_ok_and(|available| available == name)
+            })
+        };
+        let mut enabled: Vec<*const std::ffi::c_char> = Vec::new();
+        // Portability implementations require this extension and explicit feature enablement.
+        let portability_subset = has(ash::khr::portability_subset::NAME);
+        if portability_subset {
+            enabled.push(ash::khr::portability_subset::NAME.as_ptr());
+        }
+        let presents = has(ash::khr::swapchain::NAME);
+        if presents {
+            enabled.push(ash::khr::swapchain::NAME.as_ptr());
+        }
+        // The device extension requires its surface counterpart on the instance.
+        let swapchain_maintenance1 = presents
+            && crate::vulkan::surface_maintenance1()
+            && has(ash::ext::swapchain_maintenance1::NAME)
+            && {
+                let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+                let mut features =
+                    vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance);
+                // SAFETY: the extension is advertised and both structures
+                // live across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                maintenance.swapchain_maintenance1 == vk::TRUE
+            };
+        if swapchain_maintenance1 {
+            enabled.push(ash::ext::swapchain_maintenance1::NAME.as_ptr());
+        }
+        let pushes = has(ash::khr::push_descriptor::NAME);
+        if pushes {
+            enabled.push(ash::khr::push_descriptor::NAME.as_ptr());
+        }
+        if target.vulkan_version < (1, 2) {
+            if target.storage_buffer8_bit_access
+                || target.uniform_and_storage_buffer8_bit_access
+                || target.storage_push_constant8
+            {
+                enabled.push(ash::khr::_8bit_storage::NAME.as_ptr());
+            }
+            if target.shader_float16 || target.shader_int8 {
+                enabled.push(ash::khr::shader_float16_int8::NAME.as_ptr());
+            }
+        }
+        if target.vulkan_version < (1, 2) && target.shader_output_viewport_index {
+            enabled.push(ash::ext::shader_viewport_index_layer::NAME.as_ptr());
+        }
+        if target.vulkan_version < (1, 3) && target.demote_to_helper_invocation {
+            enabled.push(ash::ext::shader_demote_to_helper_invocation::NAME.as_ptr());
+        }
+
+        // `MTLSamplerAddressModeMirrorClampToEdge` maps onto an address mode
+        // which an unextended Vulkan 1.1 device does not accept. Vulkan 1.2
+        // carries it as an optional feature bit, and the extension which
+        // preceded it needs no bit at all - only enabling. Prefer the bit,
+        // and fall back to the extension where the device reports it instead.
+        let v12 = (target.vulkan_version >= (1, 2)).then(|| {
+            let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
+            // SAFETY: the device reports Vulkan 1.2 and both structures live
+            // across the query.
+            unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            v12
+        });
+        let mirror_clamp_feature =
+            v12.is_some_and(|v12| v12.sampler_mirror_clamp_to_edge == vk::TRUE);
+        // Occlusion query pools are reset from the host: a parallel render
+        // sub-encoder begins its queries inside a pass, where no reset can be
+        // recorded.
+        let host_query_reset = v12.is_some_and(|v12| v12.host_query_reset == vk::TRUE);
+        // `MTLEvent`s are timeline semaphores, which Vulkan 1.2 requires.
+        let timeline_semaphores = v12.is_some_and(|v12| v12.timeline_semaphore == vk::TRUE);
+        let (mirror_clamp_feature, mirror_clamp_extension) = mirror_clamp_support(
+            mirror_clamp_feature,
+            has(ash::khr::sampler_mirror_clamp_to_edge::NAME),
+        );
+        if mirror_clamp_extension {
+            enabled.push(ash::khr::sampler_mirror_clamp_to_edge::NAME.as_ptr());
+        }
+
+        // Prefer the ratified spelling. The feature structure is an exact KHR
+        // alias of the older EXT structure represented by this ash release.
+        let robustness2 = if has(ROBUSTNESS_2_KHR) {
+            Some(ROBUSTNESS_2_KHR)
+        } else if has(ash::ext::robustness2::NAME) {
+            Some(ash::ext::robustness2::NAME)
+        } else {
+            None
+        };
+        let null_descriptors = robustness2.is_some_and(|_| {
+            let mut robustness2 = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut robustness2);
+            // SAFETY: robustness2 is advertised and both structures live
+            // across the query.
+            unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            robustness2.null_descriptor == vk::TRUE
+        });
+        if null_descriptors {
+            enabled.push(
+                robustness2
+                    .expect("a queried robustness2 extension")
+                    .as_ptr(),
+            );
+        }
+
+        let (max_vertex_attribute_divisor, divisor_non_zero_first_instance) =
+            if has(ash::khr::vertex_attribute_divisor::NAME) {
+                let mut divisor = vk::PhysicalDeviceVertexAttributeDivisorFeaturesKHR::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut divisor);
+                // SAFETY: the extension is advertised and both structures live
+                // across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                if divisor.vertex_attribute_instance_rate_divisor == vk::TRUE {
+                    let mut divisor =
+                        vk::PhysicalDeviceVertexAttributeDivisorPropertiesKHR::default();
+                    let mut properties =
+                        vk::PhysicalDeviceProperties2::default().push_next(&mut divisor);
+                    // SAFETY: the extension is advertised and both structures
+                    // live across the query.
+                    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+                    enabled.push(ash::khr::vertex_attribute_divisor::NAME.as_ptr());
+                    (
+                        divisor.max_vertex_attrib_divisor,
+                        divisor.supports_non_zero_first_instance == vk::TRUE,
+                    )
+                } else {
+                    (0, false)
+                }
+            } else {
+                (0, false)
+            };
+
+        // Depth/stencil resolve is properties-only: there is no feature bit to
+        // enable, but the render pass which uses it must be created through
+        // `vkCreateRenderPass2`, which is core in Vulkan 1.2 and an extension
+        // of its own before that.
+        let depth_stencil_resolve_core = target.vulkan_version >= (1, 2);
+        let depth_stencil_resolve_extension = !depth_stencil_resolve_core
+            && has(ash::khr::depth_stencil_resolve::NAME)
+            && has(ash::khr::create_renderpass2::NAME);
+        let resolve_support = (depth_stencil_resolve_core || depth_stencil_resolve_extension)
+            .then(|| {
+                if depth_stencil_resolve_extension {
+                    enabled.push(ash::khr::create_renderpass2::NAME.as_ptr());
+                    enabled.push(ash::khr::depth_stencil_resolve::NAME.as_ptr());
+                }
+                let mut resolve = vk::PhysicalDeviceDepthStencilResolveProperties::default();
+                let mut properties =
+                    vk::PhysicalDeviceProperties2::default().push_next(&mut resolve);
+                // SAFETY: the properties are core or the extension is
+                // advertised, and both structures live across the query.
+                unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+                ResolveSupport {
+                    depth_modes: resolve.supported_depth_resolve_modes,
+                    stencil_modes: resolve.supported_stencil_resolve_modes,
+                    independent_none: resolve.independent_resolve_none == vk::TRUE,
+                    independent: resolve.independent_resolve == vk::TRUE,
+                }
+            })
+            // A device which reports no mode for either aspect can resolve
+            // nothing, and is the same as one without the feature at all.
+            .filter(|support| !(support.depth_modes | support.stencil_modes).is_empty());
+
+        // Importing a dma-buf needs its memory by descriptor and its layout
+        // by modifier; the modifier extension builds on image format lists,
+        // which Vulkan 1.2 has in core.
+        let dmabuf = has(ash::khr::external_memory_fd::NAME)
+            && has(ash::ext::external_memory_dma_buf::NAME)
+            && has(ash::ext::image_drm_format_modifier::NAME)
+            && (target.vulkan_version >= (1, 2) || has(ash::khr::image_format_list::NAME));
+        let foreign = dmabuf && has(ash::ext::queue_family_foreign::NAME);
+        if dmabuf {
+            enabled.push(ash::khr::external_memory_fd::NAME.as_ptr());
+            enabled.push(ash::ext::external_memory_dma_buf::NAME.as_ptr());
+            enabled.push(ash::ext::image_drm_format_modifier::NAME.as_ptr());
+            if target.vulkan_version < (1, 2) {
+                enabled.push(ash::khr::image_format_list::NAME.as_ptr());
+            }
+            if foreign {
+                enabled.push(ash::ext::queue_family_foreign::NAME.as_ptr());
+            }
+        }
+        let host_import = has(ash::ext::external_memory_host::NAME);
+        if host_import {
+            enabled.push(ash::ext::external_memory_host::NAME.as_ptr());
+        }
+        // Dynamic rendering and extended dynamic state are core in Vulkan 1.3,
+        // but RADV gates its PS epilog cache on the EXT feature bit, which is
+        // not promoted even though the commands are. A 1.3 device drawing with
+        // the core commands therefore faults in RADV unless the extension and
+        // its feature are enabled. Enabling them is legal on 1.3 and makes the
+        // PS epilog path work; keep it behind the feature query so a driver
+        // which does not offer it falls back to pipeline-per-state.
+        let dynamic_rendering = target.vulkan_version >= (1, 3) && {
+            let mut v13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v13);
+            // SAFETY: the device reports Vulkan 1.3 and both structures live
+            // across the query.
+            unsafe { instance.get_physical_device_features2(physical, &mut features) };
+            v13.dynamic_rendering == vk::TRUE
+        };
+        #[cfg(test)]
+        let dynamic_rendering = dynamic_rendering
+            && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        let extended_dynamic_state =
+            target.vulkan_version >= (1, 3) && has(ash::ext::extended_dynamic_state::NAME) && {
+                let mut extended = vk::PhysicalDeviceExtendedDynamicStateFeaturesEXT::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut extended);
+                // SAFETY: the extension is advertised and both structures live
+                // across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                extended.extended_dynamic_state == vk::TRUE
+            };
+        let dynamic_raster =
+            target.vulkan_version >= (1, 3) && has(ash::ext::extended_dynamic_state3::NAME) && {
+                let mut state3 = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT::default();
+                let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut state3);
+                // SAFETY: the extension is advertised and both structures
+                // live across the query.
+                unsafe { instance.get_physical_device_features2(physical, &mut features) };
+                state3.extended_dynamic_state3_polygon_mode == vk::TRUE
+                    && state3.extended_dynamic_state3_depth_clamp_enable == vk::TRUE
+            };
+        #[cfg(test)]
+        let dynamic_raster = dynamic_raster
+            && !TEST_WITHOUT_DYNAMIC_RENDERING.load(std::sync::atomic::Ordering::Acquire);
+        if extended_dynamic_state {
+            enabled.push(ash::ext::extended_dynamic_state::NAME.as_ptr());
+        }
+        if dynamic_raster {
+            enabled.push(ash::ext::extended_dynamic_state3::NAME.as_ptr());
+        }
+        let calibration = clock::Calibration::extension(entry, instance, physical, has);
+        if let Some(name) = calibration {
+            enabled.push(name.as_ptr());
+        }
+        let render_node = has(ash::ext::physical_device_drm::NAME)
+            .then(|| {
+                let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
+                let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
+                // SAFETY: the extension is advertised and both structures
+                // live across the query.
+                unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+                (drm.has_render == vk::TRUE)
+                    .then(|| render_node(drm.render_major, drm.render_minor))
+                    .flatten()
+            })
+            .flatten();
+
+        let priorities = [1.0f32];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family)
+            .queue_priorities(&priorities)];
+        let device = create_device(
+            instance,
+            physical,
+            &queues,
+            &features,
+            &enabled,
+            target,
+            DeviceCapabilities {
+                portability_subset,
+                null_descriptors,
+                vertex_attribute_divisor: max_vertex_attribute_divisor != 0,
+                swapchain_maintenance1,
+                sampler_mirror_clamp_to_edge: mirror_clamp_feature,
+                host_query_reset,
+                timeline_semaphores,
+                extended_dynamic_state,
+                dynamic_rendering,
+                dynamic_raster,
+            },
+        )?;
+        // SAFETY: the family was requested above with one queue.
+        let queue = unsafe { device.get_device_queue(queue_family, 0) };
+        // SAFETY: the physical device belongs to this live instance.
+        let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let properties = unsafe { instance.get_physical_device_properties(physical) };
+        let pipeline_cache = pipeline_cache::PipelineCache::open(&device, &properties);
+
+        let depth_stencil_resolve = resolve_support.map(|support| DepthStencilResolve {
+            renderpass2: depth_stencil_resolve_extension
+                .then(|| ash::khr::create_renderpass2::Device::new(instance, &device)),
+            support,
+        });
+        let swapchain_api = presents.then(|| ash::khr::swapchain::Device::new(instance, &device));
+        let dmabuf = dmabuf.then(|| DmabufImport {
+            memory_fd: ash::khr::external_memory_fd::Device::new(instance, &device),
+            foreign,
+            render_node,
+        });
+        let calibration = calibration.map(|name| clock::Calibration::new(instance, &device, name));
+        let dynamic_raster = dynamic_raster
+            .then(|| ash::ext::extended_dynamic_state3::Device::new(instance, &device));
+        let host_import = host_import
+            .then(|| host::HostImport::new(instance, physical, &device))
+            .flatten();
+        #[cfg(test)]
+        let pushes =
+            pushes && !TEST_WITHOUT_PUSH_DESCRIPTORS.load(std::sync::atomic::Ordering::Acquire);
+        let push_descriptor_api =
+            pushes.then(|| ash::khr::push_descriptor::Device::new(instance, &device));
+        let max_push_descriptors = if pushes {
+            let mut push = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+            let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut push);
+            // SAFETY: the physical device belongs to this live instance, and
+            // both structures live across the call.
+            unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+            push.max_push_descriptors
+        } else {
+            0
+        };
+        let null_sampler = if null_descriptors {
+            let info = vk::SamplerCreateInfo::default();
+            // SAFETY: the default sampler description is valid on every
+            // Vulkan device.
+            unsafe { device.create_sampler(&info, None) }
+                .map_err(|error| format!("vkCreateSampler for nil resources failed: {error:?}"))?
+        } else {
+            vk::Sampler::null()
+        };
+
+        Ok(Self {
+            device,
+            physical,
+            queue_family,
+            queue: Mutex::new(queue),
+            wsi: Mutex::new(()),
+            commits: submit::Commits::default(),
+            event_waits_in_flight: AtomicUsize::new(0),
+            submissions: crate::submission::Tracker::new(),
+            deferred: deferred::Deferred::default(),
+            presenter: crate::present::Presenter::new(),
+            lost: AtomicBool::new(false),
+            memory,
+            limits: properties.limits,
+            layouts: Mutex::new(HashMap::new()),
+            render_passes: Mutex::new(Default::default()),
+            pipeline_cache,
+            immediate: Mutex::new(ImmediatePool::default()),
+            immediate_ready: Condvar::new(),
+            #[cfg(test)]
+            fail_immediate_wait_after_submit: AtomicBool::new(false),
+            buffers: OnceLock::new(),
+            private_buffers: OnceLock::new(),
+            private_images: std::array::from_fn(|_| OnceLock::new()),
+            zeros: OnceLock::new(),
+            timestamp_pools: Mutex::new(Vec::new()),
+            timestamp_period: properties.limits.timestamp_period,
+            timestamp_valid_bits: families[queue_family as usize].timestamp_valid_bits,
+            occlusion_pools: Mutex::new(Vec::new()),
+            occlusion_precise: features.occlusion_query_precise == vk::TRUE,
+            alpha_to_one: features.alpha_to_one == vk::TRUE,
+            max_viewports: if features.multi_viewport == vk::TRUE {
+                properties.limits.max_viewports
+            } else {
+                1
+            },
+            dynamic_render_state: extended_dynamic_state,
+            dynamic_rendering,
+            dynamic_raster,
+            host_query_reset,
+            timeline_semaphores,
+            contexts: Mutex::new(Vec::new()),
+            secondaries: Mutex::new(Vec::new()),
+            context_budget: ContextBudget::new(),
+            descriptor_pools: Mutex::new(Vec::new()),
+            upload_chunks: Mutex::new(Vec::new()),
+            staging_buffers: Mutex::new(Vec::new()),
+            staging_trim_due: Mutex::new(std::time::Instant::now()),
+            push_descriptor_api,
+            max_push_descriptors,
+            null_descriptors,
+            sampler_mirror_clamp_to_edge: mirror_clamp_feature || mirror_clamp_extension,
+            max_vertex_attribute_divisor,
+            divisor_non_zero_first_instance,
+            null_sampler,
+            inline_samplers: Mutex::new(HashMap::new()),
+            swapchain_api,
+            swapchain_maintenance1,
+            depth_stencil_resolve,
+            dmabuf,
+            host_import,
+            host_imported: std::sync::atomic::AtomicU64::new(0),
+            calibration,
+        })
+    }
+}
+
+impl Gpu {
+    /// The cache every pipeline of this device is made through.
+    pub(crate) fn pipeline_cache(&self) -> vk::PipelineCache {
+        self.pipeline_cache.handle
+    }
+
+    /// Where the pipeline cache is saved, where the shader cache is enabled.
+    #[cfg(test)]
+    pub(crate) fn pipeline_cache_path(&self) -> Option<&std::path::Path> {
+        self.pipeline_cache.path()
+    }
+
+    /// How many bytes the driver reports for a cache made from `initial`, or
+    /// from the saved file where it is `None`.
+    #[cfg(test)]
+    pub(crate) fn reopened_pipeline_cache_bytes(&self, initial: Option<&[u8]>) -> Option<usize> {
+        self.pipeline_cache.reopened_bytes(&self.device, initial)
+    }
+
+    /// Note that a guest pipeline was made through [`Self::pipeline_cache`].
+    pub(crate) fn pipeline_created(&'static self) {
+        self.pipeline_cache.created(&self.device);
+    }
+
+    /// Write the pipeline cache out, if anything was added to it.
+    pub(crate) fn save_pipeline_cache(&self) {
+        self.pipeline_cache.save(&self.device);
+    }
+}
+
+/// Metal's `MTLTextureUsage`.
+pub const USAGE_SHADER_READ: u64 = 1;
+pub const USAGE_SHADER_WRITE: u64 = 2;
+pub const USAGE_RENDER_TARGET: u64 = 4;
+pub const USAGE_PIXEL_FORMAT_VIEW: u64 = 0x10;
+
+pub struct GpuBuffer {
+    pub buffer: vk::Buffer,
+    pub allocation: Allocation,
+    pub contents: *mut u8,
+    pub length: u64,
+    /// Cut from the private heap: device memory the host cannot map.
+    pub private: bool,
+    /// The placement heap memory it is bound into, instead of `allocation`.
+    pub placement: Option<Arc<Placement>>,
+}
+
+// SAFETY: `contents` is a permanent mapping of device memory, valid on every
+// thread; see `Allocation`.
+unsafe impl Send for GpuBuffer {}
+
+pub struct GpuImage {
+    pub image: vk::Image,
+    pub memory: Option<vk::DeviceMemory>,
+    /// The private-image heap range it is bound into, and that heap's memory
+    /// type, instead of `memory`.
+    pub heap: Option<(u32, Allocation)>,
+    /// The placement heap memory it is bound into, instead of `memory`.
+    pub placement: Option<Arc<Placement>>,
+    pub view: vk::ImageView,
+    pub format: vk::Format,
+    pub aspect: vk::ImageAspectFlags,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub levels: u32,
+    pub layers: u32,
+    pub samples: vk::SampleCountFlags,
+    /// The first level and layer of the underlying image this one covers:
+    /// zero for an image of its own, the range's start for a texture view.
+    /// `width`, `height` and `depth` stay those of the underlying image's
+    /// level zero, so every extent is computed at the absolute level.
+    pub base_level: u32,
+    pub base_layer: u32,
+    /// What the underlying image was created for, which a view of another
+    /// format may have to narrow.
+    pub usage: vk::ImageUsageFlags,
+}
+
+impl GpuBuffer {
+    /// The buffer left behind when a real one is destroyed: it is never bound,
+    /// because the object holding it is being deallocated.
+    pub fn none() -> Self {
+        Self {
+            buffer: vk::Buffer::null(),
+            allocation: Allocation::none(),
+            contents: std::ptr::null_mut(),
+            length: 0,
+            private: false,
+            placement: None,
+        }
+    }
+}
+
+/// One subresource region of an image, as a Metal copy names it.
+///
+/// Every field is a guest `NSUInteger`, so none of them is known to fit a
+/// Vulkan `uint32_t` - let alone to name texels the image has - until
+/// [`GpuImage::region`] has said so.
+#[derive(Clone, Copy)]
+pub struct Region {
+    pub level: u64,
+    pub slice: u64,
+    pub origin: [u64; 3],
+    pub size: [u64; 3],
+}
+
+/// A region checked against the image it names.
+#[derive(Clone, Copy)]
+pub struct CheckedRegion {
+    pub level: u32,
+    pub slice: u32,
+    pub origin: [u32; 3],
+    pub size: [u32; 3],
+}
+
+impl GpuImage {
+    /// The extent of one mip level, which is the base extent halved `level`
+    /// times and never below one texel.
+    pub fn level_extent(&self, level: u32) -> [u32; 3] {
+        [self.width, self.height, self.depth].map(|base| (base >> level.min(31)).max(1))
+    }
+
+    /// Check one Metal copy region against this image.
+    ///
+    /// `Err` names what is wrong, for a caller which turns it into a Metal
+    /// diagnostic. Nothing below it reaches an `ash` call: a mip level, an
+    /// array slice or an extent the image does not have is undefined
+    /// behaviour in Vulkan, and every one of them is guest-controlled.
+    pub fn region(&self, region: Region) -> Result<CheckedRegion, String> {
+        let Region {
+            level,
+            slice,
+            origin,
+            size,
+        } = region;
+        if level >= u64::from(self.levels) {
+            return Err(format!(
+                "mipmap level {level} of a texture with {} levels",
+                self.levels
+            ));
+        }
+        if slice >= u64::from(self.layers) {
+            return Err(format!(
+                "slice {slice} of a texture with {} slices",
+                self.layers
+            ));
+        }
+        let level = level as u32 + self.base_level;
+        let slice = slice + u64::from(self.base_layer);
+        // The bound is the level rounded up to whole blocks, not the level.
+        // A compressed level below one block - the 2x2 and 1x1 tail of any BC
+        // mip chain - still occupies a full 4x4 block, and both Metal and
+        // Vulkan let a copy that reaches the edge of the level cover it - Metal
+        // by naming the whole block, Vulkan by stopping at the edge. A
+        // check against the level itself refuses every BC mip tail a game
+        // uploads, which is most of its textures.
+        let (block_width, block_height) = block_extent(self.format);
+        let blocks = [block_width, block_height, 1];
+        let extent = self.level_extent(level);
+        let bound: [u32; 3] =
+            std::array::from_fn(|axis| extent[axis].next_multiple_of(blocks[axis]));
+        let mut checked = CheckedRegion {
+            level,
+            slice: slice as u32,
+            origin: [0; 3],
+            size: [1; 3],
+        };
+        for axis in 0..3 {
+            let start = origin[axis];
+            // A Metal size of zero on an axis means one texel of it, which is
+            // how a 2D copy spells its depth.
+            let span = size[axis].max(1);
+            let end = start.checked_add(span).ok_or("a region which overflows")?;
+            if end > u64::from(bound[axis]) {
+                return Err(format!(
+                    "a region ending at {end} on axis {axis}, where level {level} is {} texels \
+                     and {} with its blocks",
+                    extent[axis], bound[axis]
+                ));
+            }
+            // Vulkan covers a partial block by reaching the level's edge, not
+            // by overhanging it, so the extent stops at the level.
+            let inside = u64::from(extent[axis]).saturating_sub(start);
+            if inside == 0 {
+                return Err(format!(
+                    "a region starting at {start} on axis {axis}, past level {level}'s {} texels",
+                    extent[axis]
+                ));
+            }
+            checked.origin[axis] = start as u32;
+            checked.size[axis] = span.min(inside) as u32;
+        }
+        Ok(checked)
+    }
+
+    /// The image left behind when a drawable's own image is destroyed. It is
+    /// never bound: the texture it belongs to is unreachable by then.
+    pub fn none() -> Self {
+        Self {
+            image: vk::Image::null(),
+            memory: None,
+            heap: None,
+            placement: None,
+            view: vk::ImageView::null(),
+            format: vk::Format::UNDEFINED,
+            aspect: vk::ImageAspectFlags::COLOR,
+            width: 0,
+            height: 0,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            base_level: 0,
+            base_layer: 0,
+            usage: vk::ImageUsageFlags::empty(),
+        }
+    }
+}
+
+pub struct ImageDescription {
+    pub image_type: vk::ImageType,
+    pub view_type: vk::ImageViewType,
+    pub format: vk::Format,
+    pub width: u32,
+    pub height: u32,
+    pub depth: u32,
+    pub levels: u32,
+    pub layers: u32,
+    pub samples: u64,
+    pub usage: u64,
+    pub cube: bool,
+    /// How a shader sees the components; identity for all but alpha-only
+    /// formats, which Vulkan has no format for.
+    pub components: vk::ComponentMapping,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(width: u32, height: u32, levels: u32, layers: u32) -> GpuImage {
+        GpuImage {
+            width,
+            height,
+            levels,
+            layers,
+            ..GpuImage::none()
+        }
+    }
+
+    fn image2d(width: u32, height: u32, levels: u32) -> GpuImage {
+        image(width, height, levels, 1)
+    }
+
+    fn region(level: u64, slice: u64, origin: [u64; 3], size: [u64; 3]) -> Region {
+        Region {
+            level,
+            slice,
+            origin,
+            size,
+        }
+    }
+
+    #[test]
+    fn mirror_clamp_prefers_the_core_feature_over_the_extension() {
+        assert_eq!(mirror_clamp_support(true, true), (true, false));
+        assert_eq!(mirror_clamp_support(true, false), (true, false));
+    }
+
+    #[test]
+    fn mirror_clamp_falls_back_to_the_extension() {
+        assert_eq!(mirror_clamp_support(false, true), (false, true));
+    }
+
+    #[test]
+    fn mirror_clamp_is_unsupported_without_either_spelling() {
+        assert_eq!(mirror_clamp_support(false, false), (false, false));
+    }
+
+    #[test]
+    fn standalone_depth_and_stencil_formats_select_a_lossless_combined_format() {
+        use vk::Format as F;
+        assert_eq!(
+            combined_depth_stencil_format(F::D16_UNORM, F::S8_UINT),
+            Some(F::D16_UNORM_S8_UINT)
+        );
+        assert_eq!(
+            combined_depth_stencil_format(F::D32_SFLOAT, F::S8_UINT),
+            Some(F::D32_SFLOAT_S8_UINT)
+        );
+        assert_eq!(
+            combined_depth_stencil_format(F::D32_SFLOAT, F::R8_UINT),
+            None
+        );
+    }
+
+    #[test]
+    fn a_region_inside_its_level_is_accepted_and_narrowed() {
+        let image = image(64, 32, 4, 6);
+        let checked = image
+            .region(region(2, 5, [4, 2, 0], [8, 4, 0]))
+            .expect("inside level two");
+        assert_eq!(checked.level, 2);
+        assert_eq!(checked.slice, 5);
+        assert_eq!(checked.origin, [4, 2, 0]);
+        // A Metal size of zero on an axis is one texel of it.
+        assert_eq!(checked.size, [8, 4, 1]);
+    }
+
+    #[test]
+    fn a_region_a_texture_cannot_hold_is_refused_rather_than_truncated() {
+        let image = image(64, 32, 4, 6);
+        // Level two of a 64x32 texture is 16x8.
+        assert!(image.region(region(2, 0, [0, 0, 0], [17, 8, 1])).is_err());
+        assert!(image.region(region(4, 0, [0, 0, 0], [1, 1, 1])).is_err());
+        assert!(image.region(region(0, 6, [0, 0, 0], [1, 1, 1])).is_err());
+        assert!(image.region(region(0, 0, [60, 0, 0], [8, 1, 1])).is_err());
+        // An origin and a size which overflow rather than exceed.
+        assert!(
+            image
+                .region(region(0, 0, [u64::MAX, 0, 0], [2, 1, 1]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_compressed_mip_tail_may_cover_its_whole_block() {
+        let mut image = image(16, 16, 5, 1);
+        image.format = vk::Format::BC3_UNORM_BLOCK;
+        // Level three is 2x2 texels and level four 1x1, and a BC3 upload
+        // names the 4x4 block each of them sits in.
+        // Vulkan is handed the level's own extent, which reaches its edge.
+        for (level, texels) in [(3, 2), (4, 1)] {
+            let checked = image
+                .region(region(level, 0, [0, 0, 0], [4, 4, 1]))
+                .expect("a whole block of the mip tail");
+            assert_eq!(checked.size, [texels, texels, 1]);
+        }
+        // One block, and no further.
+        assert!(image.region(region(4, 0, [0, 0, 0], [8, 4, 1])).is_err());
+        // An uncompressed texture of the same shape is bounded by the level.
+        assert!(
+            image2d(16, 16, 5)
+                .region(region(4, 0, [0, 0, 0], [4, 4, 1]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_mip_level_is_never_narrower_than_one_texel() {
+        assert_eq!(image(8, 1, 8, 1).level_extent(7), [1, 1, 1]);
+    }
+}

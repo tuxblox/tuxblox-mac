@@ -1,0 +1,1048 @@
+use crate::sysctl::{
+    CTL_HW, CTL_KERN, HW_MACHINE, KERN_HOSTNAME, KERN_OSRELEASE, KERN_OSTYPE, KERN_VERSION,
+};
+
+#[repr(C)]
+struct Rusage {
+    utime: [i64; 2],
+    stime: [i64; 2],
+    counters: [i64; 14],
+}
+
+/// `getrusage` converts Darwin's 32-bit `tv_usec` fields and byte-valued
+/// `ru_maxrss` instead of exposing Linux's layout and KiB count.
+unsafe extern "C" fn getrusage(who: i32, out: *mut Rusage) -> i32 {
+    if out.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let mut host = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    if unsafe { libc::getrusage(who, host.as_mut_ptr()) } != 0 {
+        return -1;
+    }
+    let host = unsafe { host.assume_init() };
+    let counters = [
+        host.ru_maxrss.saturating_mul(1024),
+        host.ru_ixrss,
+        host.ru_idrss,
+        host.ru_isrss,
+        host.ru_minflt,
+        host.ru_majflt,
+        host.ru_nswap,
+        host.ru_inblock,
+        host.ru_oublock,
+        host.ru_msgsnd,
+        host.ru_msgrcv,
+        host.ru_nsignals,
+        host.ru_nvcsw,
+        host.ru_nivcsw,
+    ];
+    // The array is explicitly Darwin's fourteen `long` counters.
+    unsafe {
+        out.write(Rusage {
+            utime: [
+                host.ru_utime.tv_sec,
+                i64::from(host.ru_utime.tv_usec as i32),
+            ],
+            stime: [
+                host.ru_stime.tv_sec,
+                i64::from(host.ru_stime.tv_usec as i32),
+            ],
+            counters,
+        })
+    };
+    0
+}
+
+const PATHCONF: &[(i32, i32)] = &[
+    (1, libc::_PC_LINK_MAX),
+    (2, libc::_PC_MAX_CANON),
+    (3, libc::_PC_MAX_INPUT),
+    (4, libc::_PC_NAME_MAX),
+    (5, libc::_PC_PATH_MAX),
+    (6, libc::_PC_PIPE_BUF),
+    (7, libc::_PC_CHOWN_RESTRICTED),
+    (8, libc::_PC_NO_TRUNC),
+    (9, libc::_PC_VDISABLE),
+    (10, libc::_PC_SYMLINK_MAX),
+];
+
+fn pathconf_name(name: i32) -> Option<i32> {
+    PATHCONF.iter().find(|(d, _)| *d == name).map(|(_, h)| *h)
+}
+
+unsafe extern "C" fn pathconf(path: *const libc::c_char, name: i32) -> i64 {
+    let Some(name) = pathconf_name(name) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    // The path is the guest's; see [`crate::fs`] for why it is translated.
+    crate::stat::with_fallback(path, |path| {
+        let value = unsafe { libc::pathconf(path, name) as i64 };
+        (value, value >= 0)
+    })
+}
+
+unsafe extern "C" fn fpathconf(fd: i32, name: i32) -> i64 {
+    match pathconf_name(name) {
+        Some(name) => unsafe { libc::fpathconf(fd, name) as i64 },
+        None => {
+            crate::errno::set(libc::EINVAL);
+            -1
+        }
+    }
+}
+
+/// Darwin's `confstr` names: POSIX's `_CS_PATH`, and the per-user temporary
+/// directory launchd makes for each user.
+const CS_PATH: i32 = 1;
+const CS_DARWIN_USER_TEMP_DIR: i32 = 65537;
+
+/// `size_t confstr(int name, char *buf, size_t len)`: the length the whole
+/// value needs, NUL included, with as much as fits copied into `buf`.
+unsafe extern "C" fn confstr(name: i32, out: *mut libc::c_char, len: usize) -> usize {
+    match name {
+        CS_PATH => unsafe { libc::confstr(libc::_CS_PATH, out, len) },
+        // macOS sets `TMPDIR` from this very directory, so they agree.
+        CS_DARWIN_USER_TEMP_DIR => match crate::env::guest_value("TMPDIR") {
+            Some(dir) => {
+                let mut value = dir.into_encoded_bytes();
+                if !value.ends_with(b"/") {
+                    value.push(b'/');
+                }
+                value.push(0);
+                if len > 0 && !out.is_null() {
+                    let n = value.len().min(len);
+                    // SAFETY: the caller's buffer holds `len` bytes.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(value.as_ptr().cast(), out, n);
+                        *out.add(n - 1) = 0;
+                    }
+                }
+                value.len()
+            }
+            None => {
+                crate::errno::set(libc::EINVAL);
+                0
+            }
+        },
+        _ => {
+            crate::errno::set(libc::EINVAL);
+            0
+        }
+    }
+}
+
+/// `_SYS_NAMELEN`, the width of every field in Darwin's `struct utsname`.
+///
+/// The reason `uname` cannot be passed through on Linux: glibc's fields are 65 bytes
+/// and musl's are 65 too, so the host would write five short strings into a 1280-byte
+/// buffer at the wrong five offsets.
+pub const SYS_NAMELEN: usize = 256;
+
+/// Darwin's `struct utsname`. Five fixed-width strings, nothing else.
+#[repr(C)]
+pub struct Utsname {
+    pub sysname: [u8; SYS_NAMELEN],
+    pub nodename: [u8; SYS_NAMELEN],
+    pub release: [u8; SYS_NAMELEN],
+    pub version: [u8; SYS_NAMELEN],
+    pub machine: [u8; SYS_NAMELEN],
+}
+
+/// `int uname(struct utsname *)`.
+///
+/// Filled from this crate's own [`crate::sysctl`] rather than from the host, which is
+/// what keeps `uname -m` and `sysctl hw.machine` agreeing: both are questions about
+/// the guest, and answering them from two places is how they come to disagree.
+///
+/// # Safety
+///
+/// `out` points at a writable Darwin `struct utsname`.
+unsafe extern "C" fn uname(out: *mut Utsname) -> i32 {
+    if out.is_null() {
+        crate::errno::set(libc::EFAULT);
+        return -1;
+    }
+    let fields = [
+        (0usize, ask(&[CTL_KERN, KERN_OSTYPE])),
+        (1, ask(&[CTL_KERN, KERN_HOSTNAME])),
+        (2, ask(&[CTL_KERN, KERN_OSRELEASE])),
+        (3, ask(&[CTL_KERN, KERN_VERSION])),
+        (4, ask(&[CTL_HW, HW_MACHINE])),
+    ];
+    for (index, value) in fields {
+        // SAFETY: `out` is a writable `utsname`, whose five fields are contiguous
+        // arrays of `SYS_NAMELEN` bytes each; `index` is one of the five.
+        let field = unsafe { (out as *mut u8).add(index * SYS_NAMELEN) };
+        let bytes = value.as_bytes();
+        let n = bytes.len().min(SYS_NAMELEN - 1);
+        // SAFETY: `field` is `SYS_NAMELEN` writable bytes and `n` is at most one less.
+        unsafe {
+            std::ptr::write_bytes(field, 0, SYS_NAMELEN);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), field, n);
+        }
+    }
+    0
+}
+
+/// One `sysctl` string, or the empty string if nothing answers.
+///
+/// Goes through the exported `sysctl` rather than around it, so a guest that reads a
+/// key directly and a guest that calls `uname` cannot be told different things.
+fn ask(mib: &[i32]) -> String {
+    let Some(sysctl) = crate::sysctl::symbol("sysctl") else {
+        return String::new();
+    };
+    // SAFETY: `sysctl::symbol` returns this crate's own `sysctl`, whose prototype is
+    // the one named here.
+    let f: unsafe extern "C" fn(
+        *const libc::c_int,
+        libc::c_uint,
+        *mut libc::c_void,
+        *mut libc::size_t,
+        *mut libc::c_void,
+        libc::size_t,
+    ) -> i32 = unsafe { std::mem::transmute(sysctl as usize as *const ()) };
+
+    let mut buf = [0u8; SYS_NAMELEN];
+    let mut len: libc::size_t = buf.len();
+    // SAFETY: `mib` is live for its own length and `buf` for `len` bytes.
+    let rc = unsafe {
+        f(
+            mib.as_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || len == 0 {
+        return String::new();
+    }
+    let end = buf[..len].iter().position(|b| *b == 0).unwrap_or(len);
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+/// Darwin's `_SC_*` names, which are numbered nothing like glibc's.
+///
+/// Both platforms hand `sysconf` a small integer and neither publishes the same
+/// integer for the same question. The one that matters most is `_SC_PAGESIZE`:
+/// Darwin calls it 29, glibc calls 29 `_SC_VERSION`, and a guest asking for the
+/// page size is answered `200809`. mimalloc rounds its page-map reservation up
+/// to that "page size", asks for a mapping of the result, gets nothing, and the
+/// program dies in a static initializer with an uncaught `std::bad_alloc` - with
+/// no mention of `sysconf` anywhere in the wreckage.
+///
+/// From macOS's `<sys/unistd.h>`. Only the block this list covers contiguously,
+/// 1 through 52, plus the handful above it that programs actually ask for; a
+/// name outside it is `EINVAL` rather than a guess, because a guess here is the
+/// bug being fixed.
+mod sc {
+    pub const ARG_MAX: i32 = 1;
+    pub const CHILD_MAX: i32 = 2;
+    pub const CLK_TCK: i32 = 3;
+    pub const NGROUPS_MAX: i32 = 4;
+    pub const OPEN_MAX: i32 = 5;
+    pub const JOB_CONTROL: i32 = 6;
+    pub const SAVED_IDS: i32 = 7;
+    pub const VERSION: i32 = 8;
+    pub const BC_BASE_MAX: i32 = 9;
+    pub const BC_DIM_MAX: i32 = 10;
+    pub const BC_SCALE_MAX: i32 = 11;
+    pub const BC_STRING_MAX: i32 = 12;
+    pub const COLL_WEIGHTS_MAX: i32 = 13;
+    pub const EXPR_NEST_MAX: i32 = 14;
+    pub const LINE_MAX: i32 = 15;
+    pub const RE_DUP_MAX: i32 = 16;
+    pub const TWO_VERSION: i32 = 17;
+    pub const TWO_C_BIND: i32 = 18;
+    pub const TWO_C_DEV: i32 = 19;
+    pub const TWO_CHAR_TERM: i32 = 20;
+    pub const TWO_FORT_DEV: i32 = 21;
+    pub const TWO_FORT_RUN: i32 = 22;
+    pub const TWO_LOCALEDEF: i32 = 23;
+    pub const TWO_SW_DEV: i32 = 24;
+    pub const TWO_UPE: i32 = 25;
+    pub const STREAM_MAX: i32 = 26;
+    pub const TZNAME_MAX: i32 = 27;
+    pub const ASYNCHRONOUS_IO: i32 = 28;
+    pub const PAGESIZE: i32 = 29;
+    pub const MEMLOCK: i32 = 30;
+    pub const MEMLOCK_RANGE: i32 = 31;
+    pub const MEMORY_PROTECTION: i32 = 32;
+    pub const MESSAGE_PASSING: i32 = 33;
+    pub const PRIORITIZED_IO: i32 = 34;
+    pub const PRIORITY_SCHEDULING: i32 = 35;
+    pub const REALTIME_SIGNALS: i32 = 36;
+    pub const SEMAPHORES: i32 = 37;
+    pub const FSYNC: i32 = 38;
+    pub const SHARED_MEMORY_OBJECTS: i32 = 39;
+    pub const SYNCHRONIZED_IO: i32 = 40;
+    pub const AIO_LISTIO_MAX: i32 = 42;
+    pub const AIO_MAX: i32 = 43;
+    pub const AIO_PRIO_DELTA_MAX: i32 = 44;
+    pub const DELAYTIMER_MAX: i32 = 45;
+    pub const MQ_OPEN_MAX: i32 = 46;
+    pub const MAPPED_FILES: i32 = 47;
+    pub const RTSIG_MAX: i32 = 48;
+    pub const SEM_NSEMS_MAX: i32 = 49;
+    pub const SEM_VALUE_MAX: i32 = 50;
+    pub const SIGQUEUE_MAX: i32 = 51;
+    pub const TIMER_MAX: i32 = 52;
+    pub const IOV_MAX: i32 = 56;
+    pub const NPROCESSORS_CONF: i32 = 57;
+    pub const NPROCESSORS_ONLN: i32 = 58;
+    pub const GETGR_R_SIZE_MAX: i32 = 70;
+    pub const GETPW_R_SIZE_MAX: i32 = 71;
+    pub const HOST_NAME_MAX: i32 = 72;
+    pub const LOGIN_NAME_MAX: i32 = 73;
+    pub const THREAD_DESTRUCTOR_ITERATIONS: i32 = 85;
+    pub const THREAD_KEYS_MAX: i32 = 86;
+    pub const THREAD_STACK_MIN: i32 = 93;
+    pub const THREAD_THREADS_MAX: i32 = 94;
+    pub const TTY_NAME_MAX: i32 = 101;
+    pub const ATEXIT_MAX: i32 = 107;
+    pub const PHYS_PAGES: i32 = 200;
+}
+
+fn host_confname(name: i32) -> Option<i32> {
+    Some(match name {
+        sc::ARG_MAX => libc::_SC_ARG_MAX,
+        sc::CHILD_MAX => libc::_SC_CHILD_MAX,
+        sc::CLK_TCK => libc::_SC_CLK_TCK,
+        sc::NGROUPS_MAX => libc::_SC_NGROUPS_MAX,
+        sc::OPEN_MAX => libc::_SC_OPEN_MAX,
+        sc::JOB_CONTROL => libc::_SC_JOB_CONTROL,
+        sc::SAVED_IDS => libc::_SC_SAVED_IDS,
+        sc::VERSION => libc::_SC_VERSION,
+        sc::BC_BASE_MAX => libc::_SC_BC_BASE_MAX,
+        sc::BC_DIM_MAX => libc::_SC_BC_DIM_MAX,
+        sc::BC_SCALE_MAX => libc::_SC_BC_SCALE_MAX,
+        sc::BC_STRING_MAX => libc::_SC_BC_STRING_MAX,
+        sc::COLL_WEIGHTS_MAX => libc::_SC_COLL_WEIGHTS_MAX,
+        sc::EXPR_NEST_MAX => libc::_SC_EXPR_NEST_MAX,
+        sc::LINE_MAX => libc::_SC_LINE_MAX,
+        sc::RE_DUP_MAX => libc::_SC_RE_DUP_MAX,
+        sc::TWO_VERSION => libc::_SC_2_VERSION,
+        sc::TWO_C_BIND => libc::_SC_2_C_BIND,
+        sc::TWO_C_DEV => libc::_SC_2_C_DEV,
+        sc::TWO_CHAR_TERM => libc::_SC_2_CHAR_TERM,
+        sc::TWO_FORT_DEV => libc::_SC_2_FORT_DEV,
+        sc::TWO_FORT_RUN => libc::_SC_2_FORT_RUN,
+        sc::TWO_LOCALEDEF => libc::_SC_2_LOCALEDEF,
+        sc::TWO_SW_DEV => libc::_SC_2_SW_DEV,
+        sc::TWO_UPE => libc::_SC_2_UPE,
+        sc::STREAM_MAX => libc::_SC_STREAM_MAX,
+        sc::TZNAME_MAX => libc::_SC_TZNAME_MAX,
+        sc::ASYNCHRONOUS_IO => libc::_SC_ASYNCHRONOUS_IO,
+        sc::PAGESIZE => libc::_SC_PAGESIZE,
+        sc::MEMLOCK => libc::_SC_MEMLOCK,
+        sc::MEMLOCK_RANGE => libc::_SC_MEMLOCK_RANGE,
+        sc::MEMORY_PROTECTION => libc::_SC_MEMORY_PROTECTION,
+        sc::MESSAGE_PASSING => libc::_SC_MESSAGE_PASSING,
+        sc::PRIORITIZED_IO => libc::_SC_PRIORITIZED_IO,
+        sc::PRIORITY_SCHEDULING => libc::_SC_PRIORITY_SCHEDULING,
+        sc::REALTIME_SIGNALS => libc::_SC_REALTIME_SIGNALS,
+        sc::SEMAPHORES => libc::_SC_SEMAPHORES,
+        sc::FSYNC => libc::_SC_FSYNC,
+        sc::SHARED_MEMORY_OBJECTS => libc::_SC_SHARED_MEMORY_OBJECTS,
+        sc::SYNCHRONIZED_IO => libc::_SC_SYNCHRONIZED_IO,
+        sc::AIO_LISTIO_MAX => libc::_SC_AIO_LISTIO_MAX,
+        sc::AIO_MAX => libc::_SC_AIO_MAX,
+        sc::AIO_PRIO_DELTA_MAX => libc::_SC_AIO_PRIO_DELTA_MAX,
+        sc::DELAYTIMER_MAX => libc::_SC_DELAYTIMER_MAX,
+        sc::MQ_OPEN_MAX => libc::_SC_MQ_OPEN_MAX,
+        sc::MAPPED_FILES => libc::_SC_MAPPED_FILES,
+        sc::RTSIG_MAX => libc::_SC_RTSIG_MAX,
+        sc::SEM_NSEMS_MAX => libc::_SC_SEM_NSEMS_MAX,
+        sc::SEM_VALUE_MAX => libc::_SC_SEM_VALUE_MAX,
+        sc::SIGQUEUE_MAX => libc::_SC_SIGQUEUE_MAX,
+        sc::TIMER_MAX => libc::_SC_TIMER_MAX,
+        sc::IOV_MAX => libc::_SC_IOV_MAX,
+        sc::NPROCESSORS_CONF => libc::_SC_NPROCESSORS_CONF,
+        sc::NPROCESSORS_ONLN => libc::_SC_NPROCESSORS_ONLN,
+        sc::GETGR_R_SIZE_MAX => libc::_SC_GETGR_R_SIZE_MAX,
+        sc::GETPW_R_SIZE_MAX => libc::_SC_GETPW_R_SIZE_MAX,
+        sc::HOST_NAME_MAX => libc::_SC_HOST_NAME_MAX,
+        sc::LOGIN_NAME_MAX => libc::_SC_LOGIN_NAME_MAX,
+        sc::THREAD_DESTRUCTOR_ITERATIONS => libc::_SC_THREAD_DESTRUCTOR_ITERATIONS,
+        sc::THREAD_KEYS_MAX => libc::_SC_THREAD_KEYS_MAX,
+        sc::THREAD_STACK_MIN => libc::_SC_THREAD_STACK_MIN,
+        sc::THREAD_THREADS_MAX => libc::_SC_THREAD_THREADS_MAX,
+        sc::TTY_NAME_MAX => libc::_SC_TTY_NAME_MAX,
+        sc::ATEXIT_MAX => libc::_SC_ATEXIT_MAX,
+        sc::PHYS_PAGES => libc::_SC_PHYS_PAGES,
+        _ => return None,
+    })
+}
+
+/// `long sysconf(int name)`, with `name` translated out of Darwin's numbering.
+///
+/// Only the name is rewritten. The value is the host's own answer, because
+/// every entry above is a question about the machine this is actually running
+/// on: the page size has to be the real one or a mapping is the wrong size, and
+/// the processor count has to be the real one or a thread pool is the wrong
+/// shape.
+unsafe extern "C" fn sysconf(name: i32) -> libc::c_long {
+    let Some(host) = host_confname(name) else {
+        crate::errno::set(libc::EINVAL);
+        return -1;
+    };
+    // SAFETY: a name this host publishes; `sysconf` takes no pointer and reads a
+    // static system parameter.
+    unsafe { libc::sysconf(host) }
+}
+
+/// `int compat_mode(const char *command, const char *mode)`.
+///
+/// Darwin-only, and there is nothing on Linux to pass it through to. A command asks
+/// which of two historical behaviours it should present; `uname` asks about
+/// `"unix2003"` and prints its fields in a different order depending on the answer.
+///
+/// A modern macOS answers 1 for `unix2003` unless `COMMAND_MODE` says `legacy`, which
+/// is the rule reproduced here - `COMMAND_MODE` being the environment variable the
+/// real implementation reads.
+///
+/// The comparison is case-insensitive because the callers are: `/usr/bin/uname` asks
+/// about `"Unix2003"` with a capital U, and an exact match against the lowercase
+/// spelling answers 0 - which is a legacy `uname -a`, with a `-p` field real macOS
+/// does not print.
+unsafe extern "C" fn compat_mode(
+    _command: *const libc::c_char,
+    mode: *const libc::c_char,
+) -> libc::c_int {
+    if mode.is_null() {
+        return 0;
+    }
+    // SAFETY: the caller states `mode` is NUL-terminated.
+    let mode = unsafe { std::ffi::CStr::from_ptr(mode) };
+    let legacy = std::env::var("COMMAND_MODE").is_ok_and(|m| m.eq_ignore_ascii_case("legacy"));
+    let mode = mode.to_bytes();
+    if mode.eq_ignore_ascii_case(b"unix2003") {
+        return libc::c_int::from(!legacy);
+    }
+    libc::c_int::from(mode.eq_ignore_ascii_case(b"legacy") && legacy)
+}
+
+/// `gestaltSystemVersion`'s `0x10MB` word.
+///
+/// Gestalt.h caps each of the minor and bug-fix digits at 9 rather than the
+/// whole word - 10.3.15 is 0x1039 and 10.10.0 is 0x1090 - so a program that
+/// requires 10.5 as 0x1050 still passes on a later release. A major release past
+/// 10 has no spelling in the word; it saturates both digits, which keeps it
+/// ordered after every 10.x a program could compare it with.
+fn system_version_bcd(major: i32, minor: i32, patch: i32) -> i32 {
+    let digit = |n: i32| n.clamp(0, 9);
+    match major {
+        10 => 0x1000 | digit(minor) << 4 | digit(patch),
+        _ if major > 10 => 0x1099,
+        _ => 0x1000,
+    }
+}
+
+/// `OSErr Gestalt(OSType selector, SInt32 *response)`, the Carbon question a
+/// program still asks about the OS version.
+///
+/// Only the version selectors. Gestalt has hundreds, and every other one is
+/// about hardware this runtime is not - so an unknown selector is
+/// `gestaltUndefSelectorErr`, which is what Apple's answers for a selector the
+/// system does not implement, and a caller that checks gets told rather than
+/// handed a number about some other machine.
+///
+/// The version is [`crate::sysctl::macos_version`]'s, so this and
+/// `kern.osrelease` cannot disagree.
+///
+/// # Safety
+///
+/// `response` is null or a writable `SInt32 *`.
+unsafe extern "C" fn gestalt(selector: u32, response: *mut i32) -> i16 {
+    /// `paramErr`.
+    const PARAM_ERROR: i16 = -50;
+    /// `gestaltUndefSelectorErr`.
+    const UNDEFINED_SELECTOR: i16 = -5551;
+    /// `gestaltIntel`.
+    const GESTALT_INTEL: i32 = 10;
+
+    if response.is_null() {
+        return PARAM_ERROR;
+    }
+    let (major, minor, patch) = crate::sysctl::macos_version();
+    let value = match &selector.to_be_bytes() {
+        // Plain integers, not BCD: 10.4.17 answers 10, 4 and 17.
+        b"sys1" => major,
+        b"sys2" => minor,
+        b"sys3" => patch,
+        // `gestaltSystemVersion`, a BCD word.
+        b"sysv" => system_version_bcd(major, minor, patch),
+        // `gestaltSysArchitecture`. Only Intel has a constant; Python 2's
+        // `platform.mac_ver` fails outright when this selector does.
+        b"sysa" => match crate::sysctl::guest_arch() {
+            crate::sysctl::GuestArch::X86_64 => GESTALT_INTEL,
+            crate::sysctl::GuestArch::Arm64 => return UNDEFINED_SELECTOR,
+        },
+        _ => return UNDEFINED_SELECTOR,
+    };
+    // SAFETY: the caller states `response` is writable.
+    unsafe { *response = value };
+    0
+}
+
+/// `void dyld_get_image_versions(const struct mach_header *mh,
+/// void (^)(dyld_platform_t platform, uint32_t sdk, uint32_t minos))`
+///
+/// The block hears each platform the image was built for, with its SDK and
+/// minimum OS: one `LC_BUILD_VERSION` each, or the one `LC_VERSION_MIN_*`
+/// an older image has. A null header has nothing to read and calls nothing.
+///
+/// # Safety
+///
+/// `mh` is null or a mapped Mach-O header; `block` is a live block whose
+/// invoke is callable from here (thunked first under emulation, by the
+/// runtime's block shim).
+pub unsafe extern "C" fn dyld_get_image_versions(mh: u64, block: u64) {
+    if mh == 0 || block == 0 {
+        return;
+    }
+    // SAFETY: the caller's.
+    let versions = unsafe { image_versions(mh) };
+    // SAFETY: `invoke` is at the Block ABI's offset, and this block is
+    // `void (^)(uint32_t, uint32_t, uint32_t)`.
+    let invoke = unsafe {
+        std::mem::transmute::<u64, unsafe extern "C" fn(u64, u32, u32, u32)>(
+            ((block + crate::dispatch::block::INVOKE_OFFSET) as *const u64).read(),
+        )
+    };
+    for (platform, sdk, minos) in versions {
+        // SAFETY: guest code, entered as Darwin code.
+        unsafe { crate::call_as_darwin!(invoke(block, platform, sdk, minos)) };
+    }
+}
+
+/// `(platform, sdk, minos)` for each platform the image at `mh` names, in its
+/// load commands' order.
+///
+/// # Safety
+///
+/// `mh` is a mapped 64-bit Mach-O header with its load commands after it.
+unsafe fn image_versions(mh: u64) -> Vec<(u32, u32, u32)> {
+    use machish::spec::constants::{
+        LC_BUILD_VERSION, LC_VERSION_MIN_IPHONEOS, LC_VERSION_MIN_MACOSX, LC_VERSION_MIN_TVOS,
+        LC_VERSION_MIN_WATCHOS, MH_MAGIC_64, PLATFORM_IOS, PLATFORM_MACOS, PLATFORM_TVOS,
+        PLATFORM_WATCHOS,
+    };
+    /// `mach_header_64`'s size, and the offsets of `ncmds` and `sizeofcmds`.
+    const HEADER_SIZE: u64 = 32;
+    const NCMDS: u64 = 16;
+    const SIZEOFCMDS: u64 = 20;
+    let read = |at: u64| unsafe { (at as *const u32).read_unaligned() };
+    let mut out = Vec::new();
+    if read(mh) != MH_MAGIC_64 {
+        return out;
+    }
+    let (count, size) = (read(mh + NCMDS), u64::from(read(mh + SIZEOFCMDS)));
+    let (mut at, end) = (mh + HEADER_SIZE, mh + HEADER_SIZE + size);
+    for _ in 0..count {
+        if at + 8 > end {
+            break;
+        }
+        let (cmd, cmdsize) = (read(at), u64::from(read(at + 4)));
+        if cmdsize < 8 || at + cmdsize > end {
+            break;
+        }
+        // `build_version_command`: cmd, cmdsize, platform, minos, sdk;
+        // `version_min_command`: cmd, cmdsize, version, sdk.
+        let min_platform = match cmd {
+            LC_VERSION_MIN_MACOSX => Some(PLATFORM_MACOS),
+            LC_VERSION_MIN_IPHONEOS => Some(PLATFORM_IOS),
+            LC_VERSION_MIN_TVOS => Some(PLATFORM_TVOS),
+            LC_VERSION_MIN_WATCHOS => Some(PLATFORM_WATCHOS),
+            _ => None,
+        };
+        if cmd == LC_BUILD_VERSION && cmdsize >= 24 {
+            out.push((read(at + 8), read(at + 16), read(at + 12)));
+        } else if let Some(platform) = min_platform.filter(|_| cmdsize >= 16) {
+            out.push((platform, read(at + 12), read(at + 8)));
+        }
+        at += cmdsize;
+    }
+    out
+}
+
+/// `dyld_build_version_t`
+#[repr(C)]
+struct BuildVersion {
+    platform: u32,
+    version: u32,
+}
+
+const PLATFORM_MACOS: u32 = 1;
+
+/// A version packs as `major << 16 | minor << 8 | patch`. Entries for another
+/// platform are not about this OS and are skipped.
+///
+/// # Safety
+///
+/// `versions` is null or points at `count` readable `dyld_build_version_t`s.
+unsafe extern "C" fn availability_version_check(count: u32, versions: *const BuildVersion) -> u8 {
+    if versions.is_null() {
+        return 1;
+    }
+    let (major, minor, patch) = crate::sysctl::macos_version();
+    let running = ((major as u32) << 16) | ((minor as u32) << 8) | patch as u32;
+    // SAFETY: the caller states `versions` holds `count` entries.
+    let wanted = unsafe { std::slice::from_raw_parts(versions, count as usize) };
+    wanted
+        .iter()
+        .filter(|entry| entry.platform == PLATFORM_MACOS)
+        .all(|entry| entry.version <= running) as u8
+}
+
+/// `dyld_build_version_t.platform` for a version set: a date standing for the
+/// releases every platform shipped then.
+const VERSION_SET: u32 = 0xffff_ffff;
+
+/// Version sets, `year << 16 | month << 8 | day`, and the macOS release in
+/// each, `xxxx.yy.zz` in nibbles. Sorted; both columns increase together.
+const MACOS_VERSION_SETS: &[(u32, u32)] = &[
+    (0x07df_0901, 0x000a_0b00), // fall 2015: 10.11
+    (0x07e0_0301, 0x000a_0b04), // spring 2016: 10.11.4
+    (0x07e0_0901, 0x000a_0c00), // fall 2016: 10.12
+    (0x07e1_0301, 0x000a_0c04), // spring 2017: 10.12.4
+    (0x07e1_0901, 0x000a_0d00), // fall 2017: 10.13
+    (0x07e2_0301, 0x000a_0d04), // spring 2018: 10.13.4
+    (0x07e2_0901, 0x000a_0e00), // fall 2018: 10.14
+    (0x07e3_0301, 0x000a_0e04), // spring 2019: 10.14.4
+    (0x07e3_0901, 0x000a_0f00), // fall 2019: 10.15
+    (0x07e4_0301, 0x000a_0f04), // spring 2020: 10.15.4
+    (0x07e4_0901, 0x000b_0000), // fall 2020: 11.0
+    (0x07e5_0301, 0x000b_0300), // spring 2021: 11.3
+    (0x07e5_0901, 0x000c_0000), // fall 2021: 12.0
+    (0x07e6_0301, 0x000c_0300), // spring 2022: 12.3
+    (0x07e6_0901, 0x000d_0000), // fall 2022: 13.0
+    (0x07e7_0301, 0x000d_0300), // spring 2023: 13.3
+    (0x07e7_0901, 0x000e_0000), // fall 2023: 14.0
+    (0x07e8_0301, 0x000e_0400), // spring 2024: 14.4
+    (0x07e8_0901, 0x000f_0000), // fall 2024: 15.0
+    (0x07e9_0301, 0x000f_0400), // spring 2025: 15.4
+    (0x07e9_0901, 0x001a_0000), // fall 2025: 26.0
+];
+
+/// `bool dyld_program_sdk_at_least(dyld_build_version_t)`: whether the main
+/// program was linked against at least `version`'s SDK, which is how a library
+/// keeps old behavior for programs built before it changed.
+///
+/// The two words of the struct arrive packed in one register, platform low.
+extern "C" fn program_sdk_at_least(version: u64) -> bool {
+    let (platform, version) = (version as u32, (version >> 32) as u32);
+    let Some(sdk) = crate::images::program_sdk() else {
+        return false;
+    };
+    match platform {
+        PLATFORM_MACOS => sdk >= version,
+        VERSION_SET => sdk_at_least_set(sdk, version),
+        // A macOS program was not linked against another platform's SDK.
+        _ => false,
+    }
+}
+
+/// Whether a macOS SDK is at least a version set's release. A set not in
+/// [`MACOS_VERSION_SETS`] still lies between two that are, which settles it
+/// unless `sdk` lies between their releases too.
+fn sdk_at_least_set(sdk: u32, set: u32) -> bool {
+    let below = MACOS_VERSION_SETS.iter().rev().find(|(s, _)| *s <= set);
+    let above = MACOS_VERSION_SETS.iter().find(|(s, _)| *s >= set);
+    match (below, above) {
+        (Some(&(s, macos)), _) if s == set => sdk >= macos,
+        (_, Some(&(_, macos))) if sdk >= macos => true,
+        // FIXME (ACCURACY): otherwise a set this table does not name, and an
+        // SDK between the releases on either side of it (or past the table's
+        // end). Answered as the older SDK would be.
+        _ => false,
+    }
+}
+
+/// compiler-rt's `ConstructVersion`: the packing `dyld_build_version_t` uses,
+/// each part masked to its field.
+fn packed_version(major: u32, minor: u32, subminor: u32) -> u32 {
+    ((major & 0xffff) << 16) | ((minor & 0xff) << 8) | (subminor & 0xff)
+}
+
+/// `int32_t __isPlatformVersionAtLeast(uint32_t platform, uint32_t major,
+/// uint32_t minor, uint32_t subminor)`: what `@available` compiles to since
+/// clang 15, from compiler-rt.
+extern "C" fn is_platform_version_at_least(
+    platform: u32,
+    major: u32,
+    minor: u32,
+    subminor: u32,
+) -> i32 {
+    let wanted = [BuildVersion {
+        platform,
+        version: packed_version(major, minor, subminor),
+    }];
+    // SAFETY: a local array of one entry.
+    i32::from(unsafe { availability_version_check(1, wanted.as_ptr()) })
+}
+
+/// `int32_t __isPlatformOrVariantPlatformVersionAtLeast(uint32_t platform,
+/// uint32_t major, uint32_t minor, uint32_t subminor, uint32_t platform2,
+/// uint32_t major2, uint32_t minor2, uint32_t subminor2)`: the zippered
+/// spelling, one requirement for macOS and one for Mac Catalyst.
+#[allow(clippy::too_many_arguments)]
+extern "C" fn is_platform_or_variant_platform_version_at_least(
+    platform: u32,
+    major: u32,
+    minor: u32,
+    subminor: u32,
+    platform2: u32,
+    major2: u32,
+    minor2: u32,
+    subminor2: u32,
+) -> i32 {
+    let wanted = [
+        BuildVersion {
+            platform,
+            version: packed_version(major, minor, subminor),
+        },
+        BuildVersion {
+            platform: platform2,
+            version: packed_version(major2, minor2, subminor2),
+        },
+    ];
+    // SAFETY: a local array of two entries.
+    i32::from(unsafe { availability_version_check(2, wanted.as_ptr()) })
+}
+
+// Not the same list on both hosts: `sysconf`'s names are Darwin's already on a
+// Mac.
+/// Darwin's `NXArchInfo`.
+#[repr(C)]
+pub struct ArchInfo {
+    name: *const std::ffi::c_char,
+    cputype: i32,
+    cpusubtype: i32,
+    byteorder: u32,
+    description: *const std::ffi::c_char,
+}
+
+// SAFETY: every pointer is to a `'static` string literal.
+unsafe impl Sync for ArchInfo {}
+
+/// The architecture the guest is running as: an x86-64 guest asks, and an
+/// x86-64 Mac answers `x86_64`, `CPU_TYPE_X86_64` and `CPU_SUBTYPE_X86_64_ALL`.
+static LOCAL_ARCH: ArchInfo = ArchInfo {
+    name: c"x86_64".as_ptr(),
+    cputype: 0x0100_0007,
+    cpusubtype: 3,
+    // `NX_LittleEndian`.
+    byteorder: 1,
+    description: c"Intel x86-64".as_ptr(),
+};
+
+static X86_64_ARCH: ArchInfo = ArchInfo {
+    name: c"x86_64".as_ptr(),
+    cputype: 0x0100_0007,
+    cpusubtype: 3,
+    // `NX_LittleEndian`.
+    byteorder: 1,
+    description: c"Intel x86-64".as_ptr(),
+};
+
+static ARM64_ARCH: ArchInfo = ArchInfo {
+    name: c"arm64".as_ptr(),
+    cputype: 0x0100_000c,
+    cpusubtype: 0,
+    // `NX_LittleEndian`.
+    byteorder: 1,
+    description: c"ARM64".as_ptr(),
+};
+
+/// `const NXArchInfo *NXGetLocalArchInfo(void)`
+pub extern "C" fn nx_get_local_arch_info() -> *const ArchInfo {
+    &LOCAL_ARCH
+}
+
+/// `const NXArchInfo *NXGetArchInfoFromCpuType(cpu_type_t, cpu_subtype_t)`.
+///
+/// The runtime supports the x86-64 and arm64 guest architectures. A subtype of
+/// `CPU_SUBTYPE_MULTIPLE` requests the most general entry for a CPU type; subtype
+/// capability bits do not change the underlying architecture.
+pub extern "C" fn nx_get_arch_info_from_cpu_type(cputype: i32, cpusubtype: i32) -> *const ArchInfo {
+    let arch = match cputype {
+        0x0100_0007 => &X86_64_ARCH,
+        0x0100_000c => &ARM64_ARCH,
+        _ => return std::ptr::null(),
+    };
+    const CPU_SUBTYPE_MULTIPLE: i32 = -1;
+    const CPU_SUBTYPE_MASK: i32 = 0xff00_0000u32 as i32;
+    if cpusubtype == CPU_SUBTYPE_MULTIPLE || cpusubtype & !CPU_SUBTYPE_MASK == arch.cpusubtype {
+        arch
+    } else {
+        std::ptr::null()
+    }
+}
+
+exports::exports! {
+    functions {
+        "uname" => uname,
+        "NXGetLocalArchInfo" => nx_get_local_arch_info,
+        "NXGetArchInfoFromCpuType" => nx_get_arch_info_from_cpu_type,
+        "compat_mode" => compat_mode,
+        "Gestalt" => gestalt,
+        "_availability_version_check" => availability_version_check,
+        "__isPlatformVersionAtLeast" => is_platform_version_at_least,
+        "dyld_program_sdk_at_least" => program_sdk_at_least,
+        "dyld_get_image_versions" => dyld_get_image_versions,
+        "__isPlatformOrVariantPlatformVersionAtLeast" => is_platform_or_variant_platform_version_at_least,
+        "sysconf" => sysconf,
+        "getrusage" => getrusage,
+        "pathconf" => pathconf,
+        "fpathconf" => fpathconf,
+        "confstr" => confstr,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn libsystem_answers_dyld_get_image_versions() {
+        assert_eq!(
+            crate::symbol("_dyld_get_image_versions"),
+            Some(dyld_get_image_versions as *const () as u64)
+        );
+    }
+
+    /// A header with one `LC_BUILD_VERSION` and one `LC_VERSION_MIN_MACOSX`:
+    /// both are reported, each as (platform, sdk, minos).
+    #[test]
+    fn image_versions_reads_build_and_minimum_version_commands() {
+        let mut words: Vec<u32> = vec![0xfeed_facf, 0x0100_000c, 0, 2, 2, 24 + 16, 0, 0];
+        words.extend([0x32, 24, 1, 0x000f_0600, 0x001a_0600, 0]);
+        words.extend([0x24, 16, 0x000a_0f00, 0x000b_0000]);
+        // SAFETY: a header followed by exactly the load commands it declares.
+        let versions = unsafe { image_versions(words.as_ptr() as u64) };
+        assert_eq!(
+            versions,
+            [(1, 0x001a_0600, 0x000f_0600), (1, 0x000b_0000, 0x000a_0f00)]
+        );
+        // SAFETY: not a Mach-O header at all.
+        assert!(unsafe { image_versions([0u32; 8].as_ptr() as u64) }.is_empty());
+    }
+    use crate::sysctl::{GuestArch, lock_guest_arch};
+
+    fn field(u: &Utsname, index: usize) -> String {
+        // SAFETY: the five fields are contiguous `SYS_NAMELEN` arrays and `index` is
+        // one of the five.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                (u as *const Utsname as *const u8).add(index * SYS_NAMELEN),
+                SYS_NAMELEN,
+            )
+        };
+        let end = bytes.iter().position(|b| *b == 0).unwrap_or(SYS_NAMELEN);
+        String::from_utf8_lossy(&bytes[..end]).into_owned()
+    }
+
+    /// The component selectors are plain integers - Python 2's `platform`
+    /// formats them with `%i` - while `sysv` stays the capped BCD word.
+    #[test]
+    fn gestalt_version_components_are_decimal() {
+        let ask = |selector: &[u8; 4]| {
+            let mut out = 0;
+            // SAFETY: `out` is a writable `SInt32`.
+            assert_eq!(
+                unsafe { gestalt(u32::from_be_bytes(*selector), &mut out) },
+                0
+            );
+            out
+        };
+        let (major, minor, patch) = crate::sysctl::macos_version();
+        assert_eq!(
+            (ask(b"sys1"), ask(b"sys2"), ask(b"sys3")),
+            (major, minor, patch)
+        );
+        assert_eq!(ask(b"sysv"), system_version_bcd(major, minor, patch));
+    }
+
+    /// Each digit is capped on its own, so a program's 10.5 floor (0x1050)
+    /// passes on every later release.
+    #[test]
+    fn gestalt_system_version_caps_each_digit() {
+        assert_eq!(system_version_bcd(10, 3, 15), 0x1039);
+        assert_eq!(system_version_bcd(10, 10, 0), 0x1090);
+        assert_eq!(system_version_bcd(10, 6, 8), 0x1068);
+        assert!(system_version_bcd(26, 0, 0) >= 0x1050);
+    }
+
+    #[test]
+    fn platform_version_at_least_compares_against_the_running_macos() {
+        assert_eq!(is_platform_version_at_least(PLATFORM_MACOS, 10, 9, 0), 1);
+        assert_eq!(is_platform_version_at_least(PLATFORM_MACOS, 999, 0, 0), 0);
+        // `PLATFORM_IOS` says nothing about this system.
+        assert_eq!(is_platform_version_at_least(2, 999, 0, 0), 1);
+        // `PLATFORM_MACCATALYST`, the variant a zippered binary also names.
+        assert_eq!(
+            is_platform_or_variant_platform_version_at_least(
+                PLATFORM_MACOS,
+                10,
+                9,
+                0,
+                6,
+                999,
+                0,
+                0
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_version_set_is_compared_as_its_macos_release() {
+        // 13.4, between spring 2023 (13.3) and fall 2023 (14.0).
+        let sdk = 0x000d_0400;
+        assert!(sdk_at_least_set(sdk, 0x07e5_0301));
+        assert!(sdk_at_least_set(sdk, 0x07e7_0301));
+        assert!(!sdk_at_least_set(sdk, 0x07e7_0901));
+        // A set between two named ones, settled by an SDK newer than both.
+        assert!(sdk_at_least_set(0x001b_0200, 0x07e8_0000));
+        assert!(!sdk_at_least_set(0x000a_0e00, 0x07e8_0000));
+    }
+
+    #[test]
+    fn gestalt_names_an_intel_guest() {
+        let _arch = lock_guest_arch(GuestArch::X86_64);
+        let mut out = 0;
+        // SAFETY: `out` is a writable `SInt32`.
+        assert_eq!(
+            unsafe { gestalt(u32::from_be_bytes(*b"sysa"), &mut out) },
+            0
+        );
+        assert_eq!(out, 10);
+    }
+
+    fn called() -> Utsname {
+        // SAFETY: zero is a valid `utsname` - five empty strings.
+        let mut u: Utsname = unsafe { std::mem::zeroed() };
+        // SAFETY: `u` is a live writable `utsname`.
+        assert_eq!(unsafe { uname(&mut u) }, 0);
+        u
+    }
+
+    #[test]
+    fn the_system_is_darwin_and_the_machine_is_the_guest_s() {
+        let _held = lock_guest_arch(GuestArch::X86_64);
+        let u = called();
+        assert_eq!(field(&u, 0), "Darwin");
+        assert_eq!(field(&u, 4), "x86_64");
+        assert!(!field(&u, 2).is_empty(), "a release is reported");
+    }
+
+    /// `@available` answers against the version everything else reports, and a
+    /// platform that is not macOS does not take part.
+    #[test]
+    fn availability_check_follows_the_reported_version() {
+        let (major, minor, _) = crate::sysctl::macos_version();
+        let pack = |major: i32, minor: i32| ((major as u32) << 16) | ((minor as u32) << 8);
+        let check = |platform, version| {
+            let entry = BuildVersion { platform, version };
+            unsafe { availability_version_check(1, &entry) }
+        };
+        assert_eq!(check(PLATFORM_MACOS, pack(major, minor)), 1);
+        assert_eq!(check(PLATFORM_MACOS, pack(major, minor + 1)), 0);
+        assert_eq!(check(PLATFORM_MACOS, pack(major + 1, 0)), 0);
+        assert_eq!(check(2, pack(99, 0)), 1);
+    }
+
+    /// `uname` and a direct `sysctl` are the same question, and must not be capable
+    /// of different answers.
+    #[test]
+    fn uname_agrees_with_sysctl() {
+        let _held = lock_guest_arch(GuestArch::Arm64);
+        let u = called();
+        assert_eq!(field(&u, 4), ask(&[CTL_HW, HW_MACHINE]));
+    }
+
+    /// Every field must be NUL-terminated within its own 256 bytes, because the guest
+    /// reads each as a C string starting at a fixed offset.
+    #[test]
+    fn every_field_is_terminated_inside_its_own_width() {
+        let u = called();
+        // SAFETY: `u` is a live `utsname`, read as its own bytes.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(&u as *const Utsname as *const u8, size_of::<Utsname>())
+        };
+        for i in 0..5 {
+            let f = &bytes[i * SYS_NAMELEN..(i + 1) * SYS_NAMELEN];
+            assert!(f.contains(&0), "field {i} runs into the next");
+        }
+    }
+
+    #[test]
+    fn the_struct_is_the_width_darwin_declares() {
+        assert_eq!(size_of::<Utsname>(), 5 * 256);
+    }
+
+    /// The capitalised spelling is not a corner case - it is the one `/usr/bin/uname`
+    /// actually passes, and answering 0 to it prints a field real macOS does not.
+    #[test]
+    fn unix2003_is_in_effect_whatever_case_it_is_asked_in() {
+        let cmd = std::ffi::CString::new("bin/uname").unwrap();
+        for spelling in ["unix2003", "Unix2003", "UNIX2003"] {
+            let mode = std::ffi::CString::new(spelling).unwrap();
+            // SAFETY: both arguments are NUL-terminated and outlive the call.
+            assert_eq!(
+                unsafe { compat_mode(cmd.as_ptr(), mode.as_ptr()) },
+                1,
+                "{spelling}"
+            );
+        }
+        let legacy = std::ffi::CString::new("legacy").unwrap();
+        unsafe {
+            assert_eq!(compat_mode(cmd.as_ptr(), legacy.as_ptr()), 0);
+            assert_eq!(compat_mode(cmd.as_ptr(), std::ptr::null()), 0);
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_page_size_is_a_page_size() {
+        // SAFETY: `sysconf` takes an integer and reads a system parameter.
+        let page = unsafe { sysconf(sc::PAGESIZE) };
+        assert_eq!(page, machish::memory::host_page_size() as libc::c_long);
+        assert!(
+            page > 0 && (page as u64).is_power_of_two(),
+            "{page} is not a page size"
+        );
+    }
+
+    /// Darwin's numbering is not glibc's anywhere in the block, so a name that
+    /// happens to collide must still come back with its own answer.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn each_name_is_translated_rather_than_passed_through() {
+        // SAFETY: each is an integer argument to a parameter query.
+        unsafe {
+            assert_eq!(sysconf(sc::VERSION), libc::sysconf(libc::_SC_VERSION));
+            assert_eq!(
+                sysconf(sc::NPROCESSORS_ONLN),
+                libc::sysconf(libc::_SC_NPROCESSORS_ONLN)
+            );
+            assert!(sysconf(sc::NPROCESSORS_ONLN) >= 1);
+            assert_eq!(sysconf(sc::OPEN_MAX), libc::sysconf(libc::_SC_OPEN_MAX));
+        }
+    }
+
+    /// A name this mapping does not carry is refused rather than guessed at,
+    /// because guessing is what turned a page size into `200809`.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn an_unmapped_name_is_einval() {
+        // SAFETY: an integer argument; 9999 names nothing on either side.
+        assert_eq!(unsafe { sysconf(9999) }, -1);
+        assert_eq!(crate::errno::get(), libc::EINVAL);
+    }
+}

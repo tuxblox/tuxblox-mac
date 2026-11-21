@@ -1,0 +1,425 @@
+//! Calls to the library's own functions, which are inlined: the IR has no
+//! call. Metal forbids recursion, so every call graph inlines to an end.
+
+use super::expr::describe;
+use super::*;
+
+/// Where a `return` inside an inlined function goes.
+pub(super) struct Frame {
+    /// The function, by address: overloads share a name.
+    function: *const FunctionDef,
+    /// The result's local, for a function that returns a value.
+    result: Option<(LValue, Ty)>,
+    exit: BlockId,
+    /// A function template's type parameters, as this call binds them.
+    types: HashMap<String, Ty>,
+    values: HashMap<String, u32>,
+}
+
+/// `ty` with each template parameter in `types` replaced by its binding.
+fn substitute(
+    ty: &Ty,
+    types: &HashMap<String, Ty>,
+    values: &HashMap<String, u32>,
+    line: usize,
+) -> Result<Ty> {
+    Ok(match ty {
+        Ty::Param(name) => types.get(name).cloned().ok_or_else(|| {
+            syntax_error(
+                line,
+                format!("template parameter {name} is not deduced from the call"),
+            )
+        })?,
+        Ty::Array(element, count) => {
+            Ty::Array(Box::new(substitute(element, types, values, line)?), *count)
+        }
+        Ty::ArrayParam(element, name) => Ty::Array(
+            Box::new(substitute(element, types, values, line)?),
+            *values.get(name).ok_or_else(|| {
+                syntax_error(
+                    line,
+                    format!("array bound {name} is not deduced from the call"),
+                )
+            })?,
+        ),
+        ty => ty.clone(),
+    })
+}
+
+/// Bind the template parameters `declared` names from the type an argument
+/// has, as C++ deduces them.
+fn deduce(
+    declared: &Ty,
+    actual: &Ty,
+    types: &mut HashMap<String, Ty>,
+    values: &mut HashMap<String, u32>,
+    line: usize,
+) -> Result<()> {
+    match (declared, actual) {
+        (Ty::Param(name), actual) => match types.get(name) {
+            Some(bound) if bound != actual => Err(syntax_error(
+                line,
+                format!(
+                    "template parameter {name} is deduced as both {} and {}",
+                    describe(bound),
+                    describe(actual)
+                ),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                types.insert(name.clone(), actual.unpacked());
+                Ok(())
+            }
+        },
+        (Ty::Array(declared, _), Ty::Array(actual, _)) => {
+            deduce(declared, actual, types, values, line)
+        }
+        (Ty::ArrayParam(declared, name), Ty::Array(actual, count)) => {
+            if values.get(name).is_some_and(|bound| bound != count) {
+                return Err(syntax_error(
+                    line,
+                    format!("array bound {name} is deduced with conflicting lengths"),
+                ));
+            }
+            values.insert(name.clone(), *count);
+            deduce(declared, actual, types, values, line)
+        }
+        _ => Ok(()),
+    }
+}
+
+impl<'p> Lowerer<'_, 'p> {
+    /// Inline a library helper, selecting an exact parameter-type match.
+    pub(super) fn call_helper(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Option<Value>> {
+        let named: Vec<&'p FunctionDef> = self
+            .context
+            .program
+            .functions
+            .iter()
+            .filter(|function| function.stage.is_none() && function.name == name)
+            .collect();
+        if named.is_empty() {
+            // A helper the parser skipped fails whatever calls it.
+            if let Some(failed) = self
+                .context
+                .program
+                .failed
+                .iter()
+                .find(|failed| failed.name.as_deref() == Some(name))
+            {
+                return Err(syntax_error(
+                    line,
+                    format!("{name} could not be compiled: {}", failed.error),
+                ));
+            }
+            return Ok(None);
+        }
+        let fitting: Vec<_> = named
+            .into_iter()
+            .filter(|function| function.params.len() == args.len())
+            .collect();
+        let Some(first) = fitting.first() else {
+            return Err(syntax_error(
+                line,
+                format!("no {name} takes {} arguments", args.len()),
+            ));
+        };
+        if fitting.len() == 1 {
+            return self.inline_call(first, args, line).map(Some);
+        }
+        if fitting.iter().any(|function| {
+            function
+                .params
+                .iter()
+                .zip(&first.params)
+                .any(|(param, first)| param.indirection != first.indirection)
+        }) {
+            return Err(syntax_error(
+                line,
+                format!("{name} overloads with different parameter indirection are not supported"),
+            ));
+        }
+        // Preserve reference identity and evaluate effectful argument indices once.
+        let bindings = first
+            .params
+            .iter()
+            .zip(args)
+            .map(|(param, arg)| {
+                Ok(match param.indirection {
+                    Indirection::Value => Binding::Value(self.rvalue(arg)?),
+                    Indirection::Reference => {
+                        Binding::LValue(self.lvalue(arg)?.ok_or_else(|| {
+                            syntax_error(arg.line, "a reference argument is not in memory")
+                        })?)
+                    }
+                    Indirection::Pointer => {
+                        Binding::Pointer(self.pointer(arg)?.ok_or_else(|| {
+                            syntax_error(arg.line, "a pointer argument is not a buffer pointer")
+                        })?)
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut exact = fitting.iter().filter(|function| {
+            function
+                .params
+                .iter()
+                .zip(&bindings)
+                .all(|(param, binding)| {
+                    let (same_type, space) = match binding {
+                        Binding::Value(value) => (param.ty == value.ty, None),
+                        Binding::LValue(place) => (param.ty == place.ty(), place.space()),
+                        // Pointees compare as memory holds them, as `argument` does.
+                        Binding::Pointer(pointer) => (
+                            param.ty.in_memory() == *pointer.element(),
+                            Some(pointer.space()),
+                        ),
+                    };
+                    same_type
+                        && param
+                            .space
+                            .is_none_or(|expected| Some(address_space(expected)) == space)
+                })
+        });
+        let function = match (exact.next(), exact.next()) {
+            (Some(function), None) => *function,
+            (None, _) => {
+                return Err(syntax_error(
+                    line,
+                    format!("{name} has no exact overload; conversion ranking is not supported"),
+                ));
+            }
+            _ => {
+                return Err(syntax_error(
+                    line,
+                    format!("{name} has ambiguous overloads"),
+                ));
+            }
+        };
+        self.scopes.push(HashMap::new());
+        let prepared = bindings
+            .into_iter()
+            .enumerate()
+            .map(|(index, binding)| {
+                let name = format!(" overload_arg{index}");
+                self.bind(&name, binding);
+                Expr {
+                    kind: ExprKind::Ident(name),
+                    line,
+                }
+            })
+            .collect::<Vec<_>>();
+        let result = self.inline_call(function, &prepared, line);
+        self.scopes.pop();
+        result.map(Some)
+    }
+
+    /// Inline one call of `function`.
+    pub(super) fn inline_call(
+        &mut self,
+        function: &FunctionDef,
+        args: &[Expr],
+        line: usize,
+    ) -> Result<Value> {
+        if self
+            .frames
+            .iter()
+            .any(|frame| std::ptr::eq(frame.function, function))
+        {
+            return Err(syntax_error(
+                line,
+                format!("{} calls itself, which Metal forbids", function.name),
+            ));
+        }
+        // Arguments are evaluated in the caller's scope, before the callee's
+        // replaces it.
+        let mut scope = HashMap::new();
+        let mut types = HashMap::new();
+        let mut values = HashMap::new();
+        for (param, arg) in function.params.iter().zip(args) {
+            let binding = self.argument(param, arg, &mut types, &mut values)?;
+            scope.insert(param.name.clone(), binding);
+        }
+        for (name, scalar) in &function.value_params {
+            let value = *values.get(name).ok_or_else(|| {
+                syntax_error(
+                    line,
+                    format!("template value {name} is not deduced from the call"),
+                )
+            })?;
+            if *scalar == Scalar::INT && value > i32::MAX as u32 {
+                return Err(syntax_error(
+                    line,
+                    format!("array bound {name} does not fit in int"),
+                ));
+            }
+            scope.insert(
+                name.clone(),
+                Binding::Value(Value {
+                    op: number_operand(*scalar, Number::Int(i64::from(value))),
+                    ty: Ty::Scalar(*scalar),
+                }),
+            );
+        }
+        let exit = self.new_block("return");
+        let result = match substitute(&function.ret, &types, &values, line)? {
+            Ty::Void => None,
+            ty => Some((self.local_lvalue(&ty), ty)),
+        };
+        self.frames.push(Frame {
+            function,
+            result: result.clone(),
+            exit,
+            types,
+            values,
+        });
+        let scopes = std::mem::replace(&mut self.scopes, vec![scope]);
+        let loops = std::mem::take(&mut self.loops);
+        let lowered = self.statements(&function.body);
+        self.scopes = scopes;
+        self.loops = loops;
+        self.frames.pop();
+        lowered?;
+        // Falling off the end is a `return;`.
+        self.terminate(Terminator::Branch(exit));
+        self.switch_to(exit);
+        match result {
+            Some((lvalue, _)) => self.load(&lvalue, line),
+            None => Ok(Value {
+                op: Operand::Undef(Type::Void),
+                ty: Ty::Void,
+            }),
+        }
+    }
+
+    /// What a parameter names inside the callee.
+    fn argument(
+        &mut self,
+        param: &Param,
+        arg: &Expr,
+        types: &mut HashMap<String, Ty>,
+        values: &mut HashMap<String, u32>,
+    ) -> Result<Binding> {
+        let line = arg.line;
+        match (param.indirection, &param.ty) {
+            (Indirection::Value, Ty::Texture(_) | Ty::Sampler) => {
+                Ok(Binding::Value(self.rvalue(arg)?))
+            }
+            (Indirection::Value, declared) => {
+                let value = self.rvalue(arg)?;
+                deduce(declared, &value.ty, types, values, line)?;
+                let ty = &substitute(declared, types, values, line)?;
+                let value = self.convert(value, ty, line)?;
+                let lvalue = self.local_lvalue(ty);
+                self.store(&lvalue, value, line)?;
+                Ok(Binding::LValue(lvalue))
+            }
+            // A reference names the caller's own place.
+            (Indirection::Reference, declared) => {
+                let lvalue = self.lvalue(arg)?.ok_or_else(|| {
+                    syntax_error(
+                        line,
+                        format!("{} is passed something not in memory", param.name),
+                    )
+                })?;
+                deduce(declared, &lvalue.ty(), types, values, line)?;
+                let ty = &substitute(declared, types, values, line)?;
+                if lvalue.ty().in_memory() != ty.in_memory() {
+                    return Err(syntax_error(
+                        line,
+                        format!(
+                            "{} takes a reference to {}, not {}",
+                            param.name,
+                            describe(ty),
+                            describe(&lvalue.ty())
+                        ),
+                    ));
+                }
+                Ok(Binding::LValue(lvalue))
+            }
+            (Indirection::Pointer, declared) => {
+                let pointer = self.pointer(arg)?.ok_or_else(|| {
+                    syntax_error(
+                        line,
+                        format!("{} is passed something not a buffer pointer", param.name),
+                    )
+                })?;
+                if let Some(space) = param.space
+                    && address_space(space) != pointer.space()
+                {
+                    return Err(syntax_error(
+                        line,
+                        format!(
+                            "{} is passed a pointer into another address space",
+                            param.name
+                        ),
+                    ));
+                }
+                let element = pointer.element().unpacked();
+                deduce(declared, &element, types, values, line)?;
+                let ty = substitute(declared, types, values, line)?;
+                if ty.in_memory() != *pointer.element() {
+                    return Err(syntax_error(
+                        line,
+                        format!(
+                            "{} takes a pointer to {}, not {}",
+                            param.name,
+                            describe(&ty),
+                            describe(&element)
+                        ),
+                    ));
+                }
+                Ok(Binding::Pointer(pointer))
+            }
+        }
+    }
+
+    /// `return` inside an inlined function: store the result and leave.
+    /// `None` outside one, where the entry point's own return applies.
+    pub(super) fn inline_return(
+        &mut self,
+        value: Option<&Expr>,
+        line: usize,
+    ) -> Result<Option<()>> {
+        let Some(frame) = self.frames.last() else {
+            return Ok(None);
+        };
+        let (result, exit) = (frame.result.clone(), frame.exit);
+        match (result, value) {
+            (None, None) => {}
+            (Some((lvalue, ty)), Some(value)) => {
+                let value = self.rvalue(value)?;
+                let value = self.convert(value, &ty, line)?;
+                self.store(&lvalue, value, line)?;
+            }
+            (None, Some(_)) => {
+                return Err(syntax_error(line, "a value returned from a void function"));
+            }
+            (Some(_), None) => {
+                return Err(syntax_error(
+                    line,
+                    "no value returned from a non-void function",
+                ));
+            }
+        }
+        self.terminate(Terminator::Branch(exit));
+        self.after_jump();
+        Ok(Some(()))
+    }
+}
+
+impl Lowerer<'_, '_> {
+    /// A type the source names, with the template parameters of the function
+    /// being inlined bound.
+    pub(super) fn resolve(&self, ty: &Ty, line: usize) -> Result<Ty> {
+        match self.frames.last() {
+            Some(frame) => substitute(ty, &frame.types, &frame.values, line),
+            None => Ok(ty.clone()),
+        }
+    }
+}
