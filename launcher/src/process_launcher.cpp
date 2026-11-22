@@ -22,6 +22,7 @@
 #include "launch_paths.h"
 #include "fastflag_file.h"
 #include "mac_client.h"
+#include "session_list.h"
 #include "settings.h"
 #include "wine_shortcut_export.h"
 
@@ -459,6 +460,13 @@ LaunchOutcome ProcessLauncher::launch(LaunchTarget target, const std::string& ur
     TrackedProcess& p = processFor(target);
     if (p.isRunning()) {
         return {false, i18n::tr("already running"), "", false};
+    }
+    // A session this launcher did not start still counts: another launcher,
+    // or this one restarted, knows nothing of the client already running.
+    for (const Session& live : macSessionsIn("/proc", installDir_)) {
+        if (live.target == target && live.running) {
+            return {false, i18n::tr("already running"), "", false};
+        }
     }
     return launchMacClient(target, installDir_, p, uri, extraEnv);
 }
