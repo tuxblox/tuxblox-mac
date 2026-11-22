@@ -2,14 +2,14 @@
 
 The complete TuxBlox launcher, with the experimental macOS Player backend and the Windows Studio path inherited from TuxBlox.
 
-This repository is the launcher half of TuxBlox: Home, Sessions, Versions, FastFlags, Settings, About, the shared interface, flags, crypto, translations and assets. It deliberately does **not** contain `compat/`, the Wine-based Windows compatibility layer. The macOS Player runs natively through Rosemary; Studio keeps using the compatibility layer from an existing TuxBlox install.
+This repository holds the launcher (Home, Sessions, Versions, FastFlags, Settings, About, the shared interface, flags, crypto, translations and assets) and `compat/`, the macOS compatibility layer. That layer is a fork of [Rosemary](https://github.com/microlift/rosemary) and runs the official macOS Player natively, without Wine. The Wine-based Windows compatibility layer is **not** in this repository; Studio keeps using the one from an existing TuxBlox install.
 
 ## Status
 
 - The complete launcher UI is here: Home, Sessions, Versions, FastFlags, Settings and About.
 - The macOS Player backend is experimental and sits behind a local-only flag.
 - Studio is inherited unchanged and still uses the TuxBlox compatibility layer.
-- Builds are x86_64 for now. arm64 is not supported yet.
+- Released builds are x86_64. arm64 is a work in progress.
 
 ## Download
 
@@ -42,7 +42,7 @@ Nothing patches either client. The only file written inside the macOS bundle is 
 
 ### Player only, without TuxBlox
 
-The macOS Player does not need `compat/`. Install the launcher into its own directory (for example `~/.local/share/tuxblox-mac`), add the flag and Rosemary, and run it. Launching Studio reports that the TuxBlox compatibility layer is required; it does not download the Windows client.
+The macOS Player does not need the Windows compatibility layer. Install the launcher into its own directory (for example `~/.local/share/tuxblox-mac`), add the flag and Rosemary, and run it. Launching Studio reports that the TuxBlox compatibility layer is required; it does not download the Windows client.
 
 ### Player and Studio
 
@@ -57,8 +57,8 @@ The existing `~/.tuxblox/compat` and `~/.tuxblox/libtuxblox` are left untouched 
 ## Requirements
 
 - Linux x86_64.
-- For the Player: Rosemary at `TUXBLOX_ROSEMARY`, `<install>/compat/rosemary`, or `rosemary` on `PATH`.
-- For Studio: an existing TuxBlox install (`~/.tuxblox` by default) with `compat/` and `libtuxblox/`.
+- For the Player: Rosemary at `<install>/compat/rosemary`.
+- For Studio: an existing TuxBlox install (`~/.tuxblox` by default) with its Windows compatibility layer in `compat/` and `libtuxblox/`.
 - For the build: `git`, `make`, rootless `podman`, `rsvg-convert` (librsvg) and network access. The build container provides GTK4, libadwaita, libcurl, libarchive, OpenSSL, zlib, CMake and Ninja.
 
 ## Building
@@ -91,7 +91,15 @@ build/native/TuxBloxLauncher
 build/native/libtuxblox/
 ```
 
-`build/native` is the complete launcher directory: the binary and the interface stack it loads. The Windows compatibility layer is not built from this tree.
+`build/native` is the complete launcher directory: the binary and the interface stack it loads.
+
+The macOS compatibility layer is a separate target, built from `compat/` in this tree:
+
+```sh
+make compat
+```
+
+That writes `build/native/compat/rosemary`. It is a large Rust build and the first one takes a while. The Wine-based Windows compatibility layer Studio uses is not built from this tree.
 
 To assemble the release artifacts:
 
@@ -99,7 +107,7 @@ To assemble the release artifacts:
 APPIMAGETOOL=/path/to/appimagetool make mac-appimage
 ```
 
-Without `APPIMAGETOOL`, the target still writes the portable `.tar.zst`. Rosemary is downloaded from the pinned release if it is not already under `build/native/compat`.
+Without `APPIMAGETOOL`, the target still writes the portable `.tar.zst`. It needs the compatibility layer at `build/native/compat/rosemary`, so run `make compat` first or point `ROSEMARY` at a built one.
 
 ## Installing the Player only
 
@@ -157,10 +165,10 @@ Discord Rich Presence and server-region settings are read when a Player session 
 
 - **Studio says the compatibility layer is missing.** This is the Player-only layout. Install TuxBlox and use its directory if you want Studio.
 - **The Player closes right after opening.** Check that `lms.roblox.com` resolves normally. Some DNS filters return `0.0.0.0` for it; the macOS client cannot finish its login flow without that endpoint. `www.roblox.com` and `clientsettings.roblox.com` being reachable is not enough.
-- **The Player does not start.** Confirm that `<install>/compat/rosemary` exists and is executable, or set `TUXBLOX_ROSEMARY` to the binary.
+- **The Player does not start.** Confirm that `<install>/compat/rosemary` exists and is executable.
 
 ## Licensing
 
-TuxBlox's own code is GPLv3. The compatibility layer in TuxBlox stays LGPLv2.1, with `compat/tuxblox/` and `compat/webkitgtk/bundle/` under GPLv3; it is not part of this repository. Rosemary is a separate GPL-3.0 executable and is not linked into the launcher; its licence is in `third_party_licenses/rosemary/LICENSE`.
+TuxBlox's own code is GPLv3. `compat/` is a fork of Rosemary and is GPL-3.0; it builds to a separate executable and is not linked into the launcher. Its upstream licence is in `third_party_licenses/rosemary/LICENSE`. The Wine-based Windows compatibility layer Studio uses is not part of this repository: in the main TuxBlox repository it stays LGPLv2.1, with `compat/tuxblox/` and `compat/webkitgtk/bundle/` under GPLv3.
 
 The launcher runs the official, unmodified Roblox clients. It is not affiliated with, endorsed by, or associated with Roblox Corporation.
