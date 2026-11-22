@@ -420,9 +420,21 @@ static LaunchOutcome launchMacClient(LaunchTarget target, const std::string& ins
         env.push_back("ROSEMARY_SCREEN_REFRESH_RATE=" + std::to_string(hz));
     const std::string mode = presentationMode(flagString("FStringMetalPresentationMode"));
     if (!mode.empty()) env.push_back("ROSEMARY_METAL_PRESENTATION_MODE=" + mode);
+    // The log announcement the session census reads is a channel, so it is
+    // always on; detailed logging adds the rest, and the flag overrides both
+    // because the layer reads the list left to right.
+    std::string channels = "logfile";
+    if (settings.debugLogging) channels += ",prefix,webkit,metal,import,library";
     const std::string debugChannels = flagString("DFStringRosemaryDebug");
-    if (!debugChannels.empty()) env.push_back("ROSEMARY_DEBUG=" + debugChannels);
-    const std::string menu = menuBar(flagString("DFStringMenuBar"));
+    if (!debugChannels.empty()) channels += "," + debugChannels;
+    env.push_back("ROSEMARY_DEBUG=" + channels);
+    // Only a Wayland session has an XWayland to prefer over itself.
+    if (flagBool("DFFlagPreferXWayland") && std::getenv("WAYLAND_DISPLAY") != nullptr)
+        env.push_back("SDL_VIDEODRIVER=x11");
+    // Unset: the Player shows no menu bar, Studio keeps rosemary's.
+    std::string askedMenu = flagString("DFStringMenuBar");
+    if (askedMenu.empty() && target == LaunchTarget::Player) askedMenu = "hidden";
+    const std::string menu = menuBar(askedMenu);
     if (!menu.empty()) env.push_back("ROSEMARY_MENU=" + menu);
     env.push_back(std::string("SDL_APP_ID=net.tuxblox.TuxBlox.") +
                   (target == LaunchTarget::Studio ? "Studio" : "Player"));
@@ -449,77 +461,6 @@ LaunchOutcome ProcessLauncher::launch(LaunchTarget target, const std::string& ur
         return {false, i18n::tr("already running"), "", false};
     }
     return launchMacClient(target, installDir_, p, uri, extraEnv);
-    // The macOS repository ships the launcher, not compat/. Refuse before the
-    // Windows installer is downloaded or a missing binary is exec'd.
-    if (!compatLayerAvailable(installDir_))
-        return {false, i18n::tr("the TuxBlox compatibility layer is not installed"), "", false};
-
-    std::string exePath = resolveActiveVersionExePath(target, installDir_);
-    bool wasBootstrapInstall = false;
-    if (exePath.empty()) {
-        exePath = resolveOrBootstrapExePath(target, installDir_);
-        // resolveOrBootstrapExePath falls back to the official installer
-        // whenever resolveExePath's lnk lookup finds nothing -- detect that
-        // case the same way it does internally (no exe found via lnk), so
-        // watch_launch.cpp (Task 7) knows to register whatever version this
-        // run produces.
-        const std::string driveC = installDir_ + "/runtime/pfx/drive_c";
-        wasBootstrapInstall = !exePath.empty() && resolveExePath(target, driveC).empty();
-    }
-    if (exePath.empty()) {
-        return {false, i18n::tr("could not resolve or download the Roblox executable"), "", false};
-    }
-
-    // Applied in the child (via TrackedProcess::start's env overlay) rather
-    // than here in the parent -- see Finding 6, 2026-07-28 final review:
-    // setenv()/getenv() are not thread-safe in glibc, and this (parent)
-    // process has other threads that may call getenv() concurrently.
-    std::vector<std::string> env = launchEnvVars(installDir_, target);
-    for (const std::string& kv : flagEnvVars(installDir_)) env.push_back(kv);
-    env.insert(env.end(), extraEnv.begin(), extraEnv.end());
-
-    // Multi-instance. A launch into a prefix that already has a live Roblox
-    // process must NOT use Proton's "run" verb:
-    //
-    //  - "run" goes through init_session(update_prefix_files=True), which calls
-    //    Prefix::setup() in compat/tuxblox/src/prefix/prefix.cpp. That rewrites prefix state --
-    //    upgrade_pfx(), migrate_user_paths(), and sync_host_theme()'s direct
-    //    user.reg text writes -- underneath a live wineserver, which owns the
-    //    registry and flushes over such writes.
-    //  - "run" ends in Session::waitForPrefixDrain() in compat/tuxblox/src/launch/session.cpp, whose deadline
-    //    is held off for as long as ANY Roblox process holds the prefix
-    //    (Session::run in compat/tuxblox/src/launch/session.cpp) -- including one
-    //    belonging to a different instance.
-    //    This launch's exit would not be reported until every instance exited,
-    //    delaying its crash popup and Roblox-log capture indefinitely.
-    //
-    // "run --immediate" skips both: it is excluded from the prefix-setup gate
-    // and waits on its own process only. Same finding the Studio MCP gateway
-    // rests on -- it is used precisely while Studio is open.
-    // (It replaces the old "runinprefix" verb, still accepted as a deprecated
-    // alias by the launcher but warned about on every use.)
-    //
-    // Two launches racing from a cold prefix can both observe no holder and both
-    // use "run". prefix_lock still serialises setup_prefix(), so nothing
-    // corrupts; the only effect is that each drain-waits for the other, i.e.
-    // today's single-instance behaviour. Rare and benign.
-    // A live Player is left out of that count on purpose: the compatibility layer stands it down before the new client starts, so the drive is this launch's to set up.
-    const bool secondary = launchJoinsPrefix(target, prefixSessions(installDir_ + "/runtime/pfx"));
-    std::vector<std::string> argv = {compatBinaryPath(installDir_), "run"};
-    if (secondary) argv.push_back("--immediate");
-    if (allowRoot()) argv.push_back("--allow-root");
-    argv.push_back(exePath);
-    if (!uri.empty()) argv.push_back(uri);
-
-    const std::string logsDir = installDir_ + "/logs";
-    std::error_code ec;
-    fs::create_directories(logsDir, ec);
-    const std::string logPath = launchLogPath(installDir_, target);
-
-    if (!p.start(argv, env, logPath)) {
-        return {false, i18n::tr("failed to start Proton process"), "", false};
-    }
-    return {true, "", logPath, wasBootstrapInstall};
 }
 
 void ProcessLauncher::stop(LaunchTarget target) {

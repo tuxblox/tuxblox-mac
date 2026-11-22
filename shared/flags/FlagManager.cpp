@@ -16,7 +16,6 @@
 
 #include "FlagManager.h"
 
-#include "ca_bundle.h"
 #include "json.hpp"
 #include "tuxblox_default_flags.h"
 #include <array>
@@ -24,13 +23,13 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <unistd.h>
 #include <mutex>
 #include <optional>
 #include <sstream>
 #include <thread>
-#include <curl/curl.h>
 
 namespace tuxblox {
 
@@ -42,7 +41,6 @@ constexpr std::array<std::pair<const char*, FlagType>, 3> kTypeWords = {{
     {"Int", FlagType::Int},
 }};
 
-// Values compiled in that no source may replace, so a reader can trust what they mean.
 constexpr std::array<std::pair<const char*, const char*>, 1> kBaked = {{
     {"FStringFlagsVersion", "2.0.0"},
 }};
@@ -81,7 +79,7 @@ std::optional<FlagValue> bakedFlag(const std::string& name) {
     return std::nullopt;
 }
 
-} // namespace
+}
 
 std::optional<FlagType> flagTypeForName(const std::string& name) {
     const std::optional<FlagName> parsed = parseFlagName(name);
@@ -89,7 +87,6 @@ std::optional<FlagType> flagTypeForName(const std::string& name) {
     return parsed->type;
 }
 
-// A missing S is the refusal: only a synchronized flag is one the server may set.
 bool isLocalOnlyFlag(const std::string& name) {
     const std::optional<FlagName> parsed = parseFlagName(name);
     return !parsed.has_value() || !parsed->synchronized;
@@ -103,8 +100,6 @@ FlagTable parseFlagJson(const std::string& json, bool fromServer) {
     try {
         parsed = nlohmann::json::parse(json);
     } catch (const nlohmann::json::exception& failure) {
-        // Said out loud: a flag that was dropped and a flag that was never written look
-        // identical from the outside, and support cannot tell a user which they have.
         if (!json.empty()) {
             fprintf(stderr, "TuxBlox: ignoring flags that are not valid JSON (%s)\n", failure.what());
         }
@@ -142,11 +137,7 @@ FlagTable parseFlagJson(const std::string& json, bool fromServer) {
             if (!it->is_string()) usable = false;
             else value.text = it->get<std::string>();
         } else {
-            // is_number_integer() is false for a boolean and for 4.5, which is what keeps
-            // "true" from arriving as 1 and a fraction from being truncated.
             if (!it->is_number_integer() || it->is_boolean()) usable = false;
-            // It is also TRUE for an unsigned past int64, where get<int64_t>() wraps: a
-            // flag set large and positive would arrive as its large negative twin.
             else if (it->is_number_unsigned() &&
                      it->get<uint64_t>() > static_cast<uint64_t>(INT64_MAX)) usable = false;
             else value.integer = it->get<int64_t>();
@@ -165,78 +156,11 @@ void mergeFlagsOver(FlagTable& base, const FlagTable& higher) {
     for (const auto& entry : higher) base[entry.first] = entry.second;
 }
 
-// --- what the flags decide about a request ------------------------------
-
-namespace {
-
-bool hostEndsWith(const std::string& host, const char* suffix) {
-    const std::string tail = suffix;
-    return host.size() >= tail.size() &&
-           host.compare(host.size() - tail.size(), tail.size(), tail) == 0;
-}
-
-// The host of a URL, lowercased, or empty when there is not one to read.
-std::string hostOf(const std::string& url) {
-    const std::string::size_type scheme = url.find("://");
-    if (scheme == std::string::npos) return std::string();
-    const std::string::size_type start = scheme + 3;
-    const std::string::size_type end = url.find_first_of("/?#", start);
-    std::string host = url.substr(start, end == std::string::npos ? std::string::npos : end - start);
-    // Credentials and a port are not part of the name being matched.
-    const std::string::size_type at = host.rfind('@');
-    if (at != std::string::npos) host = host.substr(at + 1);
-    const std::string::size_type colon = host.rfind(':');
-    if (colon != std::string::npos) host = host.substr(0, colon);
-    for (char& c : host) {
-        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-    }
-    return host;
-}
-
-} // namespace
-
-HttpDestination httpDestinationFor(const std::string& url) {
-    const std::string host = hostOf(url);
-    if (hostEndsWith(host, "rbxcdn.com")) return HttpDestination::RobloxCdn;
-    // The download CDN only, not every name under tuxblox.net: the flag server and
-    // telemetry are ordinary requests and answer to the third flag.
-    if (hostEndsWith(host, "tuxblox.net") && host.compare(0, 5, "setup") == 0) {
-        return HttpDestination::TuxbloxCdn;
-    }
-    return HttpDestination::Other;
-}
-
-void applyFlaggedHttpVersion(void* curl, const std::string& url) {
-    if (curl == nullptr) return;
-    std::string asked;
-    switch (httpDestinationFor(url)) {
-        case HttpDestination::RobloxCdn: asked = flagString("FStringHttpProtocolRbxCdn"); break;
-        case HttpDestination::TuxbloxCdn: asked = flagString("FStringHttpProtocolCdn"); break;
-        case HttpDestination::Other: asked = flagString("FStringHttpProtocolOther"); break;
-    }
-    long version = 0;
-    if (asked == "1.0") version = CURL_HTTP_VERSION_1_0;
-    else if (asked == "1.1") version = CURL_HTTP_VERSION_1_1;
-    // 2TLS rather than 2: over plain HTTP, asking for 2 means a connection nothing here
-    // speaks, and every one of these URLs is https anyway.
-    else if (asked == "2") version = CURL_HTTP_VERSION_2TLS;
-    else if (asked == "3") version = CURL_HTTP_VERSION_3;
-    if (version == 0) return;
-    curl_easy_setopt(static_cast<CURL*>(curl), CURLOPT_HTTP_VERSION, version);
-}
-
-// --- reading a flag -----------------------------------------------------
-
 namespace {
 
 const char* const kConfigBase = "https://config.tuxblox.net";
-const char* const kFallbackUserAgent = "TuxBlox";
-// A flag set is a short object; anything larger is not one.
 constexpr long kMaxBody = 64 * 1024;
 
-// What the fetch thread writes and the first read collects. Shared by pointer so a fetch
-// that outran its budget can finish writing into something still alive instead of into a
-// table nobody is allowed to touch any more.
 struct Pending {
     std::mutex mutex;
     std::condition_variable done;
@@ -267,42 +191,6 @@ FlagTable defaultTable() {
     return parseFlagJson(kTuxBloxDefaultFlagsJson, false);
 }
 
-size_t writeToString(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* out = static_cast<std::string*>(userdata);
-    if (out->size() + size * nmemb > static_cast<size_t>(kMaxBody)) return 0;
-    out->append(ptr, size * nmemb);
-    return size * nmemb;
-}
-
-std::string curlFetch(const std::string& url, int timeoutSeconds, const std::string& agent) {
-    CURL* curl = curl_easy_init();
-    if (!curl) return {};
-    std::string body;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    // Not optional: the libcurl TuxBlox ships is built --without-ca-bundle on purpose,
-    // so a request that does not ask for the certificate list fails verification on
-    // every machine, forever, and fails soft with nothing said.
-    applyCaBundle(curl);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, agent.c_str());
-    // This is the one handle in the tree created on a thread spawned for it, which is
-    // the case libcurl documents NOSIGNAL for.
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, static_cast<long>(timeoutSeconds));
-    // HTTP/2 where the server offers it, by ALPN. For one small request the gain is
-    // marginal -- a TLS handshake dominates -- but it costs nothing to ask for.
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeToString);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeoutSeconds));
-    const CURLcode result = curl_easy_perform(curl);
-    long status = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
-    curl_easy_cleanup(curl);
-    if (result != CURLE_OK || status < 200 || status >= 300) return {};
-    return body;
-}
-
 std::string readFile(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     if (!file) return {};
@@ -311,10 +199,6 @@ std::string readFile(const std::string& path) {
     return buffer.str();
 }
 
-// Collects whatever the fetch produced, applies the server's answer and then the user's
-// override, and seals. Called once, by the first read; the caller holds stateMutex().
-// Flags named directly in the environment: the name is the variable, so the
-// grammar alone says which variables are flags and every other one is skipped.
 FlagTable flagsFromEnvironment() {
     FlagTable table;
     for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
@@ -366,26 +250,19 @@ void sealLocked(State& s) {
 
     if (s.pending) {
         std::unique_lock<std::mutex> lock(s.pending->mutex);
-        // On the wall clock rather than wait_for, because libstdc++ routes wait_for through pthread_cond_clockwait, which glibc only grew in 2.30.
         s.pending->done.wait_until(lock, std::chrono::system_clock::now() + std::chrono::seconds(s.timeoutSeconds),
                                    [&] { return s.pending->finished; });
         if (s.pending->finished && !s.pending->body.empty()) {
             mergeFlagsOver(s.table, parseFlagJson(s.pending->body, true));
         }
     }
-    // Last, so it wins: this file is the one a person wrote by hand. Skipped entirely
-    // when there is no install directory, rather than consulting the filesystem root.
     if (!s.installDir.empty()) {
         const std::string override = readFile(s.installDir + "/flags.json");
-        // Not logged: the file is read on every start and saying so told a reader nothing about theirs.
         if (!override.empty()) mergeFlagsOver(s.table, parseFlagJson(override, false));
     }
-    // Over even that file: a variable is set for one run, on purpose.
     mergeFlagsOver(s.table, flagsFromEnvironment());
 }
 
-// Returns a COPY, not a pointer: a pointer dereferenced after the lock is released is a
-// use-after-free the moment anything clears the table.
 std::optional<FlagValue> lookup(const std::string& name) {
     if (const std::optional<FlagValue> baked = bakedFlag(name)) return baked;
     std::lock_guard<std::mutex> lock(stateMutex());
@@ -397,7 +274,7 @@ std::optional<FlagValue> lookup(const std::string& name) {
     return it->second;
 }
 
-} // namespace
+}
 
 const char* flagArch() {
 #if defined(__aarch64__)
@@ -423,11 +300,9 @@ void resetFlags() {
 
 void initFlags(const std::string& installDir, const std::string& channel,
                bool isRecordedRelease, int timeoutSeconds,
-               FlagFetch fetch, const std::string& baseUrl, const std::string& userAgent) {
+               FlagFetch fetch, const std::string& baseUrl) {
     std::lock_guard<std::mutex> lock(stateMutex());
     State& s = state();
-    // Ignored rather than obeyed: once anything has read a flag the answer is fixed for
-    // the run, and a second init would hand the next reader a different one.
     if (s.initialised || s.sealed) {
         fprintf(stderr, "TuxBlox: flags are already loaded; this call is ignored\n");
         return;
@@ -441,28 +316,18 @@ void initFlags(const std::string& installDir, const std::string& channel,
 
     if (!isRecordedRelease) return;
 
-    // Touched on this thread so its statics are constructed before the detached fetch
-    // can reach them, and cannot be destroyed underneath it at exit.
-    (void)caBundlePath();
-
     const std::string base = baseUrl.empty() ? kConfigBase : baseUrl;
     const std::string url = base + "/v1/tuxblox/client/" + channel + "/" + flagArch() + "/flags";
     auto pending = std::make_shared<Pending>();
     s.pending = pending;
-    const std::string agent = userAgent.empty() ? kFallbackUserAgent : userAgent;
-    FlagFetch run = fetch ? fetch
-                          : FlagFetch([agent](const std::string& target, int seconds) {
-                                return curlFetch(target, seconds, agent);
-                            });
+    if (!fetch) return;
+    FlagFetch run = fetch;
 
-    // Detached rather than joined: a fetch that outran its budget must not hold up the
-    // program, and it writes into `pending`, which outlives this scope by shared_ptr.
     std::thread([pending, run, url, seconds = s.timeoutSeconds] {
         std::string body;
         try {
             body = run(url, seconds);
         } catch (...) {
-            // A failed fetch is routine: the sources below it already have an answer.
         }
         {
             std::lock_guard<std::mutex> guard(pending->mutex);
@@ -473,6 +338,24 @@ void initFlags(const std::string& installDir, const std::string& channel,
     }).detach();
 }
 
+void setFlag(const std::string& name, const FlagValue& value) {
+    const std::optional<FlagName> parsed = parseFlagName(name);
+    if (!parsed.has_value() || !parsed->dynamic) {
+        fprintf(stderr, "TuxBlox: refusing to set the flag \"%s\" at runtime: only a dynamic flag may change\n",
+                name.c_str());
+        abort();
+    }
+    if (parsed->type != value.type) {
+        fprintf(stderr, "TuxBlox: refusing to set the flag \"%s\" at runtime: its value contradicts its name\n",
+                name.c_str());
+        abort();
+    }
+    std::lock_guard<std::mutex> lock(stateMutex());
+    State& s = state();
+    if (s.table.empty() && !s.sealed) s.table = defaultTable();
+    s.table[name] = value;
+}
+
 bool flagBool(const std::string& name) {
     const std::optional<FlagValue> value = lookup(name);
     return value && value->type == FlagType::Bool && value->boolean;
@@ -480,7 +363,6 @@ bool flagBool(const std::string& name) {
 
 bool flagBoolOffline(const std::string& installDir, const std::string& name) {
     FlagTable table = defaultTable();
-    // Skipped on an empty directory rather than read from the filesystem root.
     if (!installDir.empty()) {
         mergeFlagsOver(table, parseFlagJson(readFile(installDir + "/flags.json"), false));
     }
@@ -498,4 +380,4 @@ std::string flagString(const std::string& name) {
     return value && value->type == FlagType::String ? value->text : std::string();
 }
 
-} // namespace tuxblox
+}

@@ -70,8 +70,7 @@ EnsureResult ensureCurrent(const std::string& installDir, const std::string& cha
 // client update replaces the file. Returns an error string, empty on success.
 std::string writeAppSettings(const Build& build, const std::string& settingsJson);
 
-// Where the Rosemary executable is. TUXBLOX_ROSEMARY wins, then the copy
-// in this install's compat folder, then "rosemary" on PATH.
+// Where the Rosemary executable is, in this install's compat folder.
 std::string resolveRosemary(const std::string& installDir);
 
 // "run <executable>" plus "-protocolString <link>" when a deep link was

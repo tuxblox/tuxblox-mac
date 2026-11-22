@@ -17,6 +17,7 @@
 #include "mac_client.h"
 
 #include "checksum.h"
+#include "install_paths.h"
 #include "downloader.h"
 #include "mac_signature.h"
 #include "roblox_deploy.h"
@@ -337,14 +338,7 @@ std::string writeAppSettings(const Build& build, const std::string& settingsJson
 }
 
 std::string resolveRosemary(const std::string& installDir) {
-    if (const char* env = std::getenv("TUXBLOX_ROSEMARY"))
-        if (*env != '\0') return env;
-    const fs::path beside = fs::path(installDir) / "compat" / "rosemary";
-    std::error_code ec;
-    if (fs::is_regular_file(beside, ec) &&
-        (fs::status(beside, ec).permissions() & fs::perms::owner_exec) != fs::perms::none)
-        return beside.string();
-    return "rosemary";
+    return compatDirUnder(installDir) + "/rosemary";
 }
 
 std::vector<std::string> clientLaunchArgs(const std::string& executable,

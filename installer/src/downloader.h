@@ -22,6 +22,17 @@
 
 namespace tuxblox {
 
+enum class HttpDestination {
+    RobloxCdn,
+    TuxbloxCdn,
+    Other,
+};
+
+HttpDestination httpDestinationFor(const std::string& url);
+
+void applyFlaggedHttpVersion(void* curl, const std::string& url);
+
+
 enum class DownloadResult {
     Ok,
     Cancelled,

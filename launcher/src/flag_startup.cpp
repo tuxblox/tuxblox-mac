@@ -16,16 +16,54 @@
 
 #include "flag_startup.h"
 #include "FlagManager.h"
+#include "ca_bundle.h"
 #include "release_stamp.h"
 #include "version.h"
 #include <algorithm>
 #include <cstdint>
 #include "roblox_config.h"
 #include "user_agent.h"
+#include <curl/curl.h>
 #include <filesystem>
 #include <system_error>
 
 namespace tuxblox {
+
+namespace {
+
+constexpr long kMaxFlagBody = 64 * 1024;
+
+size_t writeToString(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    if (out->size() + size * nmemb > static_cast<size_t>(kMaxFlagBody)) return 0;
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+std::string curlFetch(const std::string& url, int timeoutSeconds, const std::string& agent) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return {};
+    std::string body;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    applyCaBundle(curl);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, agent.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, static_cast<long>(timeoutSeconds));
+    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeToString);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeoutSeconds));
+    const CURLcode result = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    curl_easy_cleanup(curl);
+    if (result != CURLE_OK || status < 200 || status >= 300) return {};
+    return body;
+}
+
+}
+
 
 namespace {
 
@@ -104,9 +142,14 @@ const LauncherFlags& launcherFlags() {
 
 void initLauncherFlags(const std::string& installDir) {
     const Settings settings = loadSettings(installDir);
+    (void)caBundlePath();
+    const std::string agent = userAgent();
     initFlags(installDir, flagChannelFor(settings, settingsFilePresent(installDir), releaseChannel()),
-              !releaseChannel().empty(),
-              kFlagFetchSeconds, {}, configBaseUrl(), userAgent());
+              !releaseChannel().empty(), kFlagFetchSeconds,
+              [agent](const std::string& url, int seconds) {
+                  return curlFetch(url, seconds, agent);
+              },
+              configBaseUrl());
 }
 
 } // namespace tuxblox

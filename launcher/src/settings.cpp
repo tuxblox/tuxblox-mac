@@ -247,9 +247,6 @@ std::vector<std::string> launchEnvPairs(const Settings& settings) {
         pairs.push_back("TUXBLOX_VIRTUAL_DESKTOP=1");
     }
 
-    // Only the non-default is emitted, as with haptics above. The layer reads
-    // this and turns on the diagnostics it otherwise keeps silenced, all of
-    // which cost frame time.
     if (settings.debugLogging) {
         pairs.push_back("TUXBLOX_DEBUG=1");
     }

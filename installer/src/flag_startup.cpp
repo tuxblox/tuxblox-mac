@@ -28,7 +28,7 @@ constexpr int kFlagFetchSeconds = 5;
 
 void initInstallerFlagsFor(const std::string& installDir, const std::string& channel,
                            bool published, FlagFetch fetch) {
-    initFlags(installDir, channel, published, kFlagFetchSeconds, std::move(fetch), {}, userAgent());
+    initFlags(installDir, channel, published, kFlagFetchSeconds, std::move(fetch), {});
 }
 
 void initInstallerFlags(const std::string& installDir, const std::string& channel,

@@ -16,6 +16,7 @@
 
 #include "roblox_http.h"
 #include "FlagManager.h"
+#include "downloader.h"
 #include "user_agent.h"
 
 #include "ca_bundle.h"

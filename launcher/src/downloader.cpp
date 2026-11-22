@@ -25,6 +25,58 @@ namespace tuxblox {
 
 namespace {
 
+bool hostEndsWith(const std::string& host, const char* suffix) {
+    const std::string tail = suffix;
+    return host.size() >= tail.size() &&
+           host.compare(host.size() - tail.size(), tail.size(), tail) == 0;
+}
+
+std::string hostOf(const std::string& url) {
+    const std::string::size_type scheme = url.find("://");
+    if (scheme == std::string::npos) return std::string();
+    const std::string::size_type start = scheme + 3;
+    const std::string::size_type end = url.find_first_of("/?#", start);
+    std::string host = url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    const std::string::size_type at = host.rfind('@');
+    if (at != std::string::npos) host = host.substr(at + 1);
+    const std::string::size_type colon = host.rfind(':');
+    if (colon != std::string::npos) host = host.substr(0, colon);
+    for (char& c : host) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return host;
+}
+
+}
+
+HttpDestination httpDestinationFor(const std::string& url) {
+    const std::string host = hostOf(url);
+    if (hostEndsWith(host, "rbxcdn.com")) return HttpDestination::RobloxCdn;
+    if (hostEndsWith(host, "tuxblox.net") && host.compare(0, 5, "setup") == 0) {
+        return HttpDestination::TuxbloxCdn;
+    }
+    return HttpDestination::Other;
+}
+
+void applyFlaggedHttpVersion(void* curl, const std::string& url) {
+    if (curl == nullptr) return;
+    std::string asked;
+    switch (httpDestinationFor(url)) {
+        case HttpDestination::RobloxCdn: asked = flagString("FStringHttpProtocolRbxCdn"); break;
+        case HttpDestination::TuxbloxCdn: asked = flagString("FStringHttpProtocolCdn"); break;
+        case HttpDestination::Other: asked = flagString("FStringHttpProtocolOther"); break;
+    }
+    long version = 0;
+    if (asked == "1.0") version = CURL_HTTP_VERSION_1_0;
+    else if (asked == "1.1") version = CURL_HTTP_VERSION_1_1;
+    else if (asked == "2") version = CURL_HTTP_VERSION_2TLS;
+    else if (asked == "3") version = CURL_HTTP_VERSION_3;
+    if (version == 0) return;
+    curl_easy_setopt(static_cast<CURL*>(curl), CURLOPT_HTTP_VERSION, version);
+}
+
+namespace {
+
 struct WriteContext {
     FILE* file = nullptr;
 };
