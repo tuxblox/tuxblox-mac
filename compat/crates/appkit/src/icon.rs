@@ -2,6 +2,9 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::raster::Bitmap;
 
+/// Wider than this and the icon outgrows an X11 property.
+const WINDOW_LIMIT: u32 = 128;
+
 /// What `-setApplicationIconImage:` last set, which wins over the bundle's.
 static REPLACEMENT: Mutex<Option<Bitmap>> = Mutex::new(None);
 
@@ -40,6 +43,7 @@ pub fn apply(window: sdl3::Window) {
     let Some(icon) = replacement.as_ref().or_else(|| bundled()) else {
         return;
     };
+    let icon = crate::raster::shrink(icon.clone(), WINDOW_LIMIT);
     sdl3::video::set_window_icon(window, icon.width as i32, icon.height as i32, &icon.pixels);
 }
 

@@ -457,33 +457,7 @@ fn icon_pixels(image: Id) -> Option<crate::raster::Bitmap> {
         true => None,
     }
     .or_else(crate::icon::current)?;
-    Some(shrink(bitmap, ICON_LIMIT))
-}
-
-/// Box-filter `bitmap` down until it fits in `limit` pixels.
-fn shrink(bitmap: crate::raster::Bitmap, limit: u32) -> crate::raster::Bitmap {
-    let mut b = bitmap;
-    while b.width > limit && b.height > limit && b.width % 2 == 0 && b.height % 2 == 0 {
-        let (w, h) = (b.width / 2, b.height / 2);
-        let mut out = vec![0u8; (w * h * 4) as usize];
-        for y in 0..h {
-            for x in 0..w {
-                for c in 0..4 {
-                    let at = |dx: u32, dy: u32| {
-                        b.pixels[(((y * 2 + dy) * b.width + x * 2 + dx) * 4 + c) as usize] as u32
-                    };
-                    out[((y * w + x) * 4 + c) as usize] =
-                        ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1)) / 4) as u8;
-                }
-            }
-        }
-        b = crate::raster::Bitmap {
-            width: w,
-            height: h,
-            pixels: out,
-        };
-    }
-    b
+    Some(crate::raster::shrink(bitmap, ICON_LIMIT))
 }
 
 /// Fill `menu` from an `NSMenu`, recording what each entry stands for.
