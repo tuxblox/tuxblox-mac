@@ -25,6 +25,8 @@
 #include "process_name.h"
 #include "roblox_autoupdate.h"
 #include "roblox_log_capture.h"
+#include "mac_client.h"
+#include "session_list.h"
 #include "settings.h"
 #include "server_region.h"
 #include "system_info.h"
@@ -32,11 +34,43 @@
 #include "fastflag_file.h"
 #include "versions_manifest.h"
 #include "wine_shortcut_export.h"
+#include <chrono>
+#include <csignal>
 #include <ctime>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
 #include <optional>
 #include <vector>
 
 namespace tuxblox {
+
+// The guest's own helpers outlive the client: `opend` and the menu bar are
+// reparented away from it, so they keep the tray icon and their windows after
+// the client is gone. The prefix's server owns them, so ending it ends the
+// session. Only when nothing is left, because both clients share one prefix.
+void flushPrefixSession(const std::string& installDir) {
+    if (!macSessionsIn("/proc", installDir).empty()) return;
+    const std::string rosemary = macclient::resolveRosemary(installDir);
+    const std::string prefix = installDir + "/runtime/prefix";
+    pid_t pid = fork();
+    if (pid < 0) return;
+    if (pid == 0) {
+        // In the child, single-threaded: setenv() is not safe beside the
+        // launcher's own threads.
+        setenv("ROSEMARY_PREFIX", prefix.c_str(), 1);
+        execl(rosemary.c_str(), rosemary.c_str(), "server", "--stop",
+              static_cast<char*>(nullptr));
+        _exit(127);
+    }
+    // Bounded, so a wedged server cannot hold the session watcher open.
+    for (int waited = 0; waited < 3000; waited += 20) {
+        if (waitpid(pid, nullptr, WNOHANG) == pid) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    kill(pid, SIGKILL);
+    waitpid(pid, nullptr, 0);
+}
 
 // The tail, not the whole file, because a long session writes a log that no clipboard is going to carry and nobody is going to paste.
 constexpr long kMaxLogCopyBytes = 4 * 1024 * 1024;
@@ -74,6 +108,8 @@ int runWatchAndLaunch(const std::string& installDir, LaunchTarget target, const 
         std::string message = i18n::trf("A TuxBlox process has exited with a non-zero exit code.\n{0}",
                                         {outcome.errorMessage});
         showErrorMessageBox(i18n::tr("TuxBlox Error"), message);
+
+
         return 1;
     }
 
@@ -87,6 +123,7 @@ int runWatchAndLaunch(const std::string& installDir, LaunchTarget target, const 
                     presenceLog);
 
     auto ev = launcher.takeExitEvent(target);
+    flushPrefixSession(installDir);
 
     // Everything that was copied is in our log now, so the file it came from is not left behind as a second log for the same session.
     const std::vector<std::string> appendedLogs =
