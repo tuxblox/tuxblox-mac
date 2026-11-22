@@ -545,16 +545,30 @@ struct Installed {
 /// # Safety
 ///
 /// `view` must be null or an object this runtime allocated.
-unsafe fn installed_in(view: Id, key: bool, first: Id, out: &mut Vec<Installed>) {
+unsafe fn installed_in(
+    view: Id,
+    key: bool,
+    first: Id,
+    out: &mut Vec<Installed>,
+    hidden_above: bool,
+) {
     if view.is_null() {
         return;
     }
-    let hidden = crate::view::is_hidden_or_has_hidden_ancestor(view);
-    let point = unsafe { crate::view::pointer_in(view) };
+    // Hiding is inherited, so one flag per view replaces an ancestor walk.
+    let hidden = hidden_above || crate::view::is_hidden_self(view);
+    // Most views carry no area; asking where the pointer is costs a class
+    // lookup per view, so it waits until an area needs the answer.
+    let mut point = None;
+    let mut looked = false;
     for area in unsafe { crate::view::tracking_areas_of(view) } {
         let Some(tracked) = area_of(area) else {
             continue;
         };
+        if !looked {
+            point = unsafe { crate::view::pointer_in(view) };
+            looked = true;
+        }
         let rect = match tracked.options & tracking::IN_VISIBLE_RECT != 0 {
             true => crate::view::bounds_of(view),
             false => tracked.rect,
@@ -567,7 +581,7 @@ unsafe fn installed_in(view: Id, key: bool, first: Id, out: &mut Vec<Installed>)
     }
     for child in unsafe { crate::view::children(view) } {
         // SAFETY: an object this runtime allocated.
-        unsafe { installed_in(child, key, first, out) };
+        unsafe { installed_in(child, key, first, out, hidden) };
     }
 }
 
@@ -587,7 +601,9 @@ fn installed(window: Id) -> Vec<Installed> {
     };
     let mut out = Vec::new();
     // SAFETY: null or the content view, which this crate made.
-    unsafe { installed_in(crate::window::content_view_of(window), key, first, &mut out) };
+    let root = crate::window::content_view_of(window);
+    let hidden = crate::view::is_hidden_or_has_hidden_ancestor(root);
+    unsafe { installed_in(root, key, first, &mut out, hidden) };
     out.reverse();
     out
 }

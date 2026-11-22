@@ -3495,6 +3495,11 @@ unsafe extern "C" fn is_hidden_or_has_hidden_ancestor_method(receiver: Id, _sel:
     u8::from(is_hidden_or_has_hidden_ancestor(receiver))
 }
 
+/// Whether `view` itself is hidden, without walking above it.
+pub(crate) fn is_hidden_self(view: Id) -> bool {
+    is_view(view) && view_of(view).hidden != 0
+}
+
 /// Whether `view` or any view above it is hidden, which is what decides
 /// whether it is drawn or presented at all.
 pub fn is_hidden_or_has_hidden_ancestor(view: Id) -> bool {
