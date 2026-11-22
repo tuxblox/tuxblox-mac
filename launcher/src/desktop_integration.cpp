@@ -481,10 +481,12 @@ void ensureDesktopIntegration(const std::string& launcherExePath, const std::str
         if (!std::getenv("TUXBLOX_SKIP_XDG_MIME")) { // escape hatch for sandboxed test/CI runs
             // Read off the virtual drive rather than versions.json, so a stale file cannot make an installed Roblox look missing.
             const VersionsManifest versions = loadInstalledVersions(installDir);
-            const bool macPlayer = macclient::hasInstalledClient(installDir);
-            const std::vector<std::string> wanted =
-                schemesToClaim(!versions.player.installed.empty() || macPlayer,
-                               !versions.studio.installed.empty());
+            const bool player = !versions.player.installed.empty() ||
+                                macclient::hasInstalledClient(installDir);
+            const bool studio =
+                !versions.studio.installed.empty() ||
+                macclient::hasInstalledClient(installDir, LaunchTarget::Studio);
+            const std::vector<std::string> wanted = schemesToClaim(player, studio);
             for (const auto& h : installedHandlers()) {
                 for (const char* scheme : h.schemes) {
                     if (std::find(wanted.begin(), wanted.end(), scheme) == wanted.end()) continue;
@@ -494,7 +496,7 @@ void ensureDesktopIntegration(const std::string& launcherExePath, const std::str
 
             // Before claiming the file types: the types have to exist in the database before anything can be made their default.
             runCommandBestEffort({"update-mime-database", std::string(home) + "/.local/share/mime"});
-            if (shouldClaimPlaceFiles(!versions.studio.installed.empty())) {
+            if (shouldClaimPlaceFiles(studio)) {
                 for (const char* mimeType : placeFileMimeTypes()) {
                     claimDefaultIfFree(mimeType, "tuxblox-studio-place.desktop");
                 }
