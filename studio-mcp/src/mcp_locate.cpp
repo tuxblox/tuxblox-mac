@@ -21,6 +21,7 @@
 #include "lnk_resolver.h"
 
 #include <filesystem>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -29,9 +30,48 @@ namespace {
 
 const char* kMcpExeName = "StudioMCP.exe";
 
+const char* kMacMcpName = "StudioMCP";
+
+// The build the macOS client's current marker names, whose first line is the
+// "version-<hash>" directory beside it.
+std::string macStudioMcp(const std::string& installDir) {
+    const fs::path root = fs::path(installDir) / "runtime" / "studio";
+    std::error_code ec;
+    std::ifstream marker(root / "current");
+    std::string upload;
+    if (std::getline(marker, upload) && !upload.empty()) {
+        const fs::path candidate =
+            root / upload / "RobloxStudio.app" / "Contents" / "MacOS" / kMacMcpName;
+        if (fs::exists(candidate, ec) && !ec) return candidate.string();
+    }
+    // No marker, or it names a build that is gone: take the newest that is there.
+    std::string newest;
+    fs::file_time_type newestTime{};
+    fs::directory_iterator it(root, ec);
+    if (ec) return "";
+    for (const auto& entry : it) {
+        const fs::path candidate =
+            entry.path() / "RobloxStudio.app" / "Contents" / "MacOS" / kMacMcpName;
+        std::error_code itemEc;
+        if (!fs::exists(candidate, itemEc) || itemEc) continue;
+        const auto written = fs::last_write_time(candidate, itemEc);
+        if (itemEc) continue;
+        if (newest.empty() || written > newestTime) {
+            newest = candidate.string();
+            newestTime = written;
+        }
+    }
+    return newest;
+}
+
 } // namespace
 
 std::string findStudioMcp(const std::string& installDir) {
+    // The macOS client runs through the compatibility layer, so its helper is
+    // what a running Studio answers on; the Windows one is the older path.
+    const std::string mac = macStudioMcp(installDir);
+    if (!mac.empty()) return mac;
+
     const std::string driveC = installDir + "/runtime/pfx/drive_c";
 
     std::string studioExe = resolveActiveVersionExePath(LaunchTarget::Studio, installDir);
