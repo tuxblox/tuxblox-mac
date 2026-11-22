@@ -613,18 +613,31 @@ pub(crate) fn native_scene_tiled_candidate(view: Id, width: u32, height: u32) ->
 }
 
 fn tiled_view_eligible(view: Id, layer: Id, source: &Store, width: u32, height: u32) -> bool {
-    source.width == width
-        && source.height == height
-        && !source.known_translucent()
-        && !crate::coreanimation::has_tree(layer)
-        && !crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time())
-        // Both CPU and DMA-BUF overlays require the established blended
-        // contiguous path; banded sources have no mixed-DMA stage/fallback.
-        && !OVERLAYS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .any(|(id, _)| *id == view as usize)
+    let overlaid = OVERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|(id, _)| *id == view as usize);
+    // Both CPU and DMA-BUF overlays require the established blended
+    // contiguous path; banded sources have no mixed-DMA stage/fallback.
+    let why = if source.width != width || source.height != height {
+        "size differs from the scene"
+    } else if source.known_translucent() {
+        "the store is known translucent"
+    } else if crate::coreanimation::has_tree(layer) {
+        "the layer has a sublayer tree"
+    } else if crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time())
+    {
+        "the content is animating"
+    } else if overlaid {
+        "the view carries an overlay"
+    } else {
+        return true;
+    };
+    if crate::window::tracing() {
+        crate::window::trace(format_args!("no tiled path for {view:p}: {why}"));
+    }
+    false
 }
 
 /// Publication path for large plain opaque NSView backing stores. The scene
@@ -723,6 +736,25 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
                 })
             });
             if !opaque {
+                if crate::window::tracing() {
+                    let (mut seen, mut clear) = (0u64, 0u64);
+                    for r in &regions {
+                        for row in r.y..r.y + r.height {
+                            let offset = ((row as usize) * width as usize + r.x as usize) * 4;
+                            for pixel in source.pixels[offset..offset + r.width as usize * 4]
+                                .as_chunks::<4>()
+                                .0
+                            {
+                                seen += 1;
+                                clear += u64::from(pixel[3] != 255);
+                            }
+                        }
+                    }
+                    crate::window::trace(format_args!(
+                        "translucent layer {layer:p} gives up the tiled path: {clear}/{seen}                          pixels not opaque in {} region(s)",
+                        regions.len()
+                    ));
+                }
                 source.found_translucent();
                 cache.remove(&key);
                 return None;
@@ -2110,6 +2142,9 @@ pub fn pump() {
             continue;
         }
         if let Some((width, height)) = sdl3::video::window_size_in_pixels(sdl) {
+            crate::window::trace(format_args!(
+                "gpu admission damages the whole of {sdl:p}: {width}x{height}"
+            ));
             damage(
                 sdl,
                 Rect {

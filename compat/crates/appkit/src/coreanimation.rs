@@ -2604,8 +2604,44 @@ fn draw_contents(
     });
 }
 
+/// Counts for the composite report: calls, pixels, widest area, last report.
+static COMPOSITE_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPOSITE_PIXELS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPOSITE_WIDEST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static COMPOSITE_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Report how much area the software compositor covered, once a second.
+fn note_composite(area: Rect) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let pixels = (area.width.max(0) as u64) * (area.height.max(0) as u64);
+    COMPOSITE_CALLS.fetch_add(1, Relaxed);
+    COMPOSITE_PIXELS.fetch_add(pixels, Relaxed);
+    COMPOSITE_WIDEST.fetch_max(pixels, Relaxed);
+    let mut at = COMPOSITE_AT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    let due = match *at {
+        Some(then) => now.duration_since(then).as_secs_f64() >= 1.0,
+        None => {
+            *at = Some(now);
+            false
+        }
+    };
+    if !due {
+        return;
+    }
+    let seconds = now.duration_since(at.replace(now).unwrap_or(now)).as_secs_f64();
+    let calls = COMPOSITE_CALLS.swap(0, Relaxed);
+    let total = COMPOSITE_PIXELS.swap(0, Relaxed);
+    let widest = COMPOSITE_WIDEST.swap(0, Relaxed);
+    crate::window::trace(format_args!(
+        "composite {calls} calls, {:.1} Mpx/s, widest {widest} px, over {seconds:.2}s",
+        total as f64 / seconds / 1.0e6
+    ));
+}
+
 /// Draw a pixel-aligned BGRA source at native scale, clipping to `area`.
 fn composite_identity_bgra(store: &mut Store, source: &Source<'_>, area: Rect, x: i64, y: i64) {
+    note_composite(area);
     for row in area.y..area.y + area.height {
         let from = (row - y) as usize * source.stride + (area.x - x) as usize * 4;
         let length = area.width as usize * 4;
