@@ -58,9 +58,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Either layer will do: a macOS-only install has rosemary and no Windows
+    // layer, and Studio runs through whichever one is there.
     const std::string compat = compatBinaryPath(dir);
+    const std::string rosemary = (fs::path(dir) / "compat" / "rosemary").string();
     std::error_code ec;
-    if (!fs::exists(compat, ec) || ec) {
+    if ((!fs::exists(compat, ec) || ec) && !fs::exists(rosemary, ec)) {
         fprintf(stderr, "TuxBlox: the compatibility layer is missing from %s.\n"
                         "Open TuxBlox once to finish installing it.\n",
                 dir.c_str());
