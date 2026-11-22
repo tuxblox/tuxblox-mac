@@ -27,8 +27,12 @@ void exportPrefixShortcuts(const std::string& installDir, const std::string& lau
 void exportPrefixShortcutsTo(const std::string& installDir, const std::string& launcherExePath,
                              const std::string& appsDir, const std::string& iconsDir);
 
-// The icon a client puts on the desktop when it is first installed. Written through the virtual drive's own Desktop folder, which Wine points at the real one. It carries X-TuxBlox-Generated so it can be taken away again: the file is named the way a Roblox shortcut would be, and nothing else could tell it apart from one somebody wrote themselves.
-std::string clientDesktopEntry(LaunchTarget target, const std::string& launcherExePath, bool haveIcon);
+// The icon a client puts on the desktop when it is first installed. Written to the real desktop for a macOS client, and for a Windows one through the virtual drive's own Desktop folder, which Wine points at the real one. It carries X-TuxBlox-Generated so it can be taken away again: the file is named the way a Roblox shortcut would be, and nothing else could tell it apart from one somebody wrote themselves.
+std::string clientDesktopEntry(LaunchTarget target, const std::string& launcherExePath, bool haveIcon,
+                               bool macClient);
+
+// Rewrites the icons above that are still on the desktop, so an install that changed path or moved to the macOS client stops starting the old one. Only a file carrying the mark, and never one that has been deleted. Returns how many were rewritten.
+int refreshClientDesktopShortcuts(const std::string& installDir, const std::string& launcherExePath);
 
 // Puts that icon on the desktop for the client just installed. Does nothing if the folder is not there. False means nothing was written.
 bool writeClientDesktopShortcut(const std::string& installDir, const std::string& launcherExePath,

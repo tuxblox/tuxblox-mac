@@ -424,8 +424,46 @@ std::string builtinEntry(const ExportTarget& target, const std::string& launcher
 // The line that says TuxBlox wrote this file, and the only thing that authorises removing it.
 const char GeneratedMarker[] = "X-TuxBlox-Generated=true";
 
+// $XDG_DESKTOP_DIR as user-dirs.dirs sets it, else the usual place.
+fs::path userDesktopDir() {
+    const char *pHome = std::getenv("HOME");
+    if (pHome == nullptr || pHome[0] == '\0') return fs::path();
+    const std::string home = pHome;
+    std::istringstream dirs(readWholeFile(fs::path(home) / ".config" / "user-dirs.dirs"));
+    std::string line;
+    while (std::getline(dirs, line)) {
+        line = trimCR(line);
+        if (line.rfind("XDG_DESKTOP_DIR=", 0) != 0) continue;
+        std::string value = line.substr(std::string("XDG_DESKTOP_DIR=").size());
+        if (value.size() >= 2 && value.front() == '"') {
+            const size_t close = value.find('"', 1);
+            if (close == std::string::npos) continue;
+            value = value.substr(1, close - 1);
+        }
+        if (value.rfind("$HOME", 0) == 0) value = home + value.substr(5);
+        if (!value.empty()) return value;
+    }
+    return fs::path(home) / "Desktop";
+}
+
+// Where a client's icon belongs. The Windows prefix points its own Desktop at
+// the real one; a macOS install never had that prefix to point.
+fs::path clientDesktopDir(const std::string& installDir, LaunchTarget target) {
+    if (macclient::hasInstalledClient(installDir, target)) return userDesktopDir();
+    const std::string driveC = installDir + "/runtime/pfx/drive_c";
+    return fs::path(driveC) / "users" / prefixUserName(driveC) / "Desktop";
+}
+
+// What the window reports itself as: the SDL app id the macOS client is started
+// with, else the Windows executable's own name.
+std::string windowClassFor(const ExportTarget& target, bool macClient) {
+    const bool studio = std::string(target.slug) == "studio";
+    if (!macClient) return target.exeLeaf;
+    return std::string("net.tuxblox.TuxBlox.") + (studio ? "Studio" : "Player");
+}
+
 std::string clientDesktopEntry(LaunchTarget target, const std::string& launcherExePath,
-                               bool haveIcon) {
+                               bool haveIcon, bool macClient) {
     const ExportTarget *pTarget = nullptr;
     for (const auto& candidate : exportTargets()) {
         const bool player = std::string(candidate.slug) == "player";
@@ -443,7 +481,7 @@ std::string clientDesktopEntry(LaunchTarget target, const std::string& launcherE
            "Icon=" << icon << "\n"
            "Terminal=false\n"
            "StartupNotify=true\n"
-           "StartupWMClass=" << pTarget->exeLeaf << "\n"
+           "StartupWMClass=" << windowClassFor(*pTarget, macClient) << "\n"
            "Categories=Game;\n"
            // The menu entry beside this one is what application searches read. Without this the
            // desktop copy is indexed too and the same program is offered twice.
@@ -461,11 +499,9 @@ bool writeClientDesktopShortcut(const std::string& installDir, const std::string
     }
     if (pTarget == nullptr) return false;
 
-    const std::string driveC = installDir + "/runtime/pfx/drive_c";
-    const fs::path desktop =
-        fs::path(driveC) / "users" / prefixUserName(driveC) / "Desktop";
+    const fs::path desktop = clientDesktopDir(installDir, target);
     std::error_code ec;
-    if (!fs::is_directory(desktop, ec)) return false;
+    if (desktop.empty() || !fs::is_directory(desktop, ec)) return false;
 
     const char *pHome = std::getenv("HOME");
     const std::string iconsDir =
@@ -475,8 +511,10 @@ bool writeClientDesktopShortcut(const std::string& installDir, const std::string
         fs::exists(fs::path(iconsDir) / "256x256" / "apps" /
                        (std::string("tuxblox-roblox-") + pTarget->slug + ".png"), ec);
 
+    const bool macClient = macclient::hasInstalledClient(installDir, target);
     const fs::path file = desktop / (std::string(pTarget->name) + ".desktop");
-    if (!writeFileAtomic(file, clientDesktopEntry(target, launcherExePath, haveIcon))) return false;
+    if (!writeFileAtomic(file, clientDesktopEntry(target, launcherExePath, haveIcon, macClient)))
+        return false;
     // A desktop entry that is not executable is refused with a warning rather than launched.
     fs::permissions(file,
                     fs::perms::owner_exec | fs::perms::group_exec | fs::perms::others_exec,
@@ -517,6 +555,29 @@ int translateDesktopShortcuts(const std::string& installDir, const std::string& 
         }
     }
     return translated;
+}
+
+int refreshClientDesktopShortcuts(const std::string& installDir,
+                                  const std::string& launcherExePath) {
+    int refreshed = 0;
+    for (const LaunchTarget target : {LaunchTarget::Player, LaunchTarget::Studio}) {
+        const ExportTarget *pTarget = nullptr;
+        for (const auto& candidate : exportTargets()) {
+            const bool player = std::string(candidate.slug) == "player";
+            if (player == (target == LaunchTarget::Player)) pTarget = &candidate;
+        }
+        if (pTarget == nullptr) continue;
+        const fs::path desktop = clientDesktopDir(installDir, target);
+        if (desktop.empty()) continue;
+        const fs::path file = desktop / (std::string(pTarget->name) + ".desktop");
+        // Rewritten only where one already is: putting a deleted icon back is
+        // what writeClientDesktopShortcut() is for, and only on first install.
+        std::error_code ec;
+        if (!fs::is_regular_file(file, ec) || ec) continue;
+        if (readWholeFile(file).find(GeneratedMarker) == std::string::npos) continue;
+        if (writeClientDesktopShortcut(installDir, launcherExePath, target)) refreshed++;
+    }
+    return refreshed;
 }
 
 int removeGeneratedDesktopShortcuts(const std::string& desktopDir) {
@@ -628,11 +689,9 @@ void exportPrefixShortcutsTo(const std::string& installDir, const std::string& l
             const LaunchTarget target = isStudio ? LaunchTarget::Studio : LaunchTarget::Player;
             if (macTarget || isTargetInstalled(installDir, t.exeLeaf)) {
                 if (macTarget) writeMacClientIcon(installDir, iconsDir, target, t.slug);
-                const std::string appId =
-                    std::string("net.tuxblox.TuxBlox.") + (isStudio ? "Studio" : "Player");
                 writeFileAtomic(fs::path(appsDir) / id,
                                 builtinEntry(t, launcherExePath, iconsDir,
-                                             macTarget ? appId.c_str() : t.exeLeaf));
+                                             windowClassFor(t, macTarget).c_str()));
                 continue;
             }
             std::error_code rmEc;
@@ -646,6 +705,7 @@ void exportPrefixShortcutsTo(const std::string& installDir, const std::string& l
 void exportPrefixShortcuts(const std::string& installDir, const std::string& launcherExePath) {
     const char* home = std::getenv("HOME");
     if (!home || home[0] == '\0') return;
+    refreshClientDesktopShortcuts(installDir, launcherExePath);
     exportPrefixShortcutsTo(installDir, launcherExePath,
                              std::string(home) + "/.local/share/applications",
                              std::string(home) + "/.local/share/icons/hicolor");

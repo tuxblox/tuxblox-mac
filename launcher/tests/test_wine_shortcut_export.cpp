@@ -331,7 +331,7 @@ int main() {
     // somebody wrote themselves.
     {
         const std::string entry = tuxblox::clientDesktopEntry(
-            tuxblox::LaunchTarget::Player, "/home/a/.tuxblox/TuxBloxLauncher", true);
+            tuxblox::LaunchTarget::Player, "/home/a/.tuxblox/TuxBloxLauncher", true, false);
         assert(entry.find("Name=Roblox Player\n") != std::string::npos);
         // The flag, not a recorded path, so it opens whichever version is installed at the time.
         assert(entry.find("Exec=\"/home/a/.tuxblox/TuxBloxLauncher\" --launch-player\n") !=
@@ -343,11 +343,16 @@ int main() {
         assert(entry.find("X-TuxBlox-Generated=true\n") != std::string::npos);
 
         const std::string studio = tuxblox::clientDesktopEntry(
-            tuxblox::LaunchTarget::Studio, "/home/a/.tuxblox/TuxBloxLauncher", false);
+            tuxblox::LaunchTarget::Studio, "/home/a/.tuxblox/TuxBloxLauncher", false, false);
         assert(studio.find("Name=Roblox Studio\n") != std::string::npos);
         assert(studio.find("--launch-studio\n") != std::string::npos);
         // Roblox's own icon is only there once a session has exported it.
         assert(studio.find("Icon=tuxblox\n") != std::string::npos);
+
+        // The macOS client reports the SDL app id it is started with, not a Windows exe name.
+        const std::string mac = tuxblox::clientDesktopEntry(
+            tuxblox::LaunchTarget::Studio, "/home/a/.tuxblox/TuxBloxLauncher", true, true);
+        assert(mac.find("StartupWMClass=net.tuxblox.TuxBlox.Studio\n") != std::string::npos);
     }
 
     // Only a file TuxBlox wrote is ever removed, however it is named.
@@ -360,7 +365,7 @@ int main() {
         {
             std::ofstream out(ours);
             out << tuxblox::clientDesktopEntry(tuxblox::LaunchTarget::Player,
-                                               "/home/a/.tuxblox/TuxBloxLauncher", true);
+                                               "/home/a/.tuxblox/TuxBloxLauncher", true, false);
         }
         const fs::path theirs = desktop / "My Own Shortcut.desktop";
         { std::ofstream out(theirs); out << "[Desktop Entry]\nType=Application\nName=Mine\n"; }
