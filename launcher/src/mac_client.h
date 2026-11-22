@@ -73,10 +73,15 @@ std::string writeAppSettings(const Build& build, const std::string& settingsJson
 // Where the Rosemary executable is, in this install's compat folder.
 std::string resolveRosemary(const std::string& installDir);
 
-// "run <executable>" plus "-protocolString <link>" when a deep link was
-// supplied. Arguments after the executable belong to the guest.
+// "run <executable>" plus either "-protocolString <link>" for a deep link or
+// the path on its own for a file. Arguments after the executable belong to the
+// guest.
 std::vector<std::string> clientLaunchArgs(const std::string& executable,
                                           const std::string& deepLink);
+
+// A host path as the client sees it: the prefix maps the host root onto
+// /Volumes/Host. Empty when there is no such file.
+std::string guestPathFor(const std::string& hostPath);
 
 // Pure helpers, exposed for tests.
 bool validUpload(const std::string& upload);

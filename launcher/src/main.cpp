@@ -27,6 +27,7 @@
 #include "root_guard.h"
 #include "headless_launch.h"
 #include "watch_launch.h"
+#include "mac_client.h"
 #include "prefix_file_bridge.h"
 #include "copyright_file.h"
 #include "license_file.h"
@@ -277,13 +278,18 @@ int main(int argc, char** argv) {
                 return 1;
             }
 
-            const std::string winPath = bridgeHostPathIntoPrefix(dir, argv[2]);
-            if (winPath.empty()) {
+            // The macOS client has the host filesystem under /Volumes/Host, so
+            // nothing has to be linked into the Windows drive for it.
+            const std::string path =
+                macclient::hasInstalledClient(dir, LaunchTarget::Studio)
+                    ? macclient::guestPathFor(argv[2])
+                    : bridgeHostPathIntoPrefix(dir, argv[2]);
+            if (path.empty()) {
                 showErrorMessageBox(i18n::tr("TuxBlox Error"),
                                     i18n::trf("Could not open this file in Roblox Studio:\n{0}", {argv[2]}));
                 return 1;
             }
-            return runWatchAndLaunch(dir, LaunchTarget::Studio, winPath, reportedVersion(kTuxBloxVersion));
+            return runWatchAndLaunch(dir, LaunchTarget::Studio, path, reportedVersion(kTuxBloxVersion));
         }
     }
 

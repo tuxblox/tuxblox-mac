@@ -344,11 +344,23 @@ std::string resolveRosemary(const std::string& installDir) {
 std::vector<std::string> clientLaunchArgs(const std::string& executable,
                                           const std::string& deepLink) {
     std::vector<std::string> args{"run", executable};
-    if (!deepLink.empty()) {
-        args.push_back("-protocolString");
+    if (deepLink.empty()) return args;
+    // AppKit opens a file named on the command line and reads a URL out of
+    // -protocolString, and a URL never begins with a separator.
+    if (deepLink.front() == '/') {
         args.push_back(deepLink);
+        return args;
     }
+    args.push_back("-protocolString");
+    args.push_back(deepLink);
     return args;
+}
+
+std::string guestPathFor(const std::string& hostPath) {
+    std::error_code ec;
+    const fs::path canonical = fs::canonical(hostPath, ec);
+    if (ec) return std::string();
+    return "/Volumes/Host" + canonical.generic_string();
 }
 
 } // namespace tuxblox::macclient

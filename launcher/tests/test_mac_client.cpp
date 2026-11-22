@@ -61,6 +61,21 @@ int main() {
         assert(clientLaunchArgs("/opt/game/RobloxPlayer", "").size() == 2);
     }
 
+    // A place file is named on the command line, which is where AppKit reads
+    // one; -protocolString would hand Studio a path as a URL.
+    {
+        const auto args =
+            clientLaunchArgs("/opt/game/RobloxStudio", "/Volumes/Host/home/a/Place.rbxl");
+        assert(args.size() == 3);
+        assert(args[2] == "/Volumes/Host/home/a/Place.rbxl");
+    }
+
+    // The host root as the client sees it, and nothing for a file that is not there.
+    {
+        assert(guestPathFor("/tmp/tuxblox_test_mac_client_absent") == "");
+        assert(guestPathFor("/etc/hostname") == "/Volumes/Host/etc/hostname");
+    }
+
     // An install with no marker has nothing to reuse and no integrity.
     {
         const fs::path root = fs::temp_directory_path() / "tuxblox_test_mac_client";
