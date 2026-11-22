@@ -1,174 +1,142 @@
-# TuxBlox Mac
+<p align="center">
+  <img src="https://tuxblox.net/static/images/banner/tuxblox-banner.png" width="600">
+</p>
 
-The complete TuxBlox launcher, with the experimental macOS Player backend and the Windows Studio path inherited from TuxBlox.
+***
 
-This repository holds the launcher (Home, Sessions, Versions, FastFlags, Settings, About, the shared interface, flags, crypto, translations and assets) and `compat/`, the macOS compatibility layer. That layer is a fork of [Rosemary](https://github.com/microlift/rosemary) and runs the official macOS Player natively, without Wine. The Wine-based Windows compatibility layer is **not** in this repository; Studio keeps using the one from an existing TuxBlox install.
+# TuxBlox 🐧
 
-## Status
+TuxBlox is a free, open-source compatibility layer and launcher that runs Roblox on Linux. It's designed for both beginners and experts, and is under **active development**.
 
-- The complete launcher UI is here: Home, Sessions, Versions, FastFlags, Settings and About.
-- The macOS Player backend is experimental and sits behind a local-only flag.
-- Studio is inherited unchanged and still uses the TuxBlox compatibility layer.
-- Released builds are x86_64. arm64 is a work in progress.
+## How It Works
 
-## Download
+TuxBlox doesn't emulate an operating system or use a virtual machine. It runs the official macOS version of Roblox on Linux by translating its Darwin API calls at runtime.
 
-The latest release includes a ready x86_64 AppImage and a portable tarball:
+TuxBlox maintains its own Rosemary build (based on Rosemary v0.5.0) made specifically for Roblox, and bundles it. You don't need Rosemary installed on your system. Targeting a single application lets us fix problems at the source, including upstream Rosemary bugs that affect Roblox, instead of working around them with configuration.
 
-<https://github.com/tuxblox/tuxblox-mac/releases/latest>
+TuxBlox runs the **official, unmodified** Roblox binaries. It never patches or repackages them, and it refuses to run files that have been modified.
 
-```sh
-chmod +x TuxBloxMac-*-x86_64.AppImage
-./TuxBloxMac-*-x86_64.AppImage
+## Features
+
+> [!NOTE]
+> **TuxBlox has some issues with Roblox Studio.** We are aiming to fix these issues. Updates will be posted on our [Discord](https://tuxblox.net/discord).
+
+> [!NOTE]
+> **TuxBlox previously used Wine to run Roblox.** Some documentation may still be out of date, and the macOS runtime is still in public betatesting, so stable releases are not affected yet.
+
+* **Works out of the box:** installation, updates and graphics setup are handled for you. There are no launch options to supply and no prefix to maintain.
+* **Session manager:** see each running session's memory use, process ID, Roblox version and logs, and stop sessions.
+* **Version picker:** download any Roblox version you choose, straight from Roblox's servers.
+* **FastFlag manager.**
+* **Release channels:** switch between stable, canary and experimental, with automatic updates.
+* **Full control:** every default the launcher applies can be changed in its settings.
+
+## System Requirements
+
+### Hardware
+
+* **Processor:** x86-64 with SSE3 support or newer (ARM64 is planned)
+* **Memory:** 4 GB of RAM
+* **Disk space:** 4 GB free
+* **Graphics:** a GPU with Vulkan 1.1 drivers
+
+### Software
+
+* **Kernel:** Linux 5.6 or newer
+* **C library:** glibc 2.30 or newer
+* **Display:** X11 or Wayland
+
+On a Wayland session Studio runs through XWayland, because Wayland gives a client no way to place its own windows and Studio's docked panels depend on that. Set `DFFlagPreferXWayland` to prefer XWayland for everything else too.
+
+TuxBlox installs and runs as a normal user. Root is never required.
+
+## Installation
+
+### 1. Install from the Releases page
+We distribute TuxBlox files here in [GitHub releases](https://github.com/tuxblox/tuxblox/releases) and [tuxblox.net/releases](https://tuxblox.net/releases). Head over to whichever page you prefer, then download the `TuxBloxInstaller` binary.
+
+Make sure to set `chmod +x` on the installer:
+```bash
+chmod +x TuxBloxInstaller
+```
+Then run the installer.
+
+We also distribute the `.AppImage` variant of the installer. The steps to download and run are the exact same.
+
+### 2. Install from the command line
+
+This will automatically install the latest stable version of TuxBlox for you. Open a terminal and run:
+
+```bash
+curl -fsSL https://tuxblox.net/install.sh | bash
 ```
 
-The first run copies the launcher, its interface stack and Rosemary to `~/.local/share/tuxblox-mac`, writes the macOS Player flag, and starts. Later runs reuse the same directory and replace the launcher when the AppImage version changes. Set `TUXBLOX_MAC_DATA` to use another directory.
+Feel free to inspect the script first:
 
-The AppImage needs FUSE. Where FUSE is unavailable, download the `.tar.zst`, extract it, and run `TuxBloxMac.AppDir/AppRun`; it is the same payload.
-
-The release is Player-only. Studio still needs the TuxBlox compatibility layer; use the drop-in install below if you want Studio.
-
-## What it does
-
-- Downloads the official macOS Player from Roblox's setup CDN.
-- Verifies the Apple code signature against the pinned Apple Root CA before installing anything.
-- Installs the unmodified bundle under `<install>/runtime` with a local integrity manifest.
-- Starts it through Rosemary, with the same launcher, Sessions, settings, Discord Rich Presence and server-region features as TuxBlox.
-- Keeps Studio on the Windows compatibility layer, with no changes to its code path.
-
-Nothing patches either client. The only file written inside the macOS bundle is `ClientSettings` for FastFlags.
-
-## Two ways to install
-
-### Player only, without TuxBlox
-
-The macOS Player does not need the Windows compatibility layer. Install the launcher into its own directory (for example `~/.local/share/tuxblox-mac`), add the flag and Rosemary, and run it. Launching Studio reports that the TuxBlox compatibility layer is required; it does not download the Windows client.
-
-### Player and Studio
-
-Studio still needs the Windows compatibility layer. Install the official TuxBlox first, then replace its launcher with the build from this repository:
-
-```sh
-install -m 755 build/native/TuxBloxLauncher ~/.tuxblox/TuxBloxLauncher
+```bash
+curl -fsSL https://tuxblox.net/install.sh -o install.sh
+less install.sh
+bash install.sh
 ```
 
-The existing `~/.tuxblox/compat` and `~/.tuxblox/libtuxblox` are left untouched and Studio keeps using them. This repository does not duplicate or modify that layer.
+### 3. Install the Flatpak
+We also release Flatpak versions of TuxBlox, however **they are very experimental and Flatpak's sandbox might break TuxBlox**. We recommend using the releases page or the command-line.
 
-## Requirements
+Head over to [GitHub Releases](https://github.com/tuxblox/tuxblox/releases) or [tuxblox.net/releases](https://tuxblox.net/releases), and download `net.tuxblox.TuxBlox.flatpak`.
 
-- Linux x86_64.
-- For the Player: Rosemary at `<install>/compat/rosemary`.
-- For Studio: an existing TuxBlox install (`~/.tuxblox` by default) with its Windows compatibility layer in `compat/` and `libtuxblox/`.
-- For the build: `git`, `make`, rootless `podman`, `rsvg-convert` (librsvg) and network access. The build container provides GTK4, libadwaita, libcurl, libarchive, OpenSSL, zlib, CMake and Ninja.
-
-## Building
-
-Clone with the pinned submodules:
-
-```sh
-git clone --recurse-submodules https://github.com/tuxblox/tuxblox-mac.git
-cd tuxblox-mac
+Then open a terminal, and go to your Downloads folder:
+```bash
+cd ~/Downloads # change this to where you downloaded the flatpak to
+flatpak install --user ./net.tuxblox.TuxBlox.flatpak
 ```
+Note that the Flatpak releases do not automatically update, so you'll need to manually reinstall the Flatpak every time.
 
-If the repository was cloned without them:
+## Building From Source
 
-```sh
-git submodule update --init --recursive
-```
+For a full build, run `make`. For the Flatpak only, run `make flatpak`.
+Full documentation for building from source and the requirements can be seen here: https://tuxblox.net/docs/development/building-from-source
 
-Then build the launcher target:
+## Privacy
 
-```sh
-TUXBLOX_DONT_INCREMENT_BUILD=1 JOBS=2 make launcher
-```
+Some features contact TuxBlox's own servers: self-updates, the optional server-location lookup for Team Create, and optional crash reports. Roblox itself is always downloaded from Roblox's servers, and your Roblox account cookie is never sent to TuxBlox. See our [privacy policy](https://tuxblox.net/privacy).
 
-`JOBS=2` is a safe default on 8 GB machines; raise it on a larger one. The first build creates the `tuxblox-builder` container image, then builds the shared libraries and the interface stack. It needs several GB of disk and takes a while. Later builds reuse the image and the artifacts.
+## FAQ
 
-The result is:
+**Is TuxBlox a fork of Vinegar or Sober?**
 
-```text
-build/native/TuxBloxLauncher
-build/native/libtuxblox/
-```
+No, TuxBlox is its own project. Vinegar runs the Windows client through the Wine you install yourself, while TuxBlox runs the macOS client through a compatibility layer it bundles and builds for Roblox. Sober runs the Android version of Roblox instead.
 
-`build/native` is the complete launcher directory: the binary and the interface stack it loads.
+**Does it work on Wayland?**
 
-The macOS compatibility layer is a separate target, built from `compat/` in this tree:
+Yes. The launcher runs natively on Wayland, and Studio runs through XWayland.
 
-```sh
-make compat
-```
+**Why isn't there a distro package?**
 
-That writes `build/native/compat/rosemary`. It is a large Rust build and the first one takes a while. The Wine-based Windows compatibility layer Studio uses is not built from this tree.
+TuxBlox updates itself whenever a release is published, which is not how a distribution's package manager expects to work.
 
-To assemble the release artifacts:
+**Can I run other macOS apps with it?**
 
-```sh
-APPIMAGETOOL=/path/to/appimagetool make mac-appimage
-```
+No. TuxBlox only runs programs signed by Roblox or by TuxBlox itself.
 
-Without `APPIMAGETOOL`, the target still writes the portable `.tar.zst`. It needs the compatibility layer at `build/native/compat/rosemary`, so run `make compat` first or point `ROSEMARY` at a built one.
+**Is it free?**
 
-## Installing the Player only
+Yes. TuxBlox is free and open source under GPL-3.0-or-later.
 
-```sh
-DIR="$HOME/.local/share/tuxblox-mac"
-mkdir -p "$DIR"
-install -m 755 build/native/TuxBloxLauncher "$DIR/TuxBloxLauncher"
-cp -a build/native/libtuxblox "$DIR/libtuxblox"
-install -m 755 build/native/compat/rosemary "$DIR/compat/rosemary"
-```
+Additional questions are answered in [tuxblox.net/docs/getting-started/faq](https://tuxblox.net/docs/getting-started/faq).
 
-Create `"$DIR/flags.json"` before the first start:
+## Contributing
 
-```json
-{
-  "FFlagDisableUpdater": true
-}
-```
+Contributions are welcome! Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. If you use AI tools, also read [AGENTS.md](AGENTS.md) for the repository's AI policy.
 
-Then run:
+To report a security vulnerability, **don't open a public issue**. See [SECURITY.md](SECURITY.md).
 
-```sh
-"$DIR/TuxBloxLauncher"
-```
+## Any Questions?
 
-The first Player launch downloads the official client and verifies its Apple signature. The download is about 160 MB and the installed client takes about 550 MB, so keep roughly 1 GB free.
+Join our [Discord server](https://tuxblox.net/discord) for support, development updates and discussion, or read the [documentation](https://tuxblox.net/docs).
 
-## Installing beside TuxBlox
+## Legal & Disclaimer
 
-Install the official TuxBlox normally, then put this launcher in its directory:
-
-```sh
-install -m 755 build/native/TuxBloxLauncher ~/.tuxblox/TuxBloxLauncher
-```
-
-Keep the existing `libtuxblox/` and `runtime/` directories. Add the flag to `~/.tuxblox/flags.json`, keeping any entries already there:
-
-```json
-{
-  "FFlagDisableUpdater": true
-}
-```
-
-Restart the launcher.
-
-`FFlagDisableUpdater` is recommended while this is a separate build: the official updater or installer can replace this launcher with the upstream one. Do not run the official installer over this launcher.
-
-## Updates
-
-The launcher carries TuxBlox's updater. Until it has its own release channel, keep `FFlagDisableUpdater` set in `flags.json` while testing.
-
-Discord Rich Presence and server-region settings are read when a Player session starts. Restart the Player after changing them.
-
-## Troubleshooting
-
-- **Studio says the compatibility layer is missing.** This is the Player-only layout. Install TuxBlox and use its directory if you want Studio.
-- **The Player closes right after opening.** Check that `lms.roblox.com` resolves normally. Some DNS filters return `0.0.0.0` for it; the macOS client cannot finish its login flow without that endpoint. `www.roblox.com` and `clientsettings.roblox.com` being reachable is not enough.
-- **The Player does not start.** Confirm that `<install>/compat/rosemary` exists and is executable.
-
-## Licensing
-
-TuxBlox's own code is GPLv3. `compat/` is a fork of Rosemary and is GPL-3.0; it builds to a separate executable and is not linked into the launcher. Its upstream licence is in `third_party_licenses/rosemary/LICENSE`. The Wine-based Windows compatibility layer Studio uses is not part of this repository: in the main TuxBlox repository it stays LGPLv2.1, with `compat/tuxblox/` and `compat/webkitgtk/bundle/` under GPLv3.
-
-The launcher runs the official, unmodified Roblox clients. It is not affiliated with, endorsed by, or associated with Roblox Corporation.
+- **TuxBlox is an independent, unofficial community project.** It is not affiliated with, authorized or endorsed by Roblox Corporation. Roblox is a trademark of Roblox Corporation.
+- **TuxBlox's own code is licensed under GPL-3.0-or-later.**
+- **This project includes a modified version of Microlift's [Rosemary](https://github.com/microlift/rosemary) which is also licensed under GPL-3.0-or-later.
+- See [`third_party_licenses/`](third_party_licenses/) for the full licence text of all third-party code in this repository.
