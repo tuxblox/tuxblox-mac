@@ -23,6 +23,17 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo:rustc-env=ROSEMARY_BUILD_ID={}", build_id());
 
+    let version = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../VERSION");
+    println!("cargo::rerun-if-changed={}", version.display());
+    let layer = std::fs::read_to_string(&version).expect("compat/VERSION");
+    let layer = layer.lines().next().unwrap_or_default().trim();
+    println!("cargo:rustc-env=TUXBLOX_COMPAT_VERSION={layer}");
+    for named in ["TUXBLOX_RELEASE", "TUXBLOX_CHANNEL"] {
+        println!("cargo::rerun-if-env-changed={named}");
+        let value = std::env::var(named).unwrap_or_default();
+        println!("cargo:rustc-env={named}={value}");
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("freebsd") {
         return;
     }

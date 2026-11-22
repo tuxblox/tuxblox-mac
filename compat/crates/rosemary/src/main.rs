@@ -322,12 +322,6 @@ struct Target {
 #[derive(Parser, Debug)]
 #[command(
     name = "rosemary",
-    version,
-    long_version = concat!(
-        env!("CARGO_PKG_VERSION"), "\n",
-        "commit: ", env!("GIT_HASH"), "\n",
-        "built:  ", env!("BUILD_DATE"),
-    ),
     about = "Run macOS applications across architectures and operating systems",
     args_conflicts_with_subcommands = true,
     arg_required_else_help = true
@@ -402,6 +396,22 @@ fn main() -> ExitCode {
     // with annotations copied out of `sysctl`, so the argument
     // that aborted this runtime before it had loaded anything was the guest's
     // own and perfectly legal.
+    // Answered before anything loads, as every other component does.
+    if let Some(asked) = std::env::args_os().nth(1) {
+        if asked == "--version" {
+            let release = env!("TUXBLOX_RELEASE");
+            let shown = match release.is_empty() {
+                true => env!("TUXBLOX_COMPAT_VERSION"),
+                false => release,
+            };
+            println!("{shown}");
+            return ExitCode::SUCCESS;
+        }
+        if asked == "--component-version" {
+            println!("{}", env!("TUXBLOX_COMPAT_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+    }
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Prefix { args }) => prefix_cli::command(args.into_iter()),
@@ -431,6 +441,75 @@ fn main() -> ExitCode {
     }
 }
 
+/// Where a desktop records the cursor theme, best source first.
+#[cfg(not(target_os = "macos"))]
+const CURSOR_THEME_SOURCES: &[(&str, &str)] = &[
+    ("kcminputrc", "cursorTheme"),
+    ("gtk-4.0/settings.ini", "gtk-cursor-theme-name"),
+    ("gtk-3.0/settings.ini", "gtk-cursor-theme-name"),
+];
+
+/// As [`CURSOR_THEME_SOURCES`], for the size.
+#[cfg(not(target_os = "macos"))]
+const CURSOR_SIZE_SOURCES: &[(&str, &str)] = &[
+    ("kcminputrc", "cursorSize"),
+    ("gtk-4.0/settings.ini", "gtk-cursor-theme-size"),
+    ("gtk-3.0/settings.ini", "gtk-cursor-theme-size"),
+    ("~/.gtkrc-2.0", "gtk-cursor-theme-size"),
+];
+
+/// The first `key=value` one of `sources` gives, read as plain text.
+#[cfg(not(target_os = "macos"))]
+fn desktop_setting(sources: &[(&str, &str)]) -> Option<String> {
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let config = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    for (file, key) in sources {
+        let path = match file.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => config.join(file),
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(value) = line
+                .trim()
+                .strip_prefix(key)
+                .and_then(|rest| rest.trim_start().strip_prefix('='))
+            else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            if !value.is_empty() {
+                return Some(value.to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Publish the host's cursor theme to the libraries that draw cursors.
+///
+/// Unset, libXcursor falls back to the `default` theme, which a host may
+/// point at anything; GTK inside a web view then picks its own.
+#[cfg(not(target_os = "macos"))]
+fn adopt_host_cursor_theme() {
+    let set_default = |key: &str, value: String| {
+        if std::env::var_os(key).is_none() {
+            // SAFETY: before any thread has been started.
+            unsafe { std::env::set_var(key, value) };
+        }
+    };
+    if let Some(theme) = desktop_setting(CURSOR_THEME_SOURCES) {
+        set_default("XCURSOR_THEME", theme);
+    }
+    if let Some(size) = desktop_setting(CURSOR_SIZE_SOURCES) {
+        set_default("XCURSOR_SIZE", size);
+    }
+}
+
 /// Load `path` as a program and execute it.
 fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode {
     // Before anything can ask which prefix this is, including the paths
@@ -438,6 +517,8 @@ fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode
     prefix_cli::settle_prefix();
     #[cfg(target_os = "macos")]
     imply_builtin_runtime();
+    #[cfg(not(target_os = "macos"))]
+    adopt_host_cursor_theme();
     // `--slow` turns every import into a VM exit; `--native`/`--emulated`
     // force a backend the file's own slices would not have chosen.
     let policy = match options.slow {

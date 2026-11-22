@@ -81,7 +81,7 @@ INSTALLER_SRC := $(shell $(FIND) installer/src installer/CMakeLists.txt -type f 
 STUDIO_MCP_SRC := $(shell $(FIND) studio-mcp/src studio-mcp/CMakeLists.txt -type f 2>/dev/null)
 # third_party_licenses and LICENSE are staged into the layer below, so a licence that arrives or
 # leaves has to rebuild it: the layer ships its own copy and nothing else would notice.
-COMPAT_SRC := $(shell $(FIND) compat/crates compat/Cargo.toml compat/Cargo.lock -type f 2>/dev/null)
+COMPAT_SRC := $(shell $(FIND) compat/crates compat/Cargo.toml compat/Cargo.lock compat/VERSION -type f 2>/dev/null)
 
 export TUXBLOX_SKIP_DEPS := 1
 export TUXBLOX_MAKE_JOBS := $(JOBS)
@@ -1005,6 +1005,7 @@ $(ROSEMARY): $(COMPAT_SRC) | $(PODMAN)
 	podman run --rm --userns=keep-id -e CARGO_HOME=/cargo -e CARGO_TERM_COLOR=never \
 	    -e CC=x86_64-linux-gnu-gcc-10 \
 	    -e RUSTFLAGS="-C linker=x86_64-linux-gnu-gcc-10" \
+	    -e TUXBLOX_RELEASE="$(RELEASE)" -e TUXBLOX_CHANNEL="$(CHANNEL)" \
 	    -v $(ROOT)/compat:/src:Z -v $(CARGO_DIR):/cargo:z -w /src \
 	    tuxblox-builder cargo build --release --locked --bin rosemary
 	install -m 755 compat/target/release/rosemary $@
