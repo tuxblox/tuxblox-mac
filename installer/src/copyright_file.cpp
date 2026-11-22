@@ -213,6 +213,16 @@ constexpr const char* kAdwaitaSansLicenseTxt =
     "licensed under the SIL Open Font License, Version 1.1. Inter's own license\n"
     "text, which is the same license, is reproduced in full in the entry for Inter\n"
     "at the top of this file. The license is also at https://openfontlicense.org.\n";
+
+constexpr const char* kAdwaitaMonoHeading =
+    "Adwaita Mono (font, used by TuxBlox's interface)\n"
+    "https://gitlab.gnome.org/GNOME/adwaita-fonts\n\n";
+
+constexpr const char* kAdwaitaMonoLicenseTxt =
+    "Adwaita Mono 48.2, from the GNOME project. It is derived from Iosevka,\n"
+    "copyright (c) 2015-2025 Renzhi Li, and is licensed under the SIL Open Font\n"
+    "License, Version 1.1. That license text is reproduced in full in the entry\n"
+    "for Inter at the top of this file, and is also at https://openfontlicense.org.\n";
 #endif
 
 void writeEntry(std::ofstream& file, const char* heading,
@@ -252,6 +262,7 @@ void writeCopyrightFile(const std::string& installDir) {
         writeEntry(file, kLgpl21Heading, kLgpl21LicenseTxt, kLgpl21LicenseTxtLen);
         writeEntry(file, kAdwaitaHeading, kAdwaitaLicenseTxt);
         writeEntry(file, kAdwaitaSansHeading, kAdwaitaSansLicenseTxt);
+        writeEntry(file, kAdwaitaMonoHeading, kAdwaitaMonoLicenseTxt);
 #endif
         file << kDivider;
     } catch (...) {
