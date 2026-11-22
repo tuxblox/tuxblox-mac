@@ -283,6 +283,14 @@ int main() {
             "icns" + bigEndian(static_cast<uint32_t>(8 + icnsEntry.size())) + icnsEntry;
         writeAll(app / "Contents" / "Resources" / "AppIcon.icns", icns);
 
+        // What a Windows Player export copied into every bucket under the same
+        // name. A panel asking for 32px is served that bucket, so none of them
+        // may still hold it once the macOS client owns the name.
+        static const char* const sizes[] = {"16x16", "24x24", "32x32", "48x48",
+                                             "64x64", "96x96", "128x128", "256x256"};
+        for (const char* size : sizes)
+            writeAll(macIcons / size / "apps" / "tuxblox-roblox-player.png", "WINDOWSPNG");
+
         // A Windows Player left a shortcut behind. It must not replace the
         // entry that starts the macOS client.
         const fs::path macShortcuts =
@@ -306,6 +314,8 @@ int main() {
         // The PNG is taken out of the client's own .icns.
         assert(readAll(macIcons / "256x256" / "apps" / "tuxblox-roblox-player.png") == png);
         assert(!fs::exists(macIcons / "scalable" / "apps" / "tuxblox-roblox-player.svg"));
+        for (const char* size : sizes)
+            assert(readAll(macIcons / size / "apps" / "tuxblox-roblox-player.png") != "WINDOWSPNG");
 
         // Removing the client and its leftover Windows shortcut takes the
         // entry away again.

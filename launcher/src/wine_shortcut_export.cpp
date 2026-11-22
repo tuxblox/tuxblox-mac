@@ -57,8 +57,12 @@ const std::vector<ExportTarget>& exportTargets() {
 
 // Same buckets writeDesktopEntries() populates -- see its own comment for why
 // every size gets a copy rather than only 256x256.
-const char* const kIconSizes[] = {"16x16", "24x24", "32x32", "48x48",
-                                   "64x64", "96x96", "128x128", "256x256"};
+const int kIconSides[] = {16, 24, 32, 48, 64, 96, 128, 256};
+
+std::string sizeDir(int side) {
+    const std::string n = std::to_string(side);
+    return n + "x" + n;
+}
 
 std::string toLower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -155,11 +159,7 @@ std::string pngFromIcns(const std::string& icns) {
     return best;
 }
 
-// The app icon carries the transparent margin Apple's icon grid asks for.
-// On a Linux panel that makes it look smaller than the Studio icon, which
-// fills its canvas. Crop to the opaque square and scale to the icon size
-// the menu will ask for; the rounded corners and the artwork stay as shipped.
-std::string trimIconPng(const std::string& png) {
+GdkPixbuf *decodePng(const std::string& png) {
     GError *pError = nullptr;
     GdkPixbufLoader *pLoader = gdk_pixbuf_loader_new();
     bool ok = gdk_pixbuf_loader_write(pLoader,
@@ -170,6 +170,41 @@ std::string trimIconPng(const std::string& png) {
     if (pPixbuf != nullptr) g_object_ref(pPixbuf);
     g_object_unref(pLoader);
     if (pError != nullptr) g_error_free(pError);
+    return pPixbuf;
+}
+
+std::string encodePng(GdkPixbuf *pPixbuf) {
+    gchar *pBuffer = nullptr;
+    gsize size = 0;
+    GError *pError = nullptr;
+    std::string out;
+    if (gdk_pixbuf_save_to_buffer(pPixbuf, &pBuffer, &size, "png", &pError, nullptr)) {
+        out.assign(pBuffer, size);
+    }
+    g_free(pBuffer);
+    if (pError != nullptr) g_error_free(pError);
+    return out;
+}
+
+// A panel asks the icon theme for the size it draws at, so the artwork has to
+// be in that bucket rather than scaled down from the largest one.
+std::string scalePngTo(const std::string& png, int side) {
+    GdkPixbuf *pPixbuf = decodePng(png);
+    if (pPixbuf == nullptr) return std::string();
+    GdkPixbuf *pScaled = gdk_pixbuf_scale_simple(pPixbuf, side, side, GDK_INTERP_BILINEAR);
+    g_object_unref(pPixbuf);
+    if (pScaled == nullptr) return std::string();
+    const std::string out = encodePng(pScaled);
+    g_object_unref(pScaled);
+    return out;
+}
+
+// The app icon carries the transparent margin Apple's icon grid asks for.
+// On a Linux panel that makes it look smaller than the Studio icon, which
+// fills its canvas. Crop to the opaque square and scale to the icon size
+// the menu will ask for; the rounded corners and the artwork stay as shipped.
+std::string trimIconPng(const std::string& png) {
+    GdkPixbuf *pPixbuf = decodePng(png);
     if (pPixbuf == nullptr || !gdk_pixbuf_get_has_alpha(pPixbuf)) {
         if (pPixbuf != nullptr) g_object_unref(pPixbuf);
         return std::string();
@@ -215,16 +250,7 @@ std::string trimIconPng(const std::string& png) {
                              ? nullptr
                              : gdk_pixbuf_scale_simple(pSub, 256, 256, GDK_INTERP_BILINEAR);
     std::string out;
-    if (pScaled != nullptr) {
-        gchar *pBuffer = nullptr;
-        gsize size = 0;
-        pError = nullptr;
-        if (gdk_pixbuf_save_to_buffer(pScaled, &pBuffer, &size, "png", &pError, nullptr)) {
-            out.assign(pBuffer, size);
-        }
-        g_free(pBuffer);
-        if (pError != nullptr) g_error_free(pError);
-    }
+    if (pScaled != nullptr) out = encodePng(pScaled);
     if (pScaled != nullptr) g_object_unref(pScaled);
     if (pSub != nullptr) g_object_unref(pSub);
     g_object_unref(pPixbuf);
@@ -238,6 +264,13 @@ std::string trimIconPng(const std::string& png) {
 std::string writeMacClientIcon(const std::string& installDir, const std::string& iconsDir,
                                LaunchTarget target, const std::string& slug) {
     const std::string name = "tuxblox-roblox-" + slug;
+    // A Windows client installed earlier copied its own artwork into every
+    // bucket under this name, and a panel asking for 32px is served the bucket
+    // it asked for, not the largest one.
+    for (const int side : kIconSides) {
+        std::error_code rmEc;
+        fs::remove(fs::path(iconsDir) / sizeDir(side) / "apps" / (name + ".png"), rmEc);
+    }
 
     macclient::Build build;
     if (macclient::installedBuild(installDir, build, target)) {
@@ -247,9 +280,17 @@ std::string writeMacClientIcon(const std::string& installDir, const std::string&
             const std::string png = pngFromIcns(readWholeFile(icns));
             const std::string trimmed = png.empty() ? std::string() : trimIconPng(png);
             const std::string &icon = trimmed.empty() ? png : trimmed;
-            const fs::path dir = fs::path(iconsDir) / "256x256" / "apps";
-            fs::create_directories(dir, ec);
-            if (!ec && !icon.empty() && writeFileAtomic(dir / (name + ".png"), icon)) {
+            bool wroteAny = false;
+            for (const int side : kIconSides) {
+                if (icon.empty()) break;
+                const std::string scaled = side == 256 ? icon : scalePngTo(icon, side);
+                if (scaled.empty()) continue;
+                const fs::path dir = fs::path(iconsDir) / sizeDir(side) / "apps";
+                fs::create_directories(dir, ec);
+                if (ec) continue;
+                if (writeFileAtomic(dir / (name + ".png"), scaled)) wroteAny = true;
+            }
+            if (wroteAny) {
                 // An older fallback SVG would otherwise win the theme lookup on
                 // desktops that prefer scalable icons, bringing back the
                 // unreadable black-on-dark artwork.
@@ -281,11 +322,11 @@ std::string copyIcons(const fs::path& srcIconsRoot, const std::string& sourceIco
     if (sourceIconName.empty()) return "";
     const std::string destName = std::string("tuxblox-roblox-") + slug;
     bool copiedAny = false;
-    for (const char* size : kIconSizes) {
-        const fs::path src = srcIconsRoot / size / "apps" / (sourceIconName + ".png");
+    for (const int side : kIconSides) {
+        const fs::path src = srcIconsRoot / sizeDir(side) / "apps" / (sourceIconName + ".png");
         std::error_code ec;
         if (!fs::exists(src, ec) || ec) continue;
-        const fs::path destDir = iconsDir / size / "apps";
+        const fs::path destDir = iconsDir / sizeDir(side) / "apps";
         fs::create_directories(destDir, ec);
         if (ec) continue;
         const fs::path dest = destDir / (destName + ".png");
