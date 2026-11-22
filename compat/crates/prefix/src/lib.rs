@@ -1,3 +1,4 @@
+pub mod debug;
 pub mod bundle;
 pub mod cache;
 pub mod digest;

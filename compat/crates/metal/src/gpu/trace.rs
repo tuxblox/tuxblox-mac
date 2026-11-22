@@ -4,7 +4,8 @@ use super::*;
 #[inline(always)]
 fn tracing() -> bool {
     #[dynamic]
-    static ENABLED: bool = std::env::var_os("ROSEMARY_TRACE_METAL").is_some();
+    static ENABLED: bool =
+        std::env::var_os("ROSEMARY_TRACE_METAL").is_some() || darwin::debug::enabled("metal");
 
     *ENABLED
 }

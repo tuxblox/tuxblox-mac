@@ -201,7 +201,9 @@ pub fn warn_once(message: &str) {
 
 pub fn tracing() -> bool {
     static TRACE: OnceLock<bool> = OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var_os("ROSEMARY_TRACE_WEBKIT").is_some())
+    *TRACE.get_or_init(|| {
+        std::env::var_os("ROSEMARY_TRACE_WEBKIT").is_some() || darwin::debug::enabled("webkit")
+    })
 }
 
 thread_local! {

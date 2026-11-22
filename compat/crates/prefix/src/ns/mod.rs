@@ -187,7 +187,8 @@ fn host_home() -> Option<&'static Path> {
 fn tracing() -> bool {
     #[dynamic]
     static ON: bool =
-        std::env::var_os("ROSEMARY_TRACE_PREFIX").is_some_and(|v| v != "0" && !v.is_empty());
+        std::env::var_os("ROSEMARY_TRACE_PREFIX").is_some_and(|v| v != "0" && !v.is_empty())
+            || crate::debug::enabled("prefix");
     *ON
 }
 

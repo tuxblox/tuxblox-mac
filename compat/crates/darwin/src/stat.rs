@@ -581,8 +581,7 @@ fn creation(create: bool, exclusive: bool, dirfd: c_int, path: *const c_char) ->
     None
 }
 
-/// The `logfile` channel: name every `.log` file the guest makes, so whatever
-/// is watching the session can find it.
+/// Name every `.log` the guest makes, for the watching session.
 fn log_created_file(host_flags: c_int, fd: c_int, path: *const c_char) {
     if fd < 0 || host_flags & libc::O_CREAT == 0 || !crate::debug::enabled("logfile") {
         return;
@@ -596,7 +595,7 @@ fn log_created_file(host_flags: c_int, fd: c_int, path: *const c_char) {
     let full = std::fs::read_link(format!("/proc/self/fd/{fd}"))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or(given);
-    eprintln!("rosemary: logfile: {full}");
+    eprintln!("TuxBlox: created logfile: {full}");
 }
 
 /// Record what [`creation`] said was about to be made, if it was.

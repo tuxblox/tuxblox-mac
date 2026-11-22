@@ -309,6 +309,9 @@ pub const STRICT_IMPORTS_ENV: &str = "ROSEMARY_STRICT_IMPORTS";
 const UNBOUND_DETAIL_LIMIT: usize = 40;
 
 fn unbound_detail_limit() -> usize {
+    if darwin::debug::enabled("import") {
+        return usize::MAX;
+    }
     match std::env::var("ROSEMARY_UNBOUND_DETAIL") {
         Err(_) => UNBOUND_DETAIL_LIMIT,
         Ok(value) if value.eq_ignore_ascii_case("all") => usize::MAX,
@@ -621,10 +624,6 @@ pub(crate) struct HostProviders {
     /// The `dl` family, which the host exports and cannot usefully answer for an
     /// x86-64 file. See [`crate::dyld`].
     dyld: machish::resolve::SyntheticDylib,
-    /// The Steam bridge's one dispatch symbol, which the generated
-    /// `steamclient.dylib` leaves undefined. Empty when this install has no
-    /// generated dylib. See [`crate::steam`].
-    steam: machish::resolve::SyntheticDylib,
     /// OpenGL, on the GL library SDL made the context against rather than on
     /// whichever one the host loader has. See [`crate::gl`].
     opengl: machish::resolve::LazyDylib,
@@ -672,7 +671,6 @@ impl HostProviders {
             frameworks: crate::frameworks::provider(),
             base_reexports: crate::frameworks::base_reexports(),
             dyld: crate::dyld::provider(),
-            steam: crate::steam::provider(),
             openal: crate::openal::provider(),
             opengl: crate::gl::provider(),
             eager: eager_binding_shims(),
@@ -697,7 +695,6 @@ impl HostProviders {
                 .map(|lib| lib as &dyn SymbolProvider),
         );
         providers.push(&self.dyld);
-        providers.push(&self.steam);
         providers.push(&self.opengl);
         providers.push(&self.openal);
         providers.push(&self.eager);

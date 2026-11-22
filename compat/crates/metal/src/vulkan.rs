@@ -603,7 +603,7 @@ fn target_profile(version: (u8, u8)) -> metal_translate::TargetProfile {
 }
 
 fn trace(message: impl std::fmt::Display) {
-    if std::env::var_os("ROSEMARY_TRACE_METAL").is_some() {
+    if std::env::var_os("ROSEMARY_TRACE_METAL").is_some() || darwin::debug::enabled("metal") {
         eprintln!("rosemary: Metal: {message}");
     }
 }
