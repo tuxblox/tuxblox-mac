@@ -179,7 +179,6 @@ impl Native {
         let base_reexports = crate::frameworks::base_reexports();
         let dyld = crate::dyld::provider();
         let libc_lookup = crate::dyld::native_libc_provider();
-        let steam = crate::steam::provider();
         let opengl = crate::gl::provider();
         let openal = crate::openal::provider();
         let mut providers: Vec<&dyn SymbolProvider> = match crate::frameworks::using_builtin() {
@@ -190,11 +189,10 @@ impl Native {
                 &objc,
                 &frameworks,
                 &dyld,
-                &steam,
                 &opengl,
                 &openal,
             ],
-            false => vec![&eager, &runtime, &platform, &libc_lookup, &steam],
+            false => vec![&eager, &runtime, &platform, &libc_lookup],
         };
         if crate::frameworks::using_builtin() {
             providers.extend(base_reexports.iter().map(|lib| lib as &dyn SymbolProvider));

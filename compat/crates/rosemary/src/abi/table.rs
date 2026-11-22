@@ -219,10 +219,6 @@ const BOOL: T = U8;
 /// Known signatures, in no particular order - [`index`] builds the lookup. Names must
 /// be unique; `signatures_are_unique` says so.
 pub static SIGNATURES: &[FunctionAbi] = &[
-    // The Steam bridge's one entry point, which the generated
-    // `steamclient.dylib` calls for every Steamworks call the guest makes. See
-    // [`crate::steam`].
-    sig!("rosemary_steamclient_dispatch", I32, U32, P),
     sig!("getsegbyname", P, P),
     sig!("getsectbyname", P, P, P),
     sig!("getsectiondata", P, P, P, P, P),

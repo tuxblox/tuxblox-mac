@@ -48,9 +48,6 @@ pub fn run(exec: &dyn Execution) -> Result<i32, VmError> {
     // an answer about this binary rather than the program's. See [`crate::compat`].
     #[cfg(target_os = "macos")]
     crate::compat::install();
-    // Before the program's own code, because `SteamAPI_Init` asks the name
-    // server for Steam and a service published after the question is not there.
-    crate::steam::install();
     // Before the first initializer, which may read it: QtCore's do.
     #[cfg(not(target_os = "macos"))]
     if let Err(e) = darwin::commpage::install() {
