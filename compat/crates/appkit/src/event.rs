@@ -762,8 +762,8 @@ pub(crate) fn deliver_past_modal(event: sdl3::video::Event) {
                 modifiers: current_modifiers(),
                 location,
                 delta: NSPoint {
-                    x: x as f64,
-                    y: y as f64,
+                    x: f64::from(x) * WHEEL_LINES,
+                    y: f64::from(y) * WHEEL_LINES,
                 },
                 window,
                 ..Fields::default()
@@ -1757,6 +1757,13 @@ pub(crate) fn object_for(id: u32) -> Id {
 /// simply does not react - and a release build inlines every function on this
 /// path, so a breakpoint cannot answer it either. This is the answer: the name,
 /// the window, its delegate, and whether that delegate implements the method.
+/// Lines a wheel notch scrolls, which the host reports as one.
+///
+/// Without precise deltas AppKit's value is in lines, and a notch is worth
+/// more than one of them. The host has already applied the desktop's own
+/// scroll factor, so this is only the lines a single notch stands for.
+const WHEEL_LINES: f64 = 2.0;
+
 pub const TRACE_ENV: &str = "ROSEMARY_TRACE_EVENT";
 
 pub(crate) fn tracing() -> bool {
