@@ -2108,7 +2108,8 @@ unsafe extern "C" fn set_frame(receiver: Id, _sel: Sel, rect: NSRect) {
         rect.origin.x, rect.origin.y, rect.size.width, rect.size.height,
     );
     sdl3::video::set_window_size(sdl, width.max(1), height.max(1));
-    sdl3::video::set_window_position(sdl, local_x, local_y);
+    let placed = sdl3::video::set_window_position(sdl, local_x, local_y);
+    trace!("{receiver:p} set_frame placed: {placed}");
     // A hidden window takes the size at once and reports no resize, and a
     // shown one reports it later: the content view follows now either way.
     if sdl3::video::window_size(sdl) != Some((width.max(1), height.max(1))) {
@@ -2175,7 +2176,8 @@ unsafe extern "C" fn set_frame_origin(
         "{receiver:p} origin ({:.0},{:.0}) -> sdl ({local_x},{local_y})",
         origin.x, origin.y
     );
-    sdl3::video::set_window_position(sdl, local_x, local_y);
+    let placed = sdl3::video::set_window_position(sdl, local_x, local_y);
+    trace!("{receiver:p} set_frame_origin placed: {placed}");
 }
 
 /// Record where the window manager put a window as the guest's own origin,
@@ -2750,15 +2752,19 @@ unsafe extern "C" fn is_movable(receiver: Id, _sel: Sel) -> u8 {
 unsafe extern "C" fn perform_window_drag_with_event(receiver: Id, _sel: Sel, _event: Id) {
     // `-setMovable:NO` stops AppKit's own drag, not this one.
     let window = window_of(receiver);
+    trace!("{receiver:p} performWindowDrag asked");
     if window.sdl.is_null() {
+        trace!("{receiver:p} performWindowDrag refused: no sdl window");
         return;
     }
     let (Some((pointer_x, pointer_y, _)), Some((origin_x, origin_y))) = (
         sdl3::video::global_mouse_state(),
         sdl3::video::window_position(window.sdl),
     ) else {
+        trace!("{receiver:p} performWindowDrag refused: no pointer or position");
         return;
     };
+    trace!("{receiver:p} performWindowDrag begins pointer ({pointer_x:.0},{pointer_y:.0}) origin ({origin_x},{origin_y})");
     *drag().lock().unwrap_or_else(|e| e.into_inner()) = Some(Drag {
         window: receiver as usize,
         pointer: (pointer_x, pointer_y),
@@ -2807,11 +2813,10 @@ pub(crate) fn drag_moved() -> bool {
         return false;
     };
     let at = |start: i32, from: f32, to: f32| start + (to - from).round() as i32;
-    sdl3::video::set_window_position(
-        sdl,
-        at(session.origin.0, session.pointer.0, x),
-        at(session.origin.1, session.pointer.1, y),
-    );
+    let to_x = at(session.origin.0, session.pointer.0, x);
+    let to_y = at(session.origin.1, session.pointer.1, y);
+    let placed = sdl3::video::set_window_position(sdl, to_x, to_y);
+    trace!("drag_moved -> sdl ({to_x},{to_y}) placed: {placed}");
     true
 }
 

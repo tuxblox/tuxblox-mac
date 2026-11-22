@@ -256,6 +256,10 @@ pub unsafe extern "C" fn CGEventPost(_tap: u32, event: CFTypeRef) {
     // SAFETY: an instance of `class()` is a `Body`.
     let body = unsafe { &*(event as *const Body) };
     if kind::moves_the_pointer(body.kind) {
+        crate::window::trace(format_args!(
+            "CGEventPost move kind {} to ({:.0},{:.0})",
+            body.kind, body.location.x, body.location.y
+        ));
         // SAFETY: a point, which is all it takes.
         unsafe { crate::screen::CGWarpMouseCursorPosition(body.location) };
         return;

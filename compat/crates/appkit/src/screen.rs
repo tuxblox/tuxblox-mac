@@ -1448,6 +1448,10 @@ pub unsafe extern "C" fn CGWarpMouseCursorPosition(point: foundation::geometry::
         .and_then(crate::window::global_position)
         .unwrap_or((0, 0));
     let local = local_warp_point(point, origin);
+    crate::window::trace(format_args!(
+        "warp asked ({:.0},{:.0}) origin {origin:?} local ({:.0},{:.0})",
+        asked.x, asked.y, local.0, local.1
+    ));
     let from = crate::event::pointer_position();
     // Measured from the cursor the guest is told about: the frozen point when
     // it is disassociated, which a repeated warp to one target leaves exactly
@@ -1532,6 +1536,10 @@ pub unsafe extern "C" fn CGSetLocalEventsSuppressionInterval(seconds: f64) -> i3
 /// `window::global_position`), and only a pointer over one of the client's
 /// surfaces can be moved: [`sdl3::pointer::warp`].
 fn warp_physical(window: Option<sdl3::Window>, global: (f32, f32), local: (f32, f32)) -> bool {
+    crate::window::trace(format_args!(
+        "warp_physical global ({:.0},{:.0}) local ({:.0},{:.0})",
+        global.0, global.1, local.0, local.1
+    ));
     if sdl3::video::is_wayland() {
         return window
             .is_some_and(|window| sdl3::pointer::warp(window, local.0, local.1).is_some());
@@ -2114,15 +2122,10 @@ pub fn apply_mouse_association() {
             held == Some(sdl3::video::window_id(window)) || recentred == Some(window as usize);
         if !owned && sdl3::video::relative_mouse_mode(window) != relative {
             if !relative {
-                // Reset both positions on release. The in-window warp supplies
-                // SDL's restore point; the global warp after disabling reaches
-                // the physical cursor even on backends where those differ.
+                // SDL's restore point; the physical warp follows the loop.
                 let point = crate::event::pointer_position();
                 sdl3::video::warp_mouse_in_window(window, point.0, point.1);
                 sdl3::video::set_relative_mouse_mode(window, false);
-                let origin = crate::window::global_position(window).unwrap_or((0, 0));
-                let global = (point.0 + origin.0 as f32, point.1 + origin.1 as f32);
-                warp_physical(Some(window), global, point);
             } else {
                 sdl3::video::set_relative_mouse_mode(window, true);
             }
@@ -2131,6 +2134,16 @@ pub fn apply_mouse_association() {
         if relative && sdl3::video::relative_mouse_mode(window) {
             lock_at_frozen_pointer(window);
         }
+    }
+    // One physical cursor, so one warp: the pointer's own window.
+    if changed
+        && !relative
+        && let Some(target) = crate::event::pointer_window()
+    {
+        let point = crate::event::pointer_position();
+        let origin = crate::window::global_position(target).unwrap_or((0, 0));
+        let global = (point.0 + origin.0 as f32, point.1 + origin.1 as f32);
+        warp_physical(Some(target), global, point);
     }
     if changed {
         forget_relative_warp();
